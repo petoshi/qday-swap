@@ -155,8 +155,8 @@ func TestWebRoutesAndSecurityHeaders(t *testing.T) {
 		path         string
 		cacheControl string
 	}{
-		{"/app.js?v=7", "no-cache"},
-		{"/styles.css?v=7", "no-cache"},
+		{"/app.js?v=9", "no-cache"},
+		{"/styles.css?v=9", "no-cache"},
 		{"/assets/protocol-art.webp", "public, max-age=86400"},
 		{"/assets/protocol-slogan.webp", "public, max-age=86400"},
 	} {
