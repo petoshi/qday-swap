@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#111216">
+  <meta name="description" content="QDAY Swap local wallet and atomic swap application.">
+  <title>QDAY Swap</title>
+  <link rel="icon" href="/favicon.svg">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="#market" aria-label="QDAY Swap">
+      <img src="/assets/logo.webp" alt="QDAY">
+      <i></i>
+      <strong>SWAP</strong>
+    </a>
+    <nav id="main-nav" aria-label="Main navigation">
+      <a href="#market" data-route="market">Market</a>
+      <a href="#create" data-route="create">Create offer</a>
+      <a href="#swaps" data-route="swaps">Active swaps</a>
+      <a href="#history" data-route="history">History</a>
+      <a href="#settings" data-route="settings">Settings</a>
+    </nav>
+    <div class="node-pill waiting" id="node-pill"><i></i><span>STARTING</span></div>
+  </header>
+
+  <main id="app" aria-live="polite">
+    <section class="loading"><div></div><p>Opening local wallet…</p></section>
+  </main>
+
+  <footer>
+    <div class="footer-brand"><img src="/assets/logo.webp" alt="QDAY"><span>HYBRID POST QUANTUM ATOMIC SWAPS</span></div>
+    <div class="footer-links">
+      <a href="https://dex.pqday.com" target="_blank" rel="noreferrer">Public market</a>
+      <a href="https://explorer.pqday.com" target="_blank" rel="noreferrer">Explorer</a>
+      <a href="https://pqday.com" target="_blank" rel="noreferrer">Website</a>
+      <a href="https://github.com/petoshi" target="_blank" rel="noreferrer">Source</a>
+    </div>
+  </footer>
+
+  <div class="modal-backdrop hidden" id="modal-backdrop" role="presentation">
+    <section class="modal" id="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"></section>
+  </div>
+  <div class="toast" id="toast" role="status"></div>
+  <script src="/app.js" defer></script>
+</body>
+</html>
