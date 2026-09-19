@@ -18,6 +18,10 @@ const (
 	MarketQDAYBTC   = "QDAY-BTC"
 	QDAYLegacyUnit  = "1000000000000000000000000"
 	QDAYDefendUnit  = "1000000000000000000"
+	// MinimumBitcoinSwapSatoshis leaves enough value for the independent
+	// claim or refund transaction after its network fee. Tiny signed offers
+	// are rejected by every client and relay before negotiation starts.
+	MinimumBitcoinSwapSatoshis = int64(10_000)
 
 	minimumLifetime     = time.Minute
 	maximumLifetime     = 30 * 24 * time.Hour
@@ -148,7 +152,18 @@ func validatePair(give, receive Amount) error {
 	if err := validateAtomic("give", give.Atomic); err != nil {
 		return err
 	}
-	return validateAtomic("receive", receive.Atomic)
+	if err := validateAtomic("receive", receive.Atomic); err != nil {
+		return err
+	}
+	bitcoinAtomic := give.Atomic
+	if receive.Asset == "BTC" {
+		bitcoinAtomic = receive.Atomic
+	}
+	bitcoin, _ := new(big.Int).SetString(bitcoinAtomic, 10)
+	if bitcoin.Cmp(big.NewInt(MinimumBitcoinSwapSatoshis)) < 0 {
+		return fmt.Errorf("Bitcoin swap amount must be at least %d satoshis", MinimumBitcoinSwapSatoshis)
+	}
+	return nil
 }
 
 func validateAtomic(name, value string) error {

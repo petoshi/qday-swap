@@ -12,6 +12,7 @@ const toast = document.querySelector('#toast');
 
 let state;
 let orders = {items: [], page: 1, total: 0, totalPages: 0};
+let marketTrades = {items: [], total: 0};
 let negotiations = {pending: [], incoming: [], swaps: []};
 let marketError = '';
 let setupMode = 'new';
@@ -23,6 +24,9 @@ let lastTrade = null;
 let offerSide = 'buy';
 let offerPriceCurrency = 'USD';
 let pendingOffer = null;
+let selectedOrderID = '';
+let chartRange = 'ALL';
+let destroyChart = () => {};
 
 const escapeHTML = value => String(value ?? '').replace(/[&<>'"]/g, character => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
@@ -79,6 +83,16 @@ function formatUnits(atomic, unit, maximumPlaces = 8) {
   return `${commas(whole)}${fraction ? `.${fraction}` : ''}`;
 }
 
+function formatUnitsExact(atomic, unit) {
+  const decimals = decimalsFromUnit(unit);
+  if (decimals === null) return String(atomic ?? '0');
+  const negative = String(atomic || '0').startsWith('-');
+  let digits = String(atomic || '0').replace(/^-/, '').padStart(decimals + 1, '0');
+  const whole = digits.slice(0, -decimals) || '0';
+  const fraction = (decimals ? digits.slice(-decimals) : '').replace(/0+$/, '');
+  return `${negative ? '-' : ''}${whole}${fraction ? `.${fraction}` : ''}`;
+}
+
 function amountText(amount, qdayUnit) {
   const unit = amount.asset === 'BTC' ? '100000000' : qdayUnit;
   return `${formatUnits(amount.atomic, unit, amount.asset === 'BTC' ? 8 : 4)} ${amount.asset}`;
@@ -90,9 +104,9 @@ function orderPrice(terms) {
   const qday = terms.give.asset === 'QDAY' ? give : receive;
   const sats = terms.give.asset === 'BTC' ? give : receive;
   if (qday === 0n) return '—';
-  const scale = 100000000n;
+  const scale = 10000000000000000n;
   const scaled = (sats * BigInt(terms.qdayUnitAtomic) * scale) / (qday * 100000000n);
-  return formatUnits(String(scaled), String(scale), 8);
+  return formatUnits(String(scaled), String(scale), 16);
 }
 
 function orderPriceParts(terms) {
@@ -113,6 +127,13 @@ function compareOrderPrice(left, right) {
 function cleanDecimal(value, places = 12) {
   if (!Number.isFinite(value) || value <= 0) return '';
   return value.toFixed(places).replace(/0+$/, '').replace(/\.$/, '');
+}
+
+function signedDecimal(value, places = 2) {
+  if (!Number.isFinite(value)) return '';
+  const normalized = Math.abs(value) < 10 ** -places ? 0 : value;
+  const magnitude = Math.abs(normalized).toFixed(places).replace(/0+$/, '').replace(/\.$/, '');
+  return `${normalized > 0 ? '+' : normalized < 0 ? '-' : ''}${magnitude}`;
 }
 
 function dollars(value, bitcoin = false) {
@@ -225,31 +246,368 @@ function metric(label, value, note) {
   return `<div class="metric"><span>${escapeHTML(label)}</span><strong>${escapeHTML(value)}</strong><small>${escapeHTML(note)}</small></div>`;
 }
 
+function marketAmounts(terms) {
+  return {
+    qday: terms.give.asset === 'QDAY' ? terms.give : terms.receive,
+    btc: terms.give.asset === 'BTC' ? terms.give : terms.receive
+  };
+}
+
+function numericUnits(atomic, unit) {
+  const value = Number(atomic);
+  const scale = Number(unit);
+  return Number.isFinite(value) && Number.isFinite(scale) && scale > 0 ? value / scale : 0;
+}
+
+function marketPriceNumber(value) {
+  const qday = numericUnits(value.qdayAtomic, value.qdayUnitAtomic);
+  const btc = numericUnits(value.btcAtomic, '100000000');
+  return qday > 0 ? btc / qday : 0;
+}
+
+function orderBookRows(records, kind) {
+  if (!records.length) return `<div class="book-empty">NO ${kind === 'ask' ? 'SELL' : 'BUY'} OFFERS</div>`;
+  let cumulative = 0;
+  const rows = records.map(record => {
+    const terms = record.signed.order;
+    const amounts = marketAmounts(terms);
+    const quantity = numericUnits(amounts.qday.atomic, terms.qdayUnitAtomic);
+    cumulative += quantity;
+    return {record, terms, amounts, quantity, cumulative};
+  });
+  const maximum = Math.max(...rows.map(row => row.cumulative), 1);
+  const displayed = kind === 'ask' ? [...rows].reverse() : rows;
+  return displayed.map(row => {
+    const mine = row.terms.makerPublicKey === state.identityPublicKey;
+    const priceBTC = orderPrice(row.terms);
+    const totalBTC = formatUnits(row.amounts.btc.atomic, '100000000', 8);
+    const actionSide = kind === 'ask' ? 'buy' : 'sell';
+    const depth = Math.max(10, Math.min(100, Math.ceil(row.cumulative / maximum * 10) * 10));
+    return `<button type="button" class="book-row ${kind} depth-${depth} ${mine ? 'mine-row' : ''} ${selectedOrderID === row.record.signed.id ? 'selected' : ''}" data-book-order="${escapeHTML(row.record.signed.id)}" data-book-side="${actionSide}" ${mine ? 'disabled' : ''}>
+      <span class="book-price">${escapeHTML(priceBTC)}</span><span>${escapeHTML(cleanDecimal(row.quantity, 8))}</span><span>${escapeHTML(totalBTC)}</span>
+    </button>`;
+  }).join('');
+}
+
+function orderBook() {
+  const asks = orders.items.filter(record => record.signed.order.give.asset === 'QDAY').sort(compareOrderPrice).slice(0, 9);
+  const bids = orders.items.filter(record => record.signed.order.give.asset === 'BTC').sort((left, right) => compareOrderPrice(right, left)).slice(0, 9);
+  const bestAsk = asks.length ? Number(orderPrice(asks[0].signed.order)) : 0;
+  const bestBid = bids.length ? Number(orderPrice(bids[0].signed.order)) : 0;
+  const last = marketTrades.items.length ? marketPriceNumber(marketTrades.items[0]) : 0;
+  const middle = last || (bestAsk && bestBid ? (bestAsk + bestBid) / 2 : bestAsk || bestBid);
+  const middleUSD = middle && bitcoinUSD ? dollars(middle * bitcoinUSD) : '$—';
+  return `<article class="market-panel order-book-panel">
+    <header class="panel-head"><div><span>ORDER BOOK</span><strong>QDAY / BTC</strong></div><small>${orders.total} OPEN</small></header>
+    <div class="book-columns"><span>PRICE BTC</span><span>AMOUNT QDAY</span><span>TOTAL BTC</span></div>
+    <div class="book-side asks">${orderBookRows(asks, 'ask')}</div>
+    <div class="book-middle"><strong>${middle ? escapeHTML(cleanDecimal(middle, 12)) : 'N/A'}</strong><span>${escapeHTML(middleUSD)} / QDAY</span></div>
+    <div class="book-side bids">${orderBookRows(bids, 'bid')}</div>
+    <p class="book-hint">Select an offer to fill the trade ticket.</p>
+  </article>`;
+}
+
+function tradeTicket() {
+  const buying = offerSide === 'buy';
+  const selected = orders.items.find(record => record.signed.id === selectedOrderID);
+  const compatible = selected && (buying ? selected.signed.order.give.asset === 'QDAY' : selected.signed.order.give.asset === 'BTC');
+  const terms = compatible ? selected.signed.order : null;
+  const amounts = terms ? marketAmounts(terms) : null;
+  const quantity = amounts ? formatUnitsExact(amounts.qday.atomic, terms.qdayUnitAtomic) : '';
+  const selectedPrice = terms ? orderPrice(terms).replaceAll(',', '') : '';
+  const balance = buying ? `${state.bitcoinBalance?.confirmed?.btc ?? '0'} BTC` : `${state.balance?.spendable?.qday ?? '0'} QDAY`;
+  return `<article class="market-panel ticket-panel">
+    <div class="ticket-tabs" role="tablist"><button type="button" data-ticket-side="buy" class="${buying ? 'active' : ''}">BUY QDAY</button><button type="button" data-ticket-side="sell" class="${buying ? '' : 'active'}">SELL QDAY</button></div>
+    <form id="create-offer-form" data-side="${offerSide}"${terms ? ` data-selected-order="${escapeHTML(selected.signed.id)}"` : ''}>
+      <div class="ticket-balance"><span>AVAILABLE</span><strong>${escapeHTML(balance)}</strong></div>
+      ${terms ? `<div class="selected-offer"><span>OPEN OFFER SELECTED</span><strong>${buying ? 'Buy' : 'Sell'} ${escapeHTML(quantity)} QDAY now</strong><button type="button" data-clear-order>USE MY OWN PRICE</button></div>` : ''}
+      <label class="field light"><span>Limit price for 1 QDAY</span><div class="price-input"><input name="price" inputmode="decimal" autocomplete="off" maxlength="64" value="${escapeHTML(selectedPrice)}" placeholder="${offerPriceCurrency === 'USD' ? '1.00' : '0.00001'}" required ${terms ? 'readonly' : ''}><div class="currency-switch" aria-label="Price currency"><button type="button" data-price-currency="USD" class="${offerPriceCurrency === 'USD' ? 'active' : ''}" ${terms ? 'disabled' : ''}>USD</button><button type="button" data-price-currency="BTC" class="${offerPriceCurrency === 'BTC' ? 'active' : ''}" ${terms ? 'disabled' : ''}>BTC</button></div></div><small id="price-help">${offerPriceCurrency === 'USD' ? `Converted to BTC at review${bitcoinUSD ? ` using BTC/USD ${dollars(bitcoinUSD, true)}` : ''}.` : 'The selected signed offer is fixed in BTC.'}</small></label>
+      <label class="field light"><span>Amount</span><div class="unit-input"><input name="quantity" inputmode="decimal" autocomplete="off" maxlength="64" value="${escapeHTML(quantity)}" placeholder="10" required ${terms ? 'readonly' : ''}><b>QDAY</b></div></label>
+      <div class="ticket-total"><span>${buying ? 'YOU PAY' : 'YOU RECEIVE'}</span><strong id="summary-btc">— BTC</strong><small id="summary-usd">Enter price and amount</small></div>
+      <input type="hidden" name="lifetimeMinutes" value="1440">
+      <span id="summary-qday" hidden></span><span id="summary-price" hidden></span><span id="summary-price-btc" hidden></span>
+      <p class="balance-warning" id="balance-warning" hidden></p><p class="form-error dark" id="form-error" hidden></p>
+      <button class="primary ticket-submit ${buying ? 'buy' : 'sell'}" type="submit">${terms ? `REVIEW ${buying ? 'BUY' : 'SELL'}` : `PLACE ${buying ? 'BUY' : 'SELL'} ORDER`}</button>
+      <p class="ticket-note">${terms ? 'The selected signed offer is fixed. Review it before any contract is created.' : 'Your signed offer moves no funds. You approve the atomic swap after another trader accepts.'}</p>
+    </form>
+  </article>`;
+}
+
+function recentTrades() {
+  if (!marketTrades.items.length) return `<div class="empty compact-empty"><strong>NO MATCHES YET.</strong><p>The first matched order will establish the QDAY market price.</p></div>`;
+  return `<div class="recent-trades">${marketTrades.items.slice(0, 12).map(trade => {
+    const priceBTC = marketPriceNumber(trade);
+    const qday = numericUnits(trade.qdayAtomic, trade.qdayUnitAtomic);
+    return `<div><span class="${trade.side}">${escapeHTML(cleanDecimal(priceBTC, 12))}</span><span>${escapeHTML(cleanDecimal(qday, 8))}</span><time>${escapeHTML(new Date(trade.matchedAt * 1000).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'}))}</time></div>`;
+  }).join('')}</div>`;
+}
+
+function setupPriceChart() {
+  destroyChart();
+  destroyChart = () => {};
+  const canvas = document.querySelector('#price-chart');
+  const empty = document.querySelector('#chart-empty');
+  const tooltip = document.querySelector('#chart-tooltip');
+  const lastOutput = document.querySelector('#chart-last');
+  const changeOutput = document.querySelector('#chart-change');
+  const highOutput = document.querySelector('#chart-high');
+  const lowOutput = document.querySelector('#chart-low');
+  const volumeOutput = document.querySelector('#chart-volume');
+  if (!canvas || !empty || !tooltip) return;
+  const rangeSeconds = chartRange === '24H' ? 86400 : chartRange === '7D' ? 604800 : 0;
+  const cutoff = rangeSeconds ? Math.floor(Date.now() / 1000) - rangeSeconds : 0;
+  const points = marketTrades.items
+    .filter(trade => trade.matchedAt >= cutoff)
+    .map(trade => ({
+      time: Number(trade.matchedAt), price: marketPriceNumber(trade),
+      volume: numericUnits(trade.qdayAtomic, trade.qdayUnitAtomic), side: trade.side
+    }))
+    .filter(point => Number.isFinite(point.time) && point.time > 0 && Number.isFinite(point.price) && point.price > 0)
+    .sort((left, right) => left.time - right.time);
+  empty.hidden = points.length > 0;
+  canvas.hidden = !points.length;
+  if (!points.length) {
+    for (const output of [lastOutput, changeOutput, highOutput, lowOutput, volumeOutput]) {
+      if (output) output.textContent = 'N/A';
+    }
+    if (changeOutput) changeOutput.className = '';
+    return;
+  }
+
+  const firstPrice = points[0].price;
+  const latestPrice = points.at(-1).price;
+  const highPrice = Math.max(...points.map(point => point.price));
+  const lowPrice = Math.min(...points.map(point => point.price));
+  const totalVolume = points.reduce((total, point) => total + point.volume, 0);
+  const change = firstPrice > 0 ? (latestPrice / firstPrice - 1) * 100 : 0;
+  if (lastOutput) lastOutput.textContent = cleanDecimal(latestPrice, 16);
+  if (changeOutput) {
+    changeOutput.textContent = `${signedDecimal(change, 2)}%`;
+    changeOutput.className = change > 0 ? 'up' : change < 0 ? 'down' : '';
+  }
+  if (highOutput) highOutput.textContent = cleanDecimal(highPrice, 16);
+  if (lowOutput) lowOutput.textContent = cleanDecimal(lowPrice, 16);
+  if (volumeOutput) volumeOutput.textContent = `${commas(cleanDecimal(totalVolume, 4))} QDAY`;
+
+  const context = canvas.getContext('2d');
+  const wrap = canvas.parentElement;
+  let geometry = null;
+  let hover = -1;
+  const priceLabel = (value, step = 0) => {
+    if (!Number.isFinite(value)) return '—';
+    const places = step > 0
+      ? Math.max(0, Math.min(16, Math.ceil(-Math.log10(step)) + 1))
+      : value >= 1 ? 4 : value >= .001 ? 7 : 12;
+    const label = value.toFixed(places).replace(/0+$/, '').replace(/\.$/, '');
+    return label || '0';
+  };
+  const timeLabel = (timestamp, visibleSeconds) => {
+    const date = new Date(timestamp * 1000);
+    if (visibleSeconds <= 172800) return date.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+    if (visibleSeconds <= 31536000) return date.toLocaleDateString([], {month: 'short', day: 'numeric'});
+    return date.toLocaleDateString([], {month: 'short', year: '2-digit'});
+  };
+  const niceStep = raw => {
+    if (!Number.isFinite(raw) || raw <= 0) return 1;
+    const power = 10 ** Math.floor(Math.log10(raw));
+    const fraction = raw / power;
+    const nice = fraction <= 1 ? 1 : fraction <= 2 ? 2 : fraction <= 2.5 ? 2.5 : fraction <= 5 ? 5 : 10;
+    return nice * power;
+  };
+
+  function draw() {
+    const bounds = wrap.getBoundingClientRect();
+    const width = Math.max(1, Math.floor(bounds.width));
+    const height = Math.max(1, Math.floor(bounds.height));
+    const ratio = Math.min(window.devicePixelRatio || 1, 2);
+    const pixelWidth = Math.floor(width * ratio);
+    const pixelHeight = Math.floor(height * ratio);
+    if (canvas.width !== pixelWidth) canvas.width = pixelWidth;
+    if (canvas.height !== pixelHeight) canvas.height = pixelHeight;
+    context.setTransform(ratio, 0, 0, ratio, 0, 0);
+    context.clearRect(0, 0, width, height);
+
+    const volumeHeight = width < 520 ? 42 : 50;
+    const observedMinimum = Math.min(...points.map(point => point.price));
+    const observedMaximum = Math.max(...points.map(point => point.price));
+    const observedSpread = observedMaximum - observedMinimum;
+    const pricePad = observedSpread > 0 ? observedSpread * .1 : Math.max(observedMaximum * .04, 1e-16);
+    const targetPriceTicks = height < 340 ? 4 : 5;
+    const tickStep = niceStep(Math.max(observedSpread + pricePad * 2, 1e-16) / targetPriceTicks);
+    let minimumPrice = Math.floor(Math.max(0, observedMinimum - pricePad) / tickStep) * tickStep;
+    let maximumPrice = Math.ceil((observedMaximum + pricePad) / tickStep) * tickStep;
+    if (maximumPrice <= minimumPrice) maximumPrice = minimumPrice + tickStep * targetPriceTicks;
+    context.font = '9px ui-monospace, SFMono-Regular, Menlo, monospace';
+    const axisWidth = Math.max(
+      context.measureText(priceLabel(minimumPrice, tickStep)).width,
+      context.measureText(priceLabel(maximumPrice, tickStep)).width,
+      context.measureText(priceLabel(latestPrice)).width
+    );
+    const padding = {left: 14, right: Math.max(72, Math.min(width < 520 ? 102 : 124, Math.ceil(axisWidth) + 24)), top: 18, bottom: 35};
+    const chartBottom = height - padding.bottom - volumeHeight - 12;
+    const volumeTop = chartBottom + 18;
+    let minimumTime;
+    let maximumTime;
+    if (rangeSeconds) {
+      maximumTime = Math.max(Math.floor(Date.now() / 1000), points.at(-1).time);
+      minimumTime = maximumTime - rangeSeconds;
+    } else {
+      minimumTime = points[0].time;
+      maximumTime = points.at(-1).time;
+      const dataSpan = maximumTime - minimumTime;
+      const timePad = dataSpan > 0 ? Math.max(1, dataSpan * .025) : 1800;
+      minimumTime -= timePad;
+      maximumTime += timePad;
+    }
+    const plotWidth = width - padding.left - padding.right;
+    const plotHeight = chartBottom - padding.top;
+    const x = time => padding.left + (time - minimumTime) / (maximumTime - minimumTime) * plotWidth;
+    const y = price => padding.top + (maximumPrice - price) / (maximumPrice - minimumPrice) * plotHeight;
+    const maximumVolume = Math.max(...points.map(point => point.volume), 1);
+    geometry = {width, height, padding, chartBottom, volumeTop, minimumTime, maximumTime, minimumPrice, maximumPrice, tickStep, x, y};
+
+    context.font = '9px ui-monospace, SFMono-Regular, Menlo, monospace';
+    context.textBaseline = 'middle';
+    const tickCount = Math.max(2, Math.round((maximumPrice - minimumPrice) / tickStep));
+    for (let index = 0; index <= tickCount; index++) {
+      const lineY = padding.top + plotHeight * index / tickCount;
+      context.strokeStyle = '#182019';
+      context.lineWidth = 1;
+      context.beginPath(); context.moveTo(padding.left, lineY); context.lineTo(width - padding.right, lineY); context.stroke();
+      const value = maximumPrice - (maximumPrice - minimumPrice) * index / tickCount;
+      context.fillStyle = '#657067';
+      context.textAlign = 'left';
+      context.fillText(priceLabel(value, tickStep), width - padding.right + 10, lineY);
+    }
+    const timeTickCount = width < 520 ? 3 : width < 850 ? 4 : 5;
+    for (let index = 0; index <= timeTickCount; index++) {
+      const lineX = padding.left + plotWidth * index / timeTickCount;
+      context.strokeStyle = '#101510';
+      context.beginPath(); context.moveTo(lineX, padding.top); context.lineTo(lineX, chartBottom); context.stroke();
+      context.fillStyle = '#59615a';
+      context.textAlign = index === 0 ? 'left' : index === timeTickCount ? 'right' : 'center';
+      const time = minimumTime + (maximumTime - minimumTime) * index / timeTickCount;
+      context.fillText(timeLabel(time, maximumTime - minimumTime), lineX, height - 12);
+    }
+
+    const barWidth = Math.max(2, Math.min(12, plotWidth / Math.max(points.length, 1) * .58));
+    for (const point of points) {
+      const barHeight = Math.max(1, point.volume / maximumVolume * volumeHeight);
+      context.fillStyle = point.side === 'sell' ? 'rgba(255,118,84,.28)' : 'rgba(125,255,155,.25)';
+      context.fillRect(x(point.time) - barWidth / 2, volumeTop + volumeHeight - barHeight, barWidth, barHeight);
+    }
+
+    const rising = latestPrice >= firstPrice;
+    const trendColor = rising ? '#7dff9b' : '#ff896d';
+    const gradient = context.createLinearGradient(0, padding.top, 0, chartBottom);
+    gradient.addColorStop(0, rising ? 'rgba(125,255,155,.24)' : 'rgba(255,137,109,.2)');
+    gradient.addColorStop(1, rising ? 'rgba(125,255,155,0)' : 'rgba(255,137,109,0)');
+    context.beginPath();
+    points.forEach((point, index) => index ? context.lineTo(x(point.time), y(point.price)) : context.moveTo(x(point.time), y(point.price)));
+    context.lineTo(x(points.at(-1).time), chartBottom);
+    context.lineTo(x(points[0].time), chartBottom);
+    context.closePath(); context.fillStyle = gradient; context.fill();
+    context.beginPath();
+    points.forEach((point, index) => index ? context.lineTo(x(point.time), y(point.price)) : context.moveTo(x(point.time), y(point.price)));
+    context.strokeStyle = trendColor; context.lineWidth = 1.6; context.stroke();
+
+    const latest = points.at(-1);
+    const latestY = y(latest.price);
+    context.setLineDash([2, 4]); context.strokeStyle = rising ? 'rgba(125,255,155,.45)' : 'rgba(255,137,109,.45)'; context.lineWidth = 1;
+    context.beginPath(); context.moveTo(padding.left, latestY); context.lineTo(width - padding.right, latestY); context.stroke();
+    context.setLineDash([]);
+    const latestText = priceLabel(latest.price);
+    context.font = 'bold 9px ui-monospace, SFMono-Regular, Menlo, monospace';
+    const latestWidth = Math.min(padding.right - 8, context.measureText(latestText).width + 12);
+    context.fillStyle = trendColor; context.fillRect(width - padding.right + 4, latestY - 9, latestWidth, 18);
+    context.fillStyle = '#021005'; context.textAlign = 'center'; context.fillText(latestText, width - padding.right + 4 + latestWidth / 2, latestY);
+    context.font = '9px ui-monospace, SFMono-Regular, Menlo, monospace';
+
+    if (points.length < 80) {
+      context.fillStyle = trendColor;
+      for (const point of points) { context.beginPath(); context.arc(x(point.time), y(point.price), 2.2, 0, Math.PI * 2); context.fill(); }
+    }
+    if (hover >= 0 && hover < points.length) {
+      const point = points[hover];
+      const pointX = x(point.time), pointY = y(point.price);
+      context.setLineDash([3, 4]); context.strokeStyle = '#536057'; context.lineWidth = 1;
+      context.beginPath(); context.moveTo(pointX, padding.top); context.lineTo(pointX, chartBottom); context.stroke();
+      context.beginPath(); context.moveTo(padding.left, pointY); context.lineTo(width - padding.right, pointY); context.stroke();
+      context.setLineDash([]); context.fillStyle = '#030403'; context.strokeStyle = trendColor;
+      context.beginPath(); context.arc(pointX, pointY, 4, 0, Math.PI * 2); context.fill(); context.stroke();
+      const hoverText = priceLabel(point.price);
+      const hoverWidth = Math.min(padding.right - 8, context.measureText(hoverText).width + 12);
+      context.fillStyle = '#667068'; context.fillRect(width - padding.right + 4, pointY - 9, hoverWidth, 18);
+      context.fillStyle = '#f0f4f0'; context.textAlign = 'center'; context.fillText(hoverText, width - padding.right + 4 + hoverWidth / 2, pointY);
+      const hoverTime = timeLabel(point.time, maximumTime - minimumTime);
+      const hoverTimeWidth = context.measureText(hoverTime).width + 12;
+      const hoverTimeX = Math.max(padding.left, Math.min(width - padding.right - hoverTimeWidth, pointX - hoverTimeWidth / 2));
+      context.fillStyle = '#273029'; context.fillRect(hoverTimeX, height - padding.bottom + 3, hoverTimeWidth, 18);
+      context.fillStyle = '#dce2dc'; context.fillText(hoverTime, hoverTimeX + hoverTimeWidth / 2, height - padding.bottom + 12);
+    }
+  }
+
+  function pointer(event) {
+    if (!geometry) return;
+    const bounds = canvas.getBoundingClientRect();
+    const pointerX = Math.max(geometry.padding.left, Math.min(geometry.width - geometry.padding.right, event.clientX - bounds.left));
+    const pointerY = Math.max(geometry.padding.top, Math.min(geometry.chartBottom, event.clientY - bounds.top));
+    const targetTime = geometry.minimumTime + (pointerX - geometry.padding.left) / (geometry.width - geometry.padding.left - geometry.padding.right) * (geometry.maximumTime - geometry.minimumTime);
+    hover = points.reduce((best, point, index) => Math.abs(point.time - targetTime) < Math.abs(points[best].time - targetTime) ? index : best, 0);
+    const point = points[hover];
+    tooltip.hidden = false;
+    tooltip.innerHTML = `<strong>${escapeHTML(priceLabel(point.price))} BTC</strong><span>${bitcoinUSD ? `${escapeHTML(dollars(point.price * bitcoinUSD))} / QDAY · ` : ''}${escapeHTML(cleanDecimal(point.volume, 8))} QDAY</span><time>${escapeHTML(new Date(point.time * 1000).toLocaleString())}</time>`;
+    const tooltipWidth = tooltip.offsetWidth;
+    const tooltipHeight = tooltip.offsetHeight;
+    const left = pointerX + tooltipWidth + 24 > geometry.width ? pointerX - tooltipWidth - 14 : pointerX + 14;
+    const top = pointerY + tooltipHeight + 24 > geometry.height ? pointerY - tooltipHeight - 14 : pointerY + 14;
+    tooltip.style.left = `${Math.max(8, Math.min(geometry.width - tooltipWidth - 8, left))}px`;
+    tooltip.style.top = `${Math.max(8, Math.min(geometry.height - tooltipHeight - 8, top))}px`;
+    draw();
+  }
+  function leave() { hover = -1; tooltip.hidden = true; draw(); }
+  canvas.addEventListener('pointermove', pointer);
+  canvas.addEventListener('pointerdown', pointer);
+  canvas.addEventListener('pointerleave', leave);
+  const observer = new ResizeObserver(draw);
+  observer.observe(wrap);
+  draw();
+  destroyChart = () => {
+    observer.disconnect();
+    canvas.removeEventListener('pointermove', pointer);
+    canvas.removeEventListener('pointerdown', pointer);
+    canvas.removeEventListener('pointerleave', leave);
+  };
+}
+
 function renderMarket() {
   const balance = state.balance?.spendable?.qday ?? '0';
   const pending = state.balance?.pendingIn?.qday ?? '0';
   const bitcoin = state.bitcoinBalance?.confirmed?.btc ?? '0';
   const bitcoinPending = state.bitcoinBalance?.pending?.btc ?? '0';
+  const bitcoinImmature = state.bitcoinBalance?.immature?.btc ?? '0';
+  const bitcoinBalanceNote = Number(bitcoinImmature) > 0
+    ? `${commas(bitcoinPending)} pending · ${commas(bitcoinImmature)} immature`
+    : `${commas(bitcoinPending)} pending`;
   root.innerHTML = `${state.error ? `<div class="alert"><strong>Local chain needs attention</strong>${escapeHTML(state.error)}</div>` : ''}
     ${state.relayError || marketError ? `<div class="alert"><strong>Order relay needs attention</strong>${escapeHTML(state.relayError || marketError)}</div>` : ''}
-    <section class="terminal-head">
-      <div><span class="command">$ qday-swap wallet --market QDAY/BTC</span><h1>LOCAL ORDER TERMINAL</h1><p>Wallets, keys and signatures stay on this computer.</p></div>
-      <pre class="ascii-swap" aria-label="QDAY to Bitcoin atomic swap">+---------------------+       +---------------------+
-| QDAY                |       | BITCOIN             |
-| ED25519 + SLH-DSA   |&lt;-----&gt;| NATIVE SEGWIT HTLC |
-+---------------------+ SHA256 +---------------------+</pre>
+    <section class="pair-strip">
+      <div class="pair-name"><span>SPOT ATOMIC SWAP</span><strong>QDAY / BTC</strong></div>
+      <div><span>LAST MATCH</span><strong>${lastTrade ? escapeHTML(cleanDecimal(marketPriceNumber(lastTrade), 12)) : 'N/A'}</strong></div>
+      <div><span>QDAY / USD</span><strong>${lastTrade && bitcoinUSD ? escapeHTML(dollars(marketPriceNumber(lastTrade) * bitcoinUSD)) : 'N/A'}</strong></div>
+      <div><span>OPEN OFFERS</span><strong>${escapeHTML(state.relay?.stats?.open ?? orders.total ?? '0')}</strong></div>
+      <div><span>QDAY BALANCE</span><strong>${escapeHTML(commas(balance))}</strong><small>${escapeHTML(commas(pending))} pending</small></div>
+      <div><span>BTC BALANCE</span><strong>${escapeHTML(commas(bitcoin))}</strong><small>${escapeHTML(bitcoinBalanceNote)}</small></div>
     </section>
-    <section class="metrics">
-      ${metric('Spendable QDAY', commas(balance), `${commas(pending)} pending`)}
-      ${metric('Confirmed BTC', commas(bitcoin), `${commas(bitcoinPending)} pending`)}
-      ${metric('Network peers', `${state.qday?.connections ?? 0} / ${state.bitcoin?.peers ?? 0}`, 'QDAY / Bitcoin')}
-      ${metric('Open offers', state.relay?.stats?.open ?? orders.total ?? '0', 'signed orders')}
+    <section class="exchange-grid">
+      <article class="market-panel chart-panel"><header class="panel-head"><div><span>PRICE</span><strong>QDAY / BTC</strong></div><div class="chart-controls"><span class="chart-scale">AUTO SCALE</span><div class="chart-ranges"><button data-chart-range="24H" class="${chartRange === '24H' ? 'active' : ''}">24H</button><button data-chart-range="7D" class="${chartRange === '7D' ? 'active' : ''}">7D</button><button data-chart-range="ALL" class="${chartRange === 'ALL' ? 'active' : ''}">ALL</button></div></div></header><div class="chart-summary"><div><span>LAST</span><strong id="chart-last">N/A</strong></div><div><span>CHANGE</span><strong id="chart-change">N/A</strong></div><div><span>HIGH</span><strong id="chart-high">N/A</strong></div><div><span>LOW</span><strong id="chart-low">N/A</strong></div><div><span>VOLUME</span><strong id="chart-volume">N/A</strong></div></div><div class="chart-wrap"><canvas id="price-chart" aria-label="Matched QDAY Bitcoin price history"></canvas><div class="chart-empty" id="chart-empty" hidden>NO MATCHED TRADES YET</div><div class="chart-tooltip" id="chart-tooltip" hidden></div></div></article>
+      ${orderBook()}
+      ${tradeTicket()}
+      <article class="market-panel trades-panel"><header class="panel-head"><div><span>RECENT MATCHES</span><strong>PRICE · AMOUNT · TIME</strong></div><small>${marketTrades.total} TOTAL</small></header>${recentTrades()}</article>
     </section>
-    <section class="trade-actions" aria-label="Trade QDAY">
-      <a href="#create?side=buy" class="trade-action buy"><span>BUY QDAY</span><small>See available sell offers or set your own buy price.</small><b>PAY BTC →</b></a>
-      <a href="#create?side=sell" class="trade-action sell"><span>SELL QDAY</span><small>See available buy offers or set your own sell price.</small><b>RECEIVE BTC →</b></a>
-    </section>
-    <section class="card"><div class="card-head"><h2>Open QDAY ↔ BTC offers</h2><span>${escapeHTML(orders.total)} SIGNED</span></div>${orderList(orders.items)}</section>`;
+    <section class="card my-orders"><div class="card-head"><h2>MY OPEN ORDERS</h2><span>${orders.items.filter(record => record.signed.order.makerPublicKey === state.identityPublicKey).length}</span></div>${orderList(orders.items.filter(record => record.signed.order.makerPublicKey === state.identityPublicKey))}</section>`;
+  updateOfferPreview();
+  setupPriceChart();
 }
 
 function orderList(records) {
@@ -342,8 +700,22 @@ function updateOfferPreview() {
     priceBTC = enteredPrice;
     priceUSD = bitcoinUSD ? enteredPrice * bitcoinUSD : 0;
   }
-  const valid = Number.isFinite(quantity) && quantity > 0 && Number.isFinite(enteredPrice) && enteredPrice > 0 && priceBTC > 0;
+  const selected = orders.items.find(record => record.signed.id === selectedOrderID);
+  const selectedTerms = selected?.signed?.order;
+  const selectedAmounts = selectedTerms ? marketAmounts(selectedTerms) : null;
+  const selectedSide = selectedTerms?.give?.asset === 'QDAY' ? 'buy' : 'sell';
+  const takingOrder = Boolean(selected && selectedSide === form.dataset.side && form.dataset.selectedOrder === selectedOrderID);
+  const effectiveQuantity = takingOrder ? numericUnits(selectedAmounts.qday.atomic, selectedTerms.qdayUnitAtomic) : quantity;
+  const effectiveTotalBTC = takingOrder ? numericUnits(selectedAmounts.btc.atomic, '100000000') : effectiveQuantity * priceBTC;
+  const effectivePriceBTC = takingOrder ? marketPriceNumber({
+    qdayAtomic: selectedAmounts.qday.atomic,
+    btcAtomic: selectedAmounts.btc.atomic,
+    qdayUnitAtomic: selectedTerms.qdayUnitAtomic
+  }) : priceBTC;
+  const valid = takingOrder || (Number.isFinite(quantity) && quantity > 0 && Number.isFinite(enteredPrice) && enteredPrice > 0 && priceBTC > 0);
   button.disabled = !valid;
+  button.dataset.takeOrder = takingOrder ? selectedOrderID : '';
+  button.textContent = takingOrder ? `REVIEW ${buying ? 'BUY' : 'SELL'}` : `PLACE ${buying ? 'BUY' : 'SELL'} ORDER`;
   balanceWarning.hidden = true;
   if (!valid) {
     qdayOutput.textContent = '— QDAY';
@@ -353,22 +725,29 @@ function updateOfferPreview() {
     btcPriceOutput.textContent = 'Final offer is fixed in BTC';
     return;
   }
-  const totalBTC = quantity * priceBTC;
+  const totalBTC = effectiveTotalBTC;
   const totalUSD = bitcoinUSD ? totalBTC * bitcoinUSD : 0;
+  if (!takingOrder && totalBTC + 1e-12 < .0001) {
+    button.disabled = true;
+    balanceWarning.hidden = false;
+    balanceWarning.textContent = 'Bitcoin contract total must be at least 0.0001 BTC.';
+  }
   const available = Number(buying ? state.bitcoinBalance?.confirmed?.btc ?? 0 : state.balance?.spendable?.qday ?? 0);
-  const required = buying ? totalBTC : quantity;
+  const required = buying ? totalBTC : effectiveQuantity;
   if (!Number.isFinite(available) || available < required) {
     button.disabled = true;
     balanceWarning.hidden = false;
     balanceWarning.textContent = buying
       ? `Not enough confirmed BTC. This offer needs ${cleanDecimal(totalBTC, 8)} BTC; your confirmed balance is ${state.bitcoinBalance?.confirmed?.btc ?? '0'} BTC.`
-      : `Not enough spendable QDAY. This offer needs ${cleanDecimal(quantity, 8)} QDAY; your spendable balance is ${state.balance?.spendable?.qday ?? '0'} QDAY.`;
+      : `Not enough spendable QDAY. This offer needs ${cleanDecimal(effectiveQuantity, 8)} QDAY; your spendable balance is ${state.balance?.spendable?.qday ?? '0'} QDAY.`;
   }
-  qdayOutput.textContent = `${commas(cleanDecimal(quantity, 8))} QDAY`;
+  qdayOutput.textContent = `${commas(cleanDecimal(effectiveQuantity, 8))} QDAY`;
   btcOutput.textContent = `${cleanDecimal(totalBTC, 8) || '< 0.00000001'} BTC`;
-  usdOutput.textContent = totalUSD ? `≈ ${dollars(totalUSD)}` : 'USD reference unavailable';
-  priceOutput.textContent = offerPriceCurrency === 'USD' ? `${dollars(priceUSD)} / QDAY` : `${cleanDecimal(priceBTC, 16)} BTC / QDAY`;
-  btcPriceOutput.textContent = `${cleanDecimal(priceBTC, 16)} BTC per QDAY${buying ? ' · maximum you pay' : ' · minimum you receive'}`;
+  usdOutput.textContent = totalUSD
+    ? `≈ ${dollars(totalUSD)}${buying ? ' · plus Bitcoin funding fee' : ' · before Bitcoin claim fee'}`
+    : buying ? 'Plus Bitcoin funding fee' : 'Bitcoin claim fee is deducted';
+  priceOutput.textContent = takingOrder ? `${cleanDecimal(effectivePriceBTC, 16)} BTC / QDAY` : offerPriceCurrency === 'USD' ? `${dollars(priceUSD)} / QDAY` : `${cleanDecimal(effectivePriceBTC, 16)} BTC / QDAY`;
+  btcPriceOutput.textContent = `${cleanDecimal(effectivePriceBTC, 16)} BTC per QDAY${takingOrder ? ' · exact signed amounts' : buying ? ' · maximum you pay' : ' · minimum you receive'}`;
 }
 
 function offerReview(quote, lifetimeMinutes) {
@@ -378,7 +757,7 @@ function offerReview(quote, lifetimeMinutes) {
   openModal(`<div class="modal-head"><span class="eyebrow">FINAL CHECK</span><h2>${buying ? 'BUY' : 'SELL'} ${escapeHTML(quote.quantity)} QDAY.</h2></div><div class="modal-body">
     <div class="final-quote">
       <div><span>${buying ? 'YOU RECEIVE' : 'YOU SEND'}</span><strong>${escapeHTML(quote.quantity)} QDAY</strong></div>
-      <div><span>${buying ? 'YOU SEND' : 'YOU RECEIVE'}</span><strong>${escapeHTML(quote.btcAmount)} BTC</strong><small>≈ ${escapeHTML(reference)}</small></div>
+      <div><span>${buying ? 'CONTRACT AMOUNT YOU FUND' : 'BITCOIN CONTRACT AMOUNT'}</span><strong>${escapeHTML(quote.btcAmount)} BTC</strong><small>≈ ${escapeHTML(reference)} · ${buying ? 'your wallet also pays the funding fee' : 'the claim fee is deducted when you receive it'}</small></div>
       <div><span>YOUR INPUT</span><strong>${escapeHTML(entered)}</strong><small>Exact signed rate: ${escapeHTML(quote.btcPerQDAY)} BTC per QDAY</small></div>
       <div><span>EXPIRES</span><strong>${escapeHTML(String(lifetimeMinutes < 60 ? `${lifetimeMinutes} minutes` : lifetimeMinutes === 60 ? '1 hour' : lifetimeMinutes === 1440 ? '24 hours' : lifetimeMinutes === 10080 ? '7 days' : `${lifetimeMinutes / 60} hours`))}</strong><small>You can cancel while it remains open.</small></div>
     </div>
@@ -412,21 +791,97 @@ function negotiationTerms(record) {
 }
 
 function renderSwaps(historyOnly = false) {
-  const completed = new Set(['complete', 'refunded']);
+  const completed = new Set(['complete', 'refunded', 'expired']);
   const swaps = negotiations.swaps.filter(swap => historyOnly ? completed.has(swap.phase) : !completed.has(swap.phase));
   if (historyOnly) {
     root.innerHTML = `<section class="page-head"><div><span class="eyebrow">LOCAL JOURNAL</span><h1>HISTORY.</h1><p>Completed and refunded swaps remain auditable on this computer.</p></div></section>${swapTable(swaps)}`;
     return;
   }
   root.innerHTML = `<section class="page-head"><div><span class="eyebrow">LOCAL JOURNAL</span><h1>ACTIVE SWAPS.</h1><p>Acceptances, matches and contract progress survive restarts.</p></div></section>
-    ${negotiations.incoming.length ? `<section class="card"><div class="card-head"><h2>Waiting for your choice</h2><span>${negotiations.incoming.length}</span></div><div class="negotiation-list">${negotiations.incoming.map(item => `<article><div><strong>${escapeHTML(negotiationTerms(item))}</strong><small>Taker ${escapeHTML(short(item.acceptance.acceptance.takerPublicKey))}</small></div><button class="primary" data-match-acceptance="${escapeHTML(item.acceptance.id)}">MATCH TAKER</button></article>`).join('')}</div></section>` : ''}
+    ${negotiations.incoming.length ? `<section class="card"><div class="card-head"><h2>Match retry required</h2><span>${negotiations.incoming.length}</span></div><div class="negotiation-list">${negotiations.incoming.map(item => `<article><div><strong>${escapeHTML(negotiationTerms(item))}</strong><small>Automatic matching could not reach the relay.</small></div><button class="primary" data-match-acceptance="${escapeHTML(item.acceptance.id)}">RETRY MATCH</button></article>`).join('')}</div></section>` : ''}
     ${negotiations.pending.length ? `<section class="card"><div class="card-head"><h2>Waiting for maker</h2><span>${negotiations.pending.length}</span></div><div class="negotiation-list">${negotiations.pending.map(item => `<article><div><strong>${escapeHTML(negotiationTerms(item))}</strong><small>Acceptance expires ${escapeHTML(new Date(item.acceptance.acceptance.expiresAt * 1000).toLocaleString())}</small></div><span class="waiting-label">PENDING</span></article>`).join('')}</div></section>` : ''}
     ${swapTable(swaps)}`;
 }
 
 function swapTable(swaps) {
   if (!swaps.length) return `<section class="card"><div class="empty"><strong>NOTHING HERE YET.</strong><p>Matched swaps will appear here before either wallet broadcasts a contract.</p></div></section>`;
-  return `<section class="card"><div class="card-head"><h2>Swaps</h2><span>${swaps.length}</span></div><div class="negotiation-list">${swaps.map(swap => `<article><div><strong>${escapeHTML(negotiationTerms(swap))}</strong><small>${escapeHTML(swap.role.toUpperCase())} · ${escapeHTML(swap.id)}</small></div><span class="phase">${escapeHTML(swap.phase.replaceAll('_', ' ').toUpperCase())}</span></article>`).join('')}</div></section>`;
+  return `<section class="card"><div class="card-head"><h2>Swaps</h2><span>${swaps.length}</span></div><div class="swap-list">${swaps.map(swap => {
+    const view = swapView(swap);
+    const canApprove = !swap.approved && swap.agreementJSON && ['terms_agreed', 'maker_funding', 'maker_funded'].includes(swap.phase);
+    return `<article class="swap-row ${swap.lastError ? 'has-error' : ''}">
+      <div class="swap-main"><span class="side ${view.side}">${view.label}</span><strong>${escapeHTML(view.receive)}</strong><small>You send ${escapeHTML(view.send)}</small></div>
+      <div class="swap-progress"><b>${escapeHTML(swapStatus(swap))}</b><small>${escapeHTML(swapStatusNote(swap))}</small>${swap.lastError ? `<em>${escapeHTML(swap.lastError)}</em>` : ''}</div>
+      <div class="swap-actions">${canApprove ? `<button class="primary" data-review-swap="${escapeHTML(swap.id)}">REVIEW AND START</button>` : ''}<button class="secondary" data-view-swap="${escapeHTML(swap.id)}">DETAILS</button></div>
+    </article>`;
+  }).join('')}</div></section>`;
+}
+
+function swapView(swap) {
+  const terms = swap.order.order;
+  const send = swap.role === 'maker' ? terms.give : terms.receive;
+  const receive = swap.role === 'maker' ? terms.receive : terms.give;
+  return {
+    send: amountText(send, terms.qdayUnitAtomic),
+    receive: amountText(receive, terms.qdayUnitAtomic),
+    side: receive.asset === 'QDAY' ? 'buy' : 'sell',
+    label: receive.asset === 'QDAY' ? 'BUY QDAY' : 'SELL QDAY'
+  };
+}
+
+function swapStatus(swap) {
+  if (swap.phase === 'terms_agreed' && !swap.approved) return 'Ready for your approval';
+  const localMaker = swap.role === 'maker';
+  return ({
+    matched: 'Preparing secure swap',
+    terms_proposed: 'Verifying exact terms',
+    terms_agreed: 'Waiting for the other trader',
+    maker_funding: localMaker ? 'Sending your deposit' : 'Waiting for maker deposit',
+    maker_funded: localMaker ? 'Your deposit is secured' : (swap.approved ? 'Preparing your deposit' : 'Deposit received. Your approval needed'),
+    taker_funding: localMaker ? 'Waiting for taker deposit' : 'Sending your deposit',
+    taker_funded: 'Both deposits secured',
+    maker_claiming: localMaker ? 'Claiming your coins' : 'Other trader is claiming',
+    maker_claimed: localMaker ? 'Waiting for final claim' : 'Your coins are ready to claim',
+    taker_claiming: localMaker ? 'Other trader is claiming' : 'Claiming your coins',
+    complete: 'Swap complete',
+    waiting_for_refund: 'Refund window reached',
+    refunding: 'Returning your deposit',
+    refunded: 'Deposit refunded',
+    expired: 'Swap expired safely'
+  })[swap.phase] || swap.phase.replaceAll('_', ' ');
+}
+
+function swapStatusNote(swap) {
+  if (swap.phase === 'terms_agreed' && !swap.approved) return 'Check the exact amounts once, then the app handles the rest.';
+  if (swap.phase === 'maker_funded' && swap.role === 'taker' && !swap.approved) return 'The maker deposit is confirmed. Start when you are ready.';
+  if (swap.phase === 'complete') return 'Both claims are confirmed.';
+  if (swap.phase === 'refunded') return 'Your funded contract was returned to your wallet.';
+  if (swap.phase === 'expired') return 'No local funds moved. The refund window became too short to start safely.';
+  return 'The app continues automatically and survives restarts.';
+}
+
+function parseAgreement(swap) {
+  try { return JSON.parse(swap.agreementJSON || ''); } catch (_) { return null; }
+}
+
+function swapDetailsModal(swap, approval = false) {
+  const terms = swap.order.order;
+  const view = swapView(swap);
+  const agreement = parseAgreement(swap);
+  const price = orderPrice(terms);
+  const refund = agreement
+    ? `<div><span>SAFETY REFUNDS</span><strong>QDAY block ${commas(agreement.qdayRefundHeight)}<br>Bitcoin block ${commas(agreement.bitcoinRefundHeight)}</strong><small>If the other trader disappears, your funded contract returns after its chain deadline.</small></div>`
+    : `<div><span>SAFETY REFUNDS</span><strong>Preparing…</strong><small>Both absolute refund heights are verified before funding.</small></div>`;
+  openModal(`<div class="modal-head"><span class="eyebrow">${approval ? 'FINAL CHECK' : 'ATOMIC SWAP'}</span><h2>${approval ? 'START THIS SWAP?' : escapeHTML(swapStatus(swap))}</h2></div><div class="modal-body">
+    <div class="final-quote swap-review-grid">
+      <div><span>YOU SEND</span><strong>${escapeHTML(view.send)}</strong><small>Plus that chain's normal network fee</small></div>
+      <div><span>YOU RECEIVE</span><strong>${escapeHTML(view.receive)}</strong><small>Claim fee is deducted by the receiving chain</small></div>
+      <div><span>FIXED RATE</span><strong>${escapeHTML(price)} BTC / QDAY</strong><small>The signed amounts cannot change.</small></div>
+      ${refund}
+    </div>
+    <div class="swap-safety"><b>NONCUSTODIAL.</b><span>Your app signs locally. Neither the relay nor the other trader can take both deposits. Keep QDAY Swap running; if you close it, reopening resumes from the local journal.</span></div>
+    ${swap.lastError ? `<p class="form-error dark">${escapeHTML(swap.lastError)}</p>` : ''}
+    <div class="modal-actions"><button class="secondary" id="close-modal">CLOSE</button>${approval ? `<button class="primary" id="approve-swap" data-swap-id="${escapeHTML(swap.id)}">START SWAP</button>` : ''}</div>
+  </div>`);
 }
 
 function renderEmpty(title, copy, action = '') {
@@ -452,7 +907,12 @@ function currentFingerprint() {
   if (current === 'create') return 'create';
   if (current === 'settings') return JSON.stringify({current, error: state.error, relay: state.relayURL});
   if (current === 'swaps' || current === 'history') return JSON.stringify({current, negotiations, relayError: state.relayError});
-  return JSON.stringify({current: 'market', orders, balance: state.balance, bitcoinBalance: state.bitcoinBalance, relay: state.relay, error: state.error, relayError: state.relayError, marketError});
+  return JSON.stringify({
+    current: 'market', orders, marketTrades, offerSide, selectedOrderID,
+    balance: state.balance, bitcoinBalance: state.bitcoinBalance,
+    relayStats: state.relay?.stats, error: state.error,
+    relayError: state.relayError, marketError
+  });
 }
 
 function render() {
@@ -460,6 +920,8 @@ function render() {
   updateChrome();
   const fingerprint = currentFingerprint();
   if (fingerprint !== renderFingerprint) {
+    destroyChart();
+    destroyChart = () => {};
     renderFingerprint = fingerprint;
     if (!state.configured) renderSetup();
     else if (!state.unlocked) renderUnlock();
@@ -481,13 +943,15 @@ async function refreshState() {
     state = await api('/api/v1/state');
     marketError = '';
     if (state.configured && state.unlocked) {
-      const [orderResult, negotiationResult] = await Promise.allSettled([
-        api('/api/v1/orders?page=1'), api('/api/v1/negotiations')
+      const [orderResult, negotiationResult, tradeResult] = await Promise.allSettled([
+        api('/api/v1/orders?page=1'), api('/api/v1/negotiations'), api('/api/v1/trades?limit=2000')
       ]);
       if (orderResult.status === 'fulfilled') orders = orderResult.value;
       else marketError = orderResult.reason.message;
       if (negotiationResult.status === 'fulfilled') negotiations = negotiationResult.value;
       else marketError = marketError || negotiationResult.reason.message;
+      if (tradeResult.status === 'fulfilled') marketTrades = tradeResult.value;
+      else marketError = marketError || tradeResult.reason.message;
     }
     render();
   } catch (error) {
@@ -510,6 +974,37 @@ function recoveryModal(phrase, firstRun = false) {
 document.addEventListener('click', async event => {
   if (event.target.closest('#close-modal')) {
     closeModal();
+    return;
+  }
+  const bookOrder = event.target.closest('[data-book-order]');
+  if (bookOrder) {
+    selectedOrderID = bookOrder.dataset.bookOrder;
+    offerSide = bookOrder.dataset.bookSide;
+    offerPriceCurrency = 'BTC';
+    renderFingerprint = '';
+    render();
+    document.querySelector('.ticket-panel')?.scrollIntoView({behavior: 'smooth', block: 'nearest'});
+    return;
+  }
+  const ticketSide = event.target.closest('[data-ticket-side]');
+  if (ticketSide) {
+    offerSide = ticketSide.dataset.ticketSide;
+    selectedOrderID = '';
+    renderFingerprint = '';
+    render();
+    return;
+  }
+  if (event.target.closest('[data-clear-order]')) {
+    selectedOrderID = '';
+    renderFingerprint = '';
+    render();
+    return;
+  }
+  const range = event.target.closest('[data-chart-range]');
+  if (range) {
+    chartRange = range.dataset.chartRange;
+    document.querySelectorAll('[data-chart-range]').forEach(button => button.classList.toggle('active', button.dataset.chartRange === chartRange));
+    setupPriceChart();
     return;
   }
   const sideChoice = event.target.closest('[data-offer-side]');
@@ -613,6 +1108,32 @@ document.addEventListener('click', async event => {
     match.disabled = true;
     try { await post(`/api/v1/acceptances/${match.dataset.matchAcceptance}/match`); renderFingerprint = ''; await refreshState(); } catch (error) { showToast(error.message); match.disabled = false; }
   }
+  const reviewSwap = event.target.closest('[data-review-swap]');
+  if (reviewSwap) {
+    const swap = negotiations.swaps.find(item => item.id === reviewSwap.dataset.reviewSwap);
+    if (!swap) { showToast('Swap is no longer available'); return; }
+    swapDetailsModal(swap, true);
+    return;
+  }
+  const viewSwap = event.target.closest('[data-view-swap]');
+  if (viewSwap) {
+    const swap = negotiations.swaps.find(item => item.id === viewSwap.dataset.viewSwap);
+    if (!swap) { showToast('Swap is no longer available'); return; }
+    swapDetailsModal(swap, false);
+    return;
+  }
+  const approveSwap = event.target.closest('#approve-swap');
+  if (approveSwap) {
+    approveSwap.disabled = true;
+    approveSwap.textContent = 'STARTING…';
+    try {
+      await post(`/api/v1/swaps/${approveSwap.dataset.swapId}/approve`);
+      closeModal(); renderFingerprint = ''; await refreshState(); showToast('Swap started');
+    } catch (error) {
+      showToast(error.message); approveSwap.disabled = false; approveSwap.textContent = 'TRY AGAIN';
+    }
+    return;
+  }
 });
 
 document.addEventListener('input', event => {
@@ -657,6 +1178,13 @@ document.addEventListener('submit', async event => {
     const button = form.querySelector('[type=submit]');
     const errorBox = form.querySelector('#form-error');
     const originalLabel = button.textContent;
+    const takeOrderID = button.dataset.takeOrder;
+    if (takeOrderID) {
+      const record = orders.items.find(item => item.signed.id === takeOrderID);
+      if (!record) { showToast('Offer is no longer available'); return; }
+      acceptanceReview(record);
+      return;
+    }
     button.disabled = true; button.textContent = 'CALCULATING EXACT AMOUNTS…';
     errorBox.hidden = true;
     try {

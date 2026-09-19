@@ -104,7 +104,7 @@ func TestOrderAPIRejectsWrongNetworkAndTampering(t *testing.T) {
 	server, _ := testHTTPServer(t, now)
 	publicKey, privateKey := testSigner(t)
 	messageKey := [32]byte{1}
-	payload, err := order.NewPayload("testnet", order.QDAYLegacyUnit, order.Amount{Asset: "QDAY", Atomic: order.QDAYLegacyUnit}, order.Amount{Asset: "BTC", Atomic: "1000"}, time.Hour, publicKey, messageKey, now)
+	payload, err := order.NewPayload("testnet", order.QDAYLegacyUnit, order.Amount{Asset: "QDAY", Atomic: order.QDAYLegacyUnit}, order.Amount{Asset: "BTC", Atomic: "10000"}, time.Hour, publicKey, messageKey, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +118,7 @@ func TestOrderAPIRejectsWrongNetworkAndTampering(t *testing.T) {
 	}
 
 	signed = testSignedOrder(t, publicKey, privateKey, now, 0)
-	signed.Order.Receive.Atomic = "1"
+	signed.Order.Receive.Atomic = "10001"
 	response, decoded = requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/v1/orders", signed)
 	if response.StatusCode != http.StatusBadRequest || !strings.Contains(decoded["error"].(string), "ID") {
 		t.Fatalf("tamper status=%d body=%#v", response.StatusCode, decoded)
@@ -250,6 +250,15 @@ func TestNegotiationAndEncryptedMailboxAPI(t *testing.T) {
 	lastTrade := stats["lastTrade"].(map[string]any)
 	if response.StatusCode != http.StatusOK || lastTrade["qdayAtomic"] == "" || lastTrade["btcAtomic"] == "" || lastTrade["matchedAt"] != float64(fixture.match.Match.CreatedAt) {
 		t.Fatalf("last trade status=%d body=%#v", response.StatusCode, decoded)
+	}
+	response, decoded = requestJSON(t, server.Client(), http.MethodGet, server.URL+"/api/v1/trades?limit=50", nil)
+	trades := decoded["items"].([]any)
+	if response.StatusCode != http.StatusOK || decoded["total"] != float64(1) || len(trades) != 1 {
+		t.Fatalf("trade history status=%d body=%#v", response.StatusCode, decoded)
+	}
+	tradeItem := trades[0].(map[string]any)
+	if tradeItem["orderID"] != fixture.order.ID || tradeItem["matchedAt"] != float64(fixture.match.Match.CreatedAt) {
+		t.Fatalf("trade history item=%#v", tradeItem)
 	}
 	message, err := trade.EncryptMessage("mainnet", fixture.order.ID, fixture.acceptance.Acceptance.TradeID, 1,
 		fixture.makerPrivate, fixture.takerPrivate.Public().(ed25519.PublicKey), fixture.makerMessagePrivate,

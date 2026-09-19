@@ -34,6 +34,9 @@ func (fakeApplication) Orders(context.Context, string, int) (relay.ResultPage, e
 func (fakeApplication) MarketPrice(context.Context) (relay.MarketPrice, error) {
 	return relay.MarketPrice{Pair: "BTC-USD", USD: "81401.385", Source: "test"}, nil
 }
+func (fakeApplication) MarketTrades(context.Context, int, int64) (relay.TradeHistory, error) {
+	return relay.TradeHistory{Items: []relay.Trade{}}, nil
+}
 func (fakeApplication) QuoteOffer(context.Context, app.QuoteOfferRequest) (app.OfferQuote, error) {
 	return app.OfferQuote{Side: "buy", Quantity: "10", BTCAmount: "0.000125"}, nil
 }
@@ -48,6 +51,9 @@ func (fakeApplication) AcceptOffer(context.Context, string) (swapstate.Negotiati
 }
 func (fakeApplication) MatchAcceptance(context.Context, string) (swapstate.Swap, error) {
 	return swapstate.Swap{}, nil
+}
+func (fakeApplication) ApproveSwap(string) (swapstate.Swap, error) {
+	return swapstate.Swap{Approved: true}, nil
 }
 func (fakeApplication) Negotiations() (app.Negotiations, error) {
 	return app.Negotiations{Pending: []swapstate.Negotiation{}, Incoming: []swapstate.Negotiation{}, Swaps: []swapstate.Swap{}}, nil

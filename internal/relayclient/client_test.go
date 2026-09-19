@@ -41,7 +41,7 @@ func TestClientPublishesListsAndCancelsVerifiedOrder(t *testing.T) {
 	}
 	payload, err := order.NewPayload("mainnet", order.QDAYLegacyUnit,
 		order.Amount{Asset: "QDAY", Atomic: order.QDAYLegacyUnit},
-		order.Amount{Asset: "BTC", Atomic: "1000"}, time.Hour, public, [32]byte{1}, now)
+		order.Amount{Asset: "BTC", Atomic: "10000"}, time.Hour, public, [32]byte{1}, now)
 	if err != nil {
 		t.Fatal(err)
 	}

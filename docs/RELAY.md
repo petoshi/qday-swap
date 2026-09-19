@@ -34,6 +34,8 @@ page by default.
 
 ```text
 GET  /api/v1/status
+GET  /api/v1/price
+GET  /api/v1/trades?limit=200&since=0
 GET  /api/v1/orders?status=open&page=1&limit=20
 GET  /api/v1/orders/{orderID}
 POST /api/v1/orders
@@ -71,6 +73,11 @@ its signed deadline. A maker may cancel it earlier by signing a separate
 domain-separated cancellation containing the order ID, maker public key and
 cancellation time. A relay never accepts an unsigned delete request.
 
+`GET /api/v1/price` returns the external BTC/USD reference price and the last
+matched QDAY/BTC price. `GET /api/v1/trades` returns signed order matches. A
+match proves that two identities committed to fixed terms; it is not a claim
+that both chain settlements have completed.
+
 The first server keeps at most 100 simultaneously open offers for one maker
 identity. HTTP request bodies are capped at 64 KiB. Public deployment also
 applies connection and write limits at the reverse proxy while keeping read-only
@@ -81,7 +88,8 @@ order pages available.
 A taker selects an order by signing an acceptance containing a random 32-byte
 trade ID, its Ed25519 identity and its X25519 message key. The acceptance lasts
 at most 15 minutes and cannot outlive the order. It does not close the public
-offer by itself. The maker chooses one valid acceptance and signs a match that
+offer by itself. The maker application signs the first valid acceptance it
+receives and leaves a manual retry only if relay delivery fails. The match
 binds the order ID, acceptance ID, trade ID and both identities. The store
 changes the order from `open` to `matched` atomically, so two concurrent takers
 cannot both acquire the same offer.
@@ -111,10 +119,10 @@ the SHA-256 ID and verifies the Ed25519 signature again with browser WebCrypto.
 The `Open in QDAY Swap` action passes only the public order ID to the installed
 application.
 
-## Remaining application work
+## Installed application
 
 Contract construction, chain observation, signing, claim and refund stay in the
-installed application. The next implementation step connects this relay
-protocol to the durable local swap state machine and browser UI. The later
-discovery mesh can transport these same signed orders, acceptances and encrypted
-messages without changing their canonical format.
+installed application. Signed matches enter a durable local state machine;
+funding still requires explicit review and approval. Prepared transactions,
+encrypted envelopes and mailbox cursors survive restarts. The later discovery
+mesh can transport the same records without changing their canonical format.

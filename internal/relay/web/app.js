@@ -114,7 +114,7 @@ function price(order) {
   const receive = BigInt(order.receive.atomic);
   const qdayAtomic = order.give.asset === 'QDAY' ? give : receive;
   const satoshis = order.give.asset === 'BTC' ? give : receive;
-  return formatRatio(satoshis * BigInt(order.qdayUnitAtomic), qdayAtomic * 100000000n, 8);
+  return formatRatio(satoshis * BigInt(order.qdayUnitAtomic), qdayAtomic * 100000000n, 16);
 }
 
 function dollars(value, bitcoin = false) {

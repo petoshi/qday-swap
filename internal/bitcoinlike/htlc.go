@@ -228,3 +228,31 @@ func (c Contract) ExtractSecret(raw string, funding Funding) ([32]byte, error) {
 	}
 	return secret, nil
 }
+
+// IsRefund recognizes the canonical refund branch of this exact contract.
+// A confirmed transaction that passes this check can only have spent through
+// the absolute-height refund path; signature validity is enforced by Bitcoin
+// consensus before confirmation.
+func (c Contract) IsRefund(raw string, funding Funding) (bool, error) {
+	tx, err := DecodeTransaction(raw)
+	if err != nil {
+		return false, err
+	} else if len(tx.TxIn) != 1 {
+		return false, errors.New("refund must contain exactly one input")
+	}
+	input := tx.TxIn[0]
+	if input.PreviousOutPoint.Hash != funding.Hash || input.PreviousOutPoint.Index != funding.Vout {
+		return false, errors.New("refund spends another outpoint")
+	} else if tx.LockTime < c.RefundHeight || input.Sequence == 0xffffffff {
+		return false, errors.New("refund locktime is invalid")
+	}
+	witnessScript, err := c.WitnessScript()
+	if err != nil {
+		return false, err
+	}
+	witness := input.Witness
+	if len(witness) != 3 || len(witness[0]) == 0 || len(witness[1]) != 0 || !bytes.Equal(witness[2], witnessScript) {
+		return false, errors.New("refund does not contain the canonical HTLC witness")
+	}
+	return true, nil
+}

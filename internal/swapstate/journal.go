@@ -4,11 +4,14 @@
 package swapstate
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/petoshi/qday-swap/internal/order"
@@ -55,22 +58,31 @@ const (
 	PhaseWaitingForRefund Phase = "waiting_for_refund"
 	PhaseRefunding        Phase = "refunding"
 	PhaseRefunded         Phase = "refunded"
+	PhaseExpired          Phase = "expired"
 )
 
 type Swap struct {
-	Version       uint16                 `json:"version"`
-	ID            string                 `json:"id"`
-	Role          Role                   `json:"role"`
-	Phase         Phase                  `json:"phase"`
-	Order         order.Signed           `json:"order"`
-	Acceptance    trade.SignedAcceptance `json:"acceptance"`
-	Match         trade.SignedMatch      `json:"match"`
-	SecretHash    string                 `json:"secretHash,omitempty"`
-	AgreementHash string                 `json:"agreementHash,omitempty"`
-	MailboxCursor uint64                 `json:"mailboxCursor"`
-	LastError     string                 `json:"lastError,omitempty"`
-	CreatedAt     int64                  `json:"createdAt"`
-	UpdatedAt     int64                  `json:"updatedAt"`
+	Version        uint16                 `json:"version"`
+	ID             string                 `json:"id"`
+	Role           Role                   `json:"role"`
+	Phase          Phase                  `json:"phase"`
+	Order          order.Signed           `json:"order"`
+	Acceptance     trade.SignedAcceptance `json:"acceptance"`
+	Match          trade.SignedMatch      `json:"match"`
+	SecretHash     string                 `json:"secretHash,omitempty"`
+	AgreementHash  string                 `json:"agreementHash,omitempty"`
+	AgreementJSON  string                 `json:"agreementJSON,omitempty"`
+	LocalHelloJSON string                 `json:"localHelloJSON,omitempty"`
+	PeerHelloJSON  string                 `json:"peerHelloJSON,omitempty"`
+	SentMessages   map[string]string      `json:"sentMessages,omitempty"`
+	MakerFunding   string                 `json:"makerFunding,omitempty"`
+	TakerFunding   string                 `json:"takerFunding,omitempty"`
+	Approved       bool                   `json:"approved"`
+	RevealedSecret string                 `json:"revealedSecret,omitempty"`
+	MailboxCursor  uint64                 `json:"mailboxCursor"`
+	LastError      string                 `json:"lastError,omitempty"`
+	CreatedAt      int64                  `json:"createdAt"`
+	UpdatedAt      int64                  `json:"updatedAt"`
 }
 
 type ActionStatus string
@@ -193,6 +205,89 @@ func (j *Journal) SaveRelayMessage(message trade.SignedMessage, now time.Time) (
 		return bucket.Put([]byte(message.ID), encoded)
 	})
 	return created, err
+}
+
+// SaveOutboundMessage persists the exact encrypted envelope and binds it to a
+// stable protocol step in the same database transaction. A restart therefore
+// retries the same ciphertext and ID instead of reusing a sequence number with
+// a different nonce.
+func (j *Journal) SaveOutboundMessage(swapID, messageKey string, message trade.SignedMessage, now time.Time) (trade.SignedMessage, bool, error) {
+	if strings.TrimSpace(messageKey) == "" || len(messageKey) > 128 {
+		return trade.SignedMessage{}, false, errors.New("outbound message key is invalid")
+	} else if message.Message.TradeID != swapID {
+		return trade.SignedMessage{}, false, errors.New("outbound message belongs to another swap")
+	} else if err := message.Verify(time.Unix(message.Message.CreatedAt, 0)); err != nil {
+		return trade.SignedMessage{}, false, err
+	}
+	created := false
+	err := j.db.Update(func(tx *bbolt.Tx) error {
+		trades := tx.Bucket(tradesBucket)
+		encodedSwap := trades.Get([]byte(swapID))
+		if encodedSwap == nil {
+			return ErrNotFound
+		}
+		var record Swap
+		if err := json.Unmarshal(encodedSwap, &record); err != nil {
+			return err
+		}
+		if existingID := record.SentMessages[messageKey]; existingID != "" {
+			encoded := tx.Bucket(relayMessagesBucket).Get([]byte(existingID))
+			if encoded == nil {
+				return errors.New("outbound message journal is inconsistent")
+			}
+			var existing trade.SignedMessage
+			if err := json.Unmarshal(encoded, &existing); err != nil {
+				return err
+			}
+			if existing.ID != message.ID {
+				return errors.New("outbound protocol step is immutable")
+			}
+			message = existing
+			return nil
+		}
+		messages := tx.Bucket(relayMessagesBucket)
+		if encoded := messages.Get([]byte(message.ID)); encoded != nil {
+			var existing trade.SignedMessage
+			if err := json.Unmarshal(encoded, &existing); err != nil {
+				return err
+			}
+			if existing.Message.TradeID != swapID {
+				return errors.New("relay message ID belongs to another swap")
+			}
+		} else {
+			encoded, err := json.Marshal(message)
+			if err != nil {
+				return err
+			}
+			if err := messages.Put([]byte(message.ID), encoded); err != nil {
+				return err
+			}
+		}
+		if record.SentMessages == nil {
+			record.SentMessages = make(map[string]string)
+		}
+		record.SentMessages[messageKey] = message.ID
+		record.UpdatedAt = now.Unix()
+		encodedSwap, err := json.Marshal(record)
+		if err != nil {
+			return err
+		}
+		created = true
+		return trades.Put([]byte(swapID), encodedSwap)
+	})
+	return message, created, err
+}
+
+func (j *Journal) RelayMessage(id string) (trade.SignedMessage, error) {
+	var message trade.SignedMessage
+	err := j.db.View(func(tx *bbolt.Tx) error {
+		encoded := tx.Bucket(relayMessagesBucket).Get([]byte(id))
+		if encoded == nil {
+			return ErrNotFound
+		}
+		return json.Unmarshal(encoded, &message)
+	})
+	return message, err
 }
 
 func (j *Journal) RelayMessages(tradeID string) ([]trade.SignedMessage, error) {
@@ -411,6 +506,112 @@ func (j *Journal) SetAgreement(id, secretHash, agreementHash string, expected Ph
 	})
 }
 
+func (j *Journal) SetHello(id string, local bool, helloJSON string, now time.Time) (Swap, error) {
+	if helloJSON == "" || !json.Valid([]byte(helloJSON)) {
+		return Swap{}, errors.New("swap hello must be valid JSON")
+	}
+	return j.updateSwap(id, func(record *Swap) error {
+		current := &record.PeerHelloJSON
+		if local {
+			current = &record.LocalHelloJSON
+		}
+		if *current != "" && *current != helloJSON {
+			return errors.New("swap hello is immutable")
+		}
+		*current = helloJSON
+		record.UpdatedAt = now.Unix()
+		return nil
+	})
+}
+
+func (j *Journal) SetFunding(id, party, fundingJSON string, now time.Time) (Swap, error) {
+	if party != "maker" && party != "taker" {
+		return Swap{}, errors.New("funding party must be maker or taker")
+	} else if fundingJSON == "" || !json.Valid([]byte(fundingJSON)) {
+		return Swap{}, errors.New("funding notice must be valid JSON")
+	}
+	return j.updateSwap(id, func(record *Swap) error {
+		current := &record.MakerFunding
+		if party == "taker" {
+			current = &record.TakerFunding
+		}
+		if *current != "" && *current != fundingJSON {
+			return errors.New("swap funding notice is immutable")
+		}
+		*current = fundingJSON
+		record.UpdatedAt = now.Unix()
+		return nil
+	})
+}
+
+func (j *Journal) SetAgreementDetails(id, secretHash, agreementHash, agreementJSON string, expected Phase, now time.Time) (Swap, error) {
+	if len(secretHash) != 64 || len(agreementHash) != 64 {
+		return Swap{}, errors.New("secret and agreement hashes must be 32-byte hexadecimal strings")
+	} else if agreementJSON == "" || !json.Valid([]byte(agreementJSON)) {
+		return Swap{}, errors.New("swap agreement must be valid JSON")
+	}
+	return j.updateSwap(id, func(record *Swap) error {
+		if record.Phase != expected {
+			return ErrPhaseChanged
+		}
+		if record.SecretHash != "" && (record.SecretHash != secretHash || record.AgreementHash != agreementHash || record.AgreementJSON != agreementJSON) {
+			return errors.New("swap agreement is immutable")
+		}
+		record.SecretHash = secretHash
+		record.AgreementHash = agreementHash
+		record.AgreementJSON = agreementJSON
+		record.UpdatedAt = now.Unix()
+		return nil
+	})
+}
+
+func (j *Journal) Approve(id string, now time.Time) (Swap, error) {
+	return j.updateSwap(id, func(record *Swap) error {
+		switch record.Phase {
+		case PhaseTermsAgreed, PhaseMakerFunding, PhaseMakerFunded, PhaseTakerFunding, PhaseTakerFunded,
+			PhaseMakerClaiming, PhaseMakerClaimed, PhaseTakerClaiming:
+		default:
+			return errors.New("swap terms are not ready for funding approval")
+		}
+		if record.AgreementJSON == "" {
+			return errors.New("swap agreement is missing")
+		}
+		record.Approved = true
+		record.UpdatedAt = now.Unix()
+		return nil
+	})
+}
+
+func (j *Journal) SetRevealedSecret(id, secret string, now time.Time) (Swap, error) {
+	decoded, err := hex.DecodeString(secret)
+	if err != nil || len(decoded) != sha256.Size || secret != strings.ToLower(secret) {
+		return Swap{}, errors.New("revealed secret must be 32 lowercase hexadecimal bytes")
+	}
+	return j.updateSwap(id, func(record *Swap) error {
+		hash := sha256.Sum256(decoded)
+		if hex.EncodeToString(hash[:]) != record.SecretHash {
+			return errors.New("revealed secret does not match the swap hash")
+		}
+		if record.RevealedSecret != "" && record.RevealedSecret != secret {
+			return errors.New("swap secret is immutable")
+		}
+		record.RevealedSecret = secret
+		record.UpdatedAt = now.Unix()
+		return nil
+	})
+}
+
+func (j *Journal) SetLastError(id, message string, now time.Time) (Swap, error) {
+	if len(message) > 2_000 {
+		message = message[:2_000]
+	}
+	return j.updateSwap(id, func(record *Swap) error {
+		record.LastError = message
+		record.UpdatedAt = now.Unix()
+		return nil
+	})
+}
+
 func (j *Journal) SetMailboxCursor(id string, cursor uint64, now time.Time) (Swap, error) {
 	return j.updateSwap(id, func(record *Swap) error {
 		if cursor < record.MailboxCursor {
@@ -518,6 +719,18 @@ func (j *Journal) Actions(swapID string) ([]Action, error) {
 	return actions, err
 }
 
+func (j *Journal) Action(id string) (Action, error) {
+	var action Action
+	err := j.db.View(func(tx *bbolt.Tx) error {
+		encoded := tx.Bucket(actionsBucket).Get([]byte(id))
+		if encoded == nil {
+			return ErrNotFound
+		}
+		return json.Unmarshal(encoded, &action)
+	})
+	return action, err
+}
+
 func (j *Journal) updateSwap(id string, update func(*Swap) error) (Swap, error) {
 	var record Swap
 	err := j.db.Update(func(tx *bbolt.Tx) error {
@@ -567,11 +780,11 @@ func (j *Journal) updateAction(id string, update func(*Action) error) (Action, e
 func validAdvance(from, to Phase) bool {
 	allowed := map[Phase][]Phase{
 		PhaseMatched:          {PhaseTermsProposed, PhaseWaitingForRefund},
-		PhaseTermsProposed:    {PhaseTermsAgreed, PhaseWaitingForRefund},
-		PhaseTermsAgreed:      {PhaseMakerFunding, PhaseWaitingForRefund},
-		PhaseMakerFunding:     {PhaseMakerFunded, PhaseWaitingForRefund},
-		PhaseMakerFunded:      {PhaseTakerFunding, PhaseWaitingForRefund},
-		PhaseTakerFunding:     {PhaseTakerFunded, PhaseWaitingForRefund},
+		PhaseTermsProposed:    {PhaseTermsAgreed, PhaseWaitingForRefund, PhaseExpired},
+		PhaseTermsAgreed:      {PhaseMakerFunding, PhaseWaitingForRefund, PhaseExpired},
+		PhaseMakerFunding:     {PhaseMakerFunded, PhaseWaitingForRefund, PhaseExpired},
+		PhaseMakerFunded:      {PhaseTakerFunding, PhaseWaitingForRefund, PhaseExpired},
+		PhaseTakerFunding:     {PhaseTakerFunded, PhaseWaitingForRefund, PhaseExpired},
 		PhaseTakerFunded:      {PhaseMakerClaiming, PhaseWaitingForRefund},
 		PhaseMakerClaiming:    {PhaseMakerClaimed, PhaseWaitingForRefund},
 		PhaseMakerClaimed:     {PhaseTakerClaiming, PhaseWaitingForRefund},
@@ -589,8 +802,14 @@ func validAdvance(from, to Phase) bool {
 
 func validRewind(from, to Phase) bool {
 	return (from == PhaseMakerFunded && to == PhaseMakerFunding) ||
+		(from == PhaseTakerFunding && to == PhaseMakerFunding) ||
+		(from == PhaseTakerFunded && to == PhaseMakerFunding) ||
+		(from == PhaseMakerClaiming && to == PhaseMakerFunding) ||
+		(from == PhaseMakerClaiming && to == PhaseTakerFunding) ||
 		(from == PhaseTakerFunded && to == PhaseTakerFunding) ||
 		(from == PhaseMakerClaimed && to == PhaseMakerClaiming) ||
+		(from == PhaseTakerClaiming && to == PhaseMakerClaiming) ||
+		(from == PhaseComplete && to == PhaseMakerClaiming) ||
 		(from == PhaseComplete && to == PhaseTakerClaiming) ||
 		(from == PhaseRefunded && to == PhaseRefunding)
 }

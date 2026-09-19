@@ -125,6 +125,8 @@ func (s *Store) ConfirmMatch(orderID string, match trade.SignedMatch, now time.T
 		if err := json.Unmarshal(encodedAcceptance, &acceptance); err != nil {
 			return err
 		}
+		// The relay enforces the acceptance deadline using its own clock. A
+		// maker-controlled signed timestamp cannot extend a taker's consent.
 		if err := match.Verify(orderRecord.Signed, acceptance.Signed, now); err != nil {
 			return err
 		}

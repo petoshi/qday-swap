@@ -2,7 +2,8 @@
 
 ## What the user gets
 
-The application has Market, Create offer, Active swaps, History and Settings.
+The application has Market, Active swaps, History and Settings. Creating and
+accepting offers happens directly in the Market screen.
 A trade shows the asset pair, exact amounts, both network fees, confirmation
 progress and the exact time or height at which each refund becomes available.
 
@@ -118,19 +119,26 @@ several relays and installed applications.
   ID and an immutable terms hash.
 - Mainnet beta starts with configurable low value limits and removes them only
   after real recovery drills on each adapter.
+- A Bitcoin leg must be at least 10,000 satoshis so ordinary claim and refund
+  fees cannot consume the contract value.
+- A client will not start local funding with fewer than 360 QDAY blocks or 36
+  Bitcoin blocks left before its refund deadline. The unfunded swap then expires
+  locally without moving money.
 
 ## Delivery order
 
 1. Generalize the tested Litecoin P2WSH code into a Bitcoin-family contract
-   engine without weakening the existing tests.
-2. Add the Bitcoin adapter and validating light client.
+   engine without weakening the existing tests. Complete.
+2. Add the Bitcoin adapter and validating Neutrino light client. Complete.
 3. Implement the persistent two-party state machine and encrypted key store.
-4. Run QDAY/BTC and QDAY/LTC regtest scenarios through that state machine,
-   including restarts, stalled peers and reorganizations.
+   Complete.
+4. Exercise real QDAY and Bitcoin-family contracts across claims, refunds,
+   restarts, stalled transactions, concurrent swaps and reorganizations.
+   Complete in automated regtest coverage for QDAY/BTC and QDAY/LTC.
 5. Add the single public signed-order relay and web order explorer. Complete.
 6. Add signed acceptance and the encrypted durable relay mailbox. Complete.
-7. Connect the local UI to the persistent swap state machine and one-click
-   automatic recovery.
+7. Connect the local UI to the persistent swap state machine, automatic maker
+   matching and one-click recovery. Complete.
 8. Complete two small QDAY/BTC mainnet swaps between independent machines.
 9. Add peer-to-peer order discovery when real usage justifies it.
 10. Add EVM and XRP adapters, then DOGE, LTC and BCH markets.

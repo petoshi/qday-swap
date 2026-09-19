@@ -3,6 +3,8 @@ package swapstate
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"path/filepath"
 	"sync"
@@ -213,5 +215,123 @@ func TestNegotiationsAndRelayCursorSurviveRestart(t *testing.T) {
 	}
 	if records, err := journal.PendingAcceptances(); err != nil || len(records) != 0 {
 		t.Fatalf("pending after remove=%#v err=%v", records, err)
+	}
+}
+
+func TestSwapTermsApprovalAndSecretAreDurable(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	signedOrder, acceptance, match := matchedFixture(t, now)
+	journal, err := Open(filepath.Join(t.TempDir(), "swaps.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer journal.Close()
+	record, _, err := journal.Create(RoleMaker, signedOrder, acceptance, match, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := journal.SetHello(record.ID, true, `{"party":"maker"}`, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := journal.SetHello(record.ID, true, `{"party":"changed"}`, now); err == nil {
+		t.Fatal("local hello was changed")
+	}
+	if _, err := journal.SetHello(record.ID, false, `{"party":"taker"}`, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := journal.Advance(record.ID, PhaseMatched, PhaseTermsProposed, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := journal.Advance(record.ID, PhaseTermsProposed, PhaseTermsAgreed, now); err != nil {
+		t.Fatal(err)
+	}
+	secret := sha256.Sum256([]byte("journal secret fixture"))
+	secretHash := sha256.Sum256(secret[:])
+	agreementHash := sha256.Sum256([]byte("agreement"))
+	if _, err := journal.SetAgreementDetails(record.ID, hex.EncodeToString(secretHash[:]), hex.EncodeToString(agreementHash[:]), `{"version":1}`, PhaseTermsAgreed, now); err != nil {
+		t.Fatal(err)
+	}
+	approved, err := journal.Approve(record.ID, now)
+	if err != nil || !approved.Approved {
+		t.Fatalf("approve=%#v err=%v", approved, err)
+	}
+	if _, err := journal.SetRevealedSecret(record.ID, hex.EncodeToString(secret[:]), now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := journal.SetRevealedSecret(record.ID, hex.EncodeToString(make([]byte, 32)), now); err == nil {
+		t.Fatal("accepted a different revealed secret")
+	}
+}
+
+func TestOutboundMessageEnvelopeIsAtomicAndImmutable(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	signedOrder, acceptance, match := matchedFixture(t, now)
+	path := filepath.Join(t.TempDir(), "swaps.db")
+	journal, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, _, err := journal.Create(RoleMaker, signedOrder, acceptance, match, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, senderPrivate, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recipientPublic, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, senderMessagePrivate, err := box.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recipientMessagePublic, _, err := box.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err := trade.EncryptMessage(
+		signedOrder.Order.Network, signedOrder.ID, record.ID, 1,
+		senderPrivate, recipientPublic, *senderMessagePrivate,
+		*recipientMessagePublic, []byte(`{"kind":"hello"}`), time.Hour, now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved, created, err := journal.SaveOutboundMessage(record.ID, "hello", message, now)
+	if err != nil || !created || saved.ID != message.ID {
+		t.Fatalf("save=%#v created=%v err=%v", saved, created, err)
+	}
+	saved, created, err = journal.SaveOutboundMessage(record.ID, "hello", message, now.Add(time.Second))
+	if err != nil || created || saved.ID != message.ID {
+		t.Fatalf("repeat=%#v created=%v err=%v", saved, created, err)
+	}
+	other, err := trade.EncryptMessage(
+		signedOrder.Order.Network, signedOrder.ID, record.ID, 2,
+		senderPrivate, recipientPublic, *senderMessagePrivate,
+		*recipientMessagePublic, []byte(`{"kind":"changed"}`), time.Hour, now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := journal.SaveOutboundMessage(record.ID, "hello", other, now); err == nil {
+		t.Fatal("changed an immutable outbound protocol step")
+	}
+	if err := journal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	journal, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer journal.Close()
+	reopened, err := journal.Swap(record.ID)
+	if err != nil || reopened.SentMessages["hello"] != message.ID {
+		t.Fatalf("reopened=%#v err=%v", reopened, err)
+	}
+	stored, err := journal.RelayMessage(message.ID)
+	if err != nil || stored.ID != message.ID {
+		t.Fatalf("stored=%#v err=%v", stored, err)
 	}
 }

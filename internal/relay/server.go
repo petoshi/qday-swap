@@ -104,6 +104,7 @@ func (s *Server) Handler() http.Handler {
 	})
 	mux.HandleFunc("GET /api/v1/status", s.handleStatus)
 	mux.HandleFunc("GET /api/v1/price", s.handlePrice)
+	mux.HandleFunc("GET /api/v1/trades", s.handleTrades)
 	mux.HandleFunc("GET /api/v1/orders", s.handleOrders)
 	mux.HandleFunc("POST /api/v1/orders", s.handlePublish)
 	mux.HandleFunc("GET /api/v1/orders/{id}", s.handleOrder)
@@ -117,6 +118,28 @@ func (s *Server) Handler() http.Handler {
 	})
 	mux.HandleFunc("/", s.handleWeb)
 	return s.securityHeaders(s.logRequests(mux))
+}
+
+func (s *Server) handleTrades(response http.ResponseWriter, request *http.Request) {
+	limit, err := positiveQueryInteger(request.URL.Query().Get("limit"), 500, 2_000)
+	if err != nil {
+		writeError(response, http.StatusBadRequest, "invalid trade limit")
+		return
+	}
+	since := int64(0)
+	if raw := request.URL.Query().Get("since"); raw != "" {
+		since, err = strconv.ParseInt(raw, 10, 64)
+		if err != nil || since < 0 || since > s.now().Add(5*time.Minute).Unix() {
+			writeError(response, http.StatusBadRequest, "invalid trade start time")
+			return
+		}
+	}
+	history, err := s.store.Trades(limit, since)
+	if err != nil {
+		s.internalError(response, err)
+		return
+	}
+	writeJSON(response, http.StatusOK, history)
 }
 
 func (s *Server) handleStatus(response http.ResponseWriter, _ *http.Request) {

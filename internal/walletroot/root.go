@@ -211,11 +211,46 @@ func (r Root) MessageIdentity() (privateKey, publicKey [32]byte, err error) {
 // maker of a matched trade. It is recoverable from the phrase and trade ID, so
 // a crash cannot strand the counterparty's contract after the first claim.
 func (r Root) SwapSecret(tradeID string) (secret, secretHash [32]byte, err error) {
-	if len(tradeID) != 64 {
-		return secret, secretHash, errors.New("trade ID must be 32 hexadecimal bytes")
+	tradeBytes, err := tradeContext(tradeID)
+	if err != nil {
+		return secret, secretHash, err
 	}
-	tradeBytes := make([]byte, 32)
-	for index := 0; index < len(tradeBytes); index++ {
+	secret, err = r.DomainSeed("swap-secret-sha256-v1", tradeBytes)
+	clear(tradeBytes)
+	if err != nil {
+		return secret, secretHash, err
+	}
+	secretHash = sha256.Sum256(secret[:])
+	return secret, secretHash, nil
+}
+
+// BitcoinSwapKey derives the secp256k1 key used by this participant in one
+// Bitcoin HTLC. It is separate from the BIP84 wallet tree and every other
+// trade, but can still be recovered from the same phrase.
+func (r Root) BitcoinSwapKey(tradeID string) (*btcec.PrivateKey, error) {
+	tradeBytes, err := tradeContext(tradeID)
+	if err != nil {
+		return nil, err
+	}
+	seed, err := r.DomainSeed("bitcoin-swap-secp256k1-v1", tradeBytes)
+	clear(tradeBytes)
+	if err != nil {
+		return nil, err
+	}
+	key, _ := btcec.PrivKeyFromBytes(seed[:])
+	clear(seed[:])
+	if key == nil {
+		return nil, errors.New("derived an invalid Bitcoin swap key")
+	}
+	return key, nil
+}
+
+func tradeContext(tradeID string) ([]byte, error) {
+	if len(tradeID) != 64 {
+		return nil, errors.New("trade ID must be 32 lowercase hexadecimal bytes")
+	}
+	decoded := make([]byte, 32)
+	for index := range decoded {
 		var high, low byte
 		for position, destination := range [](*byte){&high, &low} {
 			value := tradeID[index*2+position]
@@ -225,16 +260,11 @@ func (r Root) SwapSecret(tradeID string) (secret, secretHash [32]byte, err error
 			case value >= 'a' && value <= 'f':
 				*destination = value - 'a' + 10
 			default:
-				return secret, secretHash, errors.New("trade ID must be 32 lowercase hexadecimal bytes")
+				clear(decoded)
+				return nil, errors.New("trade ID must be 32 lowercase hexadecimal bytes")
 			}
 		}
-		tradeBytes[index] = high<<4 | low
+		decoded[index] = high<<4 | low
 	}
-	secret, err = r.DomainSeed("swap-secret-sha256-v1", tradeBytes)
-	clear(tradeBytes)
-	if err != nil {
-		return secret, secretHash, err
-	}
-	secretHash = sha256.Sum256(secret[:])
-	return secret, secretHash, nil
+	return decoded, nil
 }

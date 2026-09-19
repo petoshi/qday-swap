@@ -70,6 +70,7 @@ func TestOrderValidationBoundaries(t *testing.T) {
 		{"zero", func(order *Payload) { order.Give.Atomic = "0" }},
 		{"leading zero", func(order *Payload) { order.Give.Atomic = "01" }},
 		{"decimal", func(order *Payload) { order.Give.Atomic = "1.5" }},
+		{"Bitcoin below swap minimum", func(order *Payload) { order.Receive.Atomic = "9999" }},
 		{"wrong pair", func(order *Payload) { order.Receive.Asset = "LTC" }},
 		{"too long", func(order *Payload) { order.ExpiresAt = order.CreatedAt + int64((31*24*time.Hour)/time.Second) }},
 	}

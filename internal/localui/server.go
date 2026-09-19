@@ -42,11 +42,13 @@ type Application interface {
 	BitcoinReceiveAddress() (string, error)
 	Orders(context.Context, string, int) (relay.ResultPage, error)
 	MarketPrice(context.Context) (relay.MarketPrice, error)
+	MarketTrades(context.Context, int, int64) (relay.TradeHistory, error)
 	QuoteOffer(context.Context, app.QuoteOfferRequest) (app.OfferQuote, error)
 	CreateOffer(context.Context, app.CreateOfferRequest) (relay.Record, error)
 	CancelOffer(context.Context, string) (relay.Record, error)
 	AcceptOffer(context.Context, string) (swapstate.Negotiation, error)
 	MatchAcceptance(context.Context, string) (swapstate.Swap, error)
+	ApproveSwap(string) (swapstate.Swap, error)
 	Negotiations() (app.Negotiations, error)
 }
 
@@ -238,6 +240,31 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, price)
+	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/trades":
+		limit := 500
+		if raw := r.URL.Query().Get("limit"); raw != "" {
+			var err error
+			limit, err = strconv.Atoi(raw)
+			if err != nil || limit < 1 || limit > 2_000 {
+				writeError(w, http.StatusBadRequest, "invalid trade limit")
+				return
+			}
+		}
+		since := int64(0)
+		if raw := r.URL.Query().Get("since"); raw != "" {
+			var err error
+			since, err = strconv.ParseInt(raw, 10, 64)
+			if err != nil || since < 0 {
+				writeError(w, http.StatusBadRequest, "invalid trade start time")
+				return
+			}
+		}
+		trades, err := s.application.MarketTrades(r.Context(), limit, since)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, trades)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/offers/quote":
 		var request app.QuoteOfferRequest
 		if !decode(w, r, &request) {
@@ -295,6 +322,17 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		swap, err := s.application.MatchAcceptance(r.Context(), routeID(r.URL.Path, "/api/v1/acceptances/", "/match"))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, swap)
+	case r.Method == http.MethodPost && routeID(r.URL.Path, "/api/v1/swaps/", "/approve") != "":
+		var request struct{}
+		if !decode(w, r, &request) {
+			return
+		}
+		swap, err := s.application.ApproveSwap(routeID(r.URL.Path, "/api/v1/swaps/", "/approve"))
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return

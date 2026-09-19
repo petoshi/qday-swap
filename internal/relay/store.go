@@ -95,6 +95,23 @@ type TradePrice struct {
 	MatchedAt      int64  `json:"matchedAt"`
 }
 
+// Trade is one matched, signed order. The relay cannot see private on-chain
+// settlement, so the public market history deliberately records matches
+// rather than claiming knowledge of completed atomic swaps.
+type Trade struct {
+	OrderID        string `json:"orderID"`
+	Side           string `json:"side"`
+	QDAYAtomic     string `json:"qdayAtomic"`
+	BTCAtomic      string `json:"btcAtomic"`
+	QDAYUnitAtomic string `json:"qdayUnitAtomic"`
+	MatchedAt      int64  `json:"matchedAt"`
+}
+
+type TradeHistory struct {
+	Items []Trade `json:"items"`
+	Total int     `json:"total"`
+}
+
 type Store struct{ db *bbolt.DB }
 
 func OpenStore(path string) (*Store, error) {
@@ -306,4 +323,53 @@ func (s *Store) Stats(now time.Time) (Stats, error) {
 		})
 	})
 	return stats, err
+}
+
+func (s *Store) Trades(limit int, since int64) (TradeHistory, error) {
+	if limit < 1 {
+		limit = 200
+	} else if limit > 2_000 {
+		limit = 2_000
+	}
+	var trades []Trade
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		return tx.Bucket(ordersBucket).ForEach(func(_, value []byte) error {
+			var record Record
+			if err := json.Unmarshal(value, &record); err != nil {
+				return err
+			}
+			if record.Status != StatusMatched || record.MatchedAt < since {
+				return nil
+			}
+			terms := record.Signed.Order
+			trade := Trade{
+				OrderID: record.Signed.ID, Side: "buy", QDAYUnitAtomic: terms.QDAYUnitAtomic,
+				MatchedAt: record.MatchedAt,
+			}
+			if terms.Give.Asset == "QDAY" {
+				trade.Side, trade.QDAYAtomic, trade.BTCAtomic = "sell", terms.Give.Atomic, terms.Receive.Atomic
+			} else {
+				trade.QDAYAtomic, trade.BTCAtomic = terms.Receive.Atomic, terms.Give.Atomic
+			}
+			trades = append(trades, trade)
+			return nil
+		})
+	})
+	if err != nil {
+		return TradeHistory{}, err
+	}
+	sort.Slice(trades, func(i, j int) bool {
+		if trades[i].MatchedAt == trades[j].MatchedAt {
+			return trades[i].OrderID > trades[j].OrderID
+		}
+		return trades[i].MatchedAt > trades[j].MatchedAt
+	})
+	total := len(trades)
+	if len(trades) > limit {
+		trades = trades[:limit]
+	}
+	if trades == nil {
+		trades = []Trade{}
+	}
+	return TradeHistory{Items: trades, Total: total}, nil
 }

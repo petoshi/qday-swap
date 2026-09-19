@@ -70,6 +70,17 @@ func (c *Client) Price(ctx context.Context) (relay.MarketPrice, error) {
 	return result, err
 }
 
+func (c *Client) Trades(ctx context.Context, limit int, since int64) (relay.TradeHistory, error) {
+	values := url.Values{}
+	values.Set("limit", strconv.Itoa(limit))
+	if since > 0 {
+		values.Set("since", strconv.FormatInt(since, 10))
+	}
+	var result relay.TradeHistory
+	err := c.do(ctx, http.MethodGet, "/api/v1/trades?"+values.Encode(), nil, &result)
+	return result, err
+}
+
 func (c *Client) Orders(ctx context.Context, status relay.Status, giveAsset string, page, limit int) (relay.ResultPage, error) {
 	values := url.Values{}
 	if status != "" {

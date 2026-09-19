@@ -200,3 +200,18 @@ func TestOnlyOneConcurrentAcceptanceCanBeMatched(t *testing.T) {
 		t.Fatalf("successful matches=%d conflicts=%d", succeeded, conflicted)
 	}
 }
+
+func TestSignedMatchCannotExtendAcceptanceTimeout(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	fixture := newRelayTradeFixture(t, now)
+	store := openTestStore(t)
+	if _, _, err := store.Publish(fixture.order, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.SubmitAcceptance(fixture.order.ID, fixture.acceptance, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, changed, err := store.ConfirmMatch(fixture.order.ID, fixture.match, now.Add(11*time.Minute)); err == nil || changed {
+		t.Fatalf("expired acceptance matched: changed=%v err=%v", changed, err)
+	}
+}

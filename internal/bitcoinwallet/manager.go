@@ -53,13 +53,15 @@ type Amount struct {
 type Balance struct {
 	Confirmed Amount `json:"confirmed"`
 	Pending   Amount `json:"pending"`
+	Immature  Amount `json:"immature"`
 	Total     Amount `json:"total"`
 }
 
 type Client struct {
-	wallet  *wallet.Wallet
-	service *neutrino.ChainService
-	network string
+	wallet      *wallet.Wallet
+	lightClient *chain.NeutrinoClient
+	service     *neutrino.ChainService
+	network     string
 }
 
 func (c *Client) Status() (Status, error) {
@@ -82,18 +84,17 @@ func (c *Client) Balance() (Balance, error) {
 	if c == nil || c.wallet == nil {
 		return Balance{}, errors.New("Bitcoin wallet is unavailable")
 	}
-	total, err := c.wallet.CalculateBalance(0)
+	balances, err := c.wallet.CalculateAccountBalances(waddrmgr.DefaultAccountNum, 1)
 	if err != nil {
-		return Balance{}, fmt.Errorf("calculate total Bitcoin balance: %w", err)
+		return Balance{}, fmt.Errorf("calculate Bitcoin account balance: %w", err)
 	}
-	confirmed, err := c.wallet.CalculateBalance(1)
-	if err != nil {
-		return Balance{}, fmt.Errorf("calculate confirmed Bitcoin balance: %w", err)
+	pending := balances.Total - balances.Spendable - balances.ImmatureReward
+	if pending < 0 {
+		return Balance{}, errors.New("Bitcoin wallet returned inconsistent balance totals")
 	}
-	pending := total - confirmed
 	return Balance{
-		Confirmed: amount(int64(confirmed)), Pending: amount(int64(pending)),
-		Total: amount(int64(total)),
+		Confirmed: amount(int64(balances.Spendable)), Pending: amount(int64(pending)),
+		Immature: amount(int64(balances.ImmatureReward)), Total: amount(int64(balances.Total)),
 	}, nil
 }
 
@@ -197,7 +198,7 @@ func (m *Manager) Start(ctx context.Context) (*Client, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.wallet != nil {
-		return &Client{wallet: m.wallet, service: m.service, network: m.config.Network}, nil
+		return &Client{wallet: m.wallet, lightClient: m.lightClient, service: m.service, network: m.config.Network}, nil
 	}
 	if err := os.MkdirAll(m.config.DataDir, 0700); err != nil {
 		return nil, err
@@ -238,7 +239,7 @@ func (m *Manager) Start(ctx context.Context) (*Client, error) {
 	loaded.SynchronizeRPC(lightClient)
 	m.loader, m.wallet, m.lightDB = loader, loaded, lightDB
 	m.lightClient, m.service = lightClient, service
-	return &Client{wallet: loaded, service: service, network: m.config.Network}, nil
+	return &Client{wallet: loaded, lightClient: lightClient, service: service, network: m.config.Network}, nil
 }
 
 func (m *Manager) Stop() error {

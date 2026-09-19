@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 	"github.com/petoshi/qday-swap/internal/order"
 	"github.com/petoshi/qday-swap/internal/relay"
 	"github.com/petoshi/qday-swap/internal/swapstate"
+	"github.com/petoshi/qday-swap/internal/trade"
 	"github.com/petoshi/qday-swap/internal/walletd"
 	"github.com/petoshi/qday-swap/internal/walletroot"
 )
@@ -70,6 +72,32 @@ func (f *fakeWalletd) Start(context.Context) (*walletd.Client, error) {
 func (f *fakeWalletd) Stop() error { return nil }
 
 type fakeBitcoin struct{ unlocked bool }
+
+type failOnceMatchRelay struct {
+	relayAPI
+	failed bool
+}
+
+func (r *failOnceMatchRelay) Match(ctx context.Context, orderID string, match trade.SignedMatch) (relay.Record, error) {
+	if !r.failed {
+		r.failed = true
+		return relay.Record{}, errors.New("simulated relay timeout")
+	}
+	return r.relayAPI.Match(ctx, orderID, match)
+}
+
+type failOnceAcceptRelay struct {
+	relayAPI
+	failed bool
+}
+
+func (r *failOnceAcceptRelay) Accept(ctx context.Context, orderID string, acceptance trade.SignedAcceptance) (relay.AcceptanceRecord, error) {
+	if !r.failed {
+		r.failed = true
+		return relay.AcceptanceRecord{}, errors.New("simulated relay timeout")
+	}
+	return r.relayAPI.Accept(ctx, orderID, acceptance)
+}
 
 func (f *fakeBitcoin) Initialize(_ context.Context, _ walletroot.Root, password string, _ time.Time) error {
 	if password != "correct horse battery staple" {
@@ -242,17 +270,22 @@ func TestTwoApplicationsPublishAcceptAndMatchOffer(t *testing.T) {
 		t.Fatalf("buy quote = %#v", buyQuote)
 	}
 	sellQuote, err := maker.QuoteOffer(context.Background(), QuoteOfferRequest{
-		Side: "sell", Quantity: "2.5", Price: "0.00001", PriceCurrency: "BTC",
+		Side: "sell", Quantity: "2.5", Price: "0.00004", PriceCurrency: "BTC",
 	})
 	if err != nil {
 		t.Fatal(err)
-	} else if sellQuote.GiveAsset != "QDAY" || sellQuote.GiveAmount != "2.5" || sellQuote.ReceiveAmount != "0.000025" || sellQuote.USDTotal != "2.00" {
+	} else if sellQuote.GiveAsset != "QDAY" || sellQuote.GiveAmount != "2.5" || sellQuote.ReceiveAmount != "0.0001" || sellQuote.USDTotal != "8.00" {
 		t.Fatalf("sell quote = %#v", sellQuote)
 	}
 	if _, err := maker.QuoteOffer(context.Background(), QuoteOfferRequest{
 		Side: "buy", Quantity: "0.00000001", Price: "0.00000001", PriceCurrency: "BTC",
 	}); err == nil || !strings.Contains(err.Error(), "below one satoshi") {
 		t.Fatalf("sub-satoshi quote error = %v", err)
+	}
+	if _, err := maker.QuoteOffer(context.Background(), QuoteOfferRequest{
+		Side: "buy", Quantity: "1", Price: "0.00001", PriceCurrency: "BTC",
+	}); err == nil || !strings.Contains(err.Error(), "at least 10000 satoshis") {
+		t.Fatalf("small Bitcoin quote error = %v", err)
 	}
 	expensive, err := maker.CreateOffer(context.Background(), CreateOfferRequest{
 		GiveAsset: "QDAY", GiveAmount: "0.1", ReceiveAmount: "2", LifetimeMinutes: 60,
@@ -271,24 +304,47 @@ func TestTwoApplicationsPublishAcceptAndMatchOffer(t *testing.T) {
 	} else if offer.Status != relay.StatusOpen {
 		t.Fatalf("offer status = %q", offer.Status)
 	}
+	flakyAcceptRelay := &failOnceAcceptRelay{relayAPI: taker.relay}
+	taker.relay = flakyAcceptRelay
+	firstPending, err := taker.AcceptOffer(context.Background(), offer.Signed.ID)
+	if err == nil || !strings.Contains(err.Error(), "simulated relay timeout") {
+		t.Fatalf("first accept error = %v", err)
+	}
 	pending, err := taker.AcceptOffer(context.Background(), offer.Signed.ID)
 	if err != nil {
 		t.Fatal(err)
+	} else if pending.Acceptance.ID != firstPending.Acceptance.ID {
+		t.Fatalf("accept retry changed signed payload: first=%q retry=%q", firstPending.Acceptance.ID, pending.Acceptance.ID)
 	} else if pending.Order.ID != offer.Signed.ID {
 		t.Fatalf("pending order = %q", pending.Order.ID)
 	}
+	flakyRelay := &failOnceMatchRelay{relayAPI: maker.relay}
+	maker.relay = flakyRelay
 	maker.lastRelaySync = time.Time{}
 	state := maker.State(context.Background())
-	if state.RelayError != "" || state.IncomingTrades != 1 {
-		t.Fatalf("maker state = %#v", state)
+	if !strings.Contains(state.RelayError, "simulated relay timeout") || state.IncomingTrades != 1 || state.ActiveSwaps != 1 {
+		t.Fatalf("maker state after relay timeout = %#v", state)
 	}
 	negotiations, err := maker.Negotiations()
-	if err != nil || len(negotiations.Incoming) != 1 {
+	if err != nil || len(negotiations.Incoming) != 1 || len(negotiations.Swaps) != 1 {
 		t.Fatalf("maker negotiations=%#v err=%v", negotiations, err)
 	}
-	matched, err := maker.MatchAcceptance(context.Background(), negotiations.Incoming[0].Acceptance.ID)
-	if err != nil {
-		t.Fatal(err)
+	firstMatch := negotiations.Swaps[0]
+	// Cross a timestamp boundary so recreating the signed match would produce a
+	// different ID and make the durable journal reject the retry.
+	time.Sleep(time.Until(time.Unix(time.Now().Unix()+1, 0)) + 20*time.Millisecond)
+	maker.lastRelaySync = time.Time{}
+	state = maker.State(context.Background())
+	if state.RelayError != "" || state.IncomingTrades != 0 || state.ActiveSwaps != 1 {
+		t.Fatalf("maker state after relay retry = %#v", state)
+	}
+	negotiations, err = maker.Negotiations()
+	if err != nil || len(negotiations.Swaps) != 1 {
+		t.Fatalf("maker swaps=%#v err=%v", negotiations.Swaps, err)
+	}
+	matched := negotiations.Swaps[0]
+	if matched.Match.ID != firstMatch.Match.ID {
+		t.Fatalf("match retry changed signed payload: first=%q retry=%q", firstMatch.Match.ID, matched.Match.ID)
 	} else if matched.Phase != swapstate.PhaseMatched || matched.Role != swapstate.RoleMaker {
 		t.Fatalf("maker swap = %#v", matched)
 	}

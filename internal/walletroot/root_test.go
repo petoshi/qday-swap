@@ -228,3 +228,32 @@ func TestSwapSecretIsRecoverableAndTradeSpecific(t *testing.T) {
 		t.Fatal("invalid trade ID accepted")
 	}
 }
+
+func TestBitcoinSwapKeyIsRecoverableAndSeparated(t *testing.T) {
+	root := Root{8, 7, 6, 5}
+	firstID := "0102030405060708090001020304050607080900010203040506070809000102"
+	secondID := "1102030405060708090001020304050607080900010203040506070809000102"
+	first, err := root.BitcoinSwapKey(firstID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repeated, err := root.BitcoinSwapKey(firstID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := root.BitcoinSwapKey(secondID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	walletKey, err := root.BitcoinKey(0, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(first.Serialize(), repeated.Serialize()) {
+		t.Fatal("Bitcoin swap key is not recoverable")
+	} else if bytes.Equal(first.Serialize(), second.Serialize()) {
+		t.Fatal("two trades derived the same Bitcoin swap key")
+	} else if bytes.Equal(first.Serialize(), walletKey.Serialize()) {
+		t.Fatal("Bitcoin swap key overlaps the wallet tree")
+	}
+}

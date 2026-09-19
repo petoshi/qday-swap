@@ -2,14 +2,14 @@
 
 `qday-swap` is a user-facing, non-custodial atomic swap application for QDAY.
 
-The first public market will be QDAY/BTC. Litecoin remains the reference
+The first public market is QDAY/BTC. Litecoin remains the reference
 integration because the complete QDAY/LTC protocol has already been exercised
 on regtest, including claims, refunds, restarts and reorganizations. The engine
 is chain-neutral so new assets are adapters rather than separate applications.
 
-Planned adapter order:
+Adapter order:
 
-1. Bitcoin
+1. Bitcoin: embedded Neutrino light wallet and atomic swap adapter implemented
 2. USDC and ETH on an EVM network
 3. XRP
 4. Dogecoin
@@ -18,8 +18,8 @@ Planned adapter order:
 The product has one local interface, one recovery phrase, signed public offers,
 exact integer accounting and automatic claim or refund. The first public order
 book runs at `dex.pqday.com`. It stores signed offers and cancellations and has
-a read-only web explorer. Signed acceptances and matches choose exactly one
-taker, then an end-to-end encrypted mailbox carries the trade protocol between
+a read-only web explorer. The first valid signed acceptance is matched
+atomically, then an end-to-end encrypted mailbox carries the trade protocol between
 the two installed applications. The relay never receives a wallet seed,
 signing key, plaintext contract message or spend authority. A peer-to-peer
 discovery mesh can replace this first relay when the market is large enough
@@ -47,6 +47,10 @@ A single unverified explorer or RPC response is never enough to advance a swap
 state. Users may optionally connect their own full node for any supported asset.
 
 The repository is under active local development and has no public release yet.
+The implementation includes the local wallet application, QDAY/BTC state
+machine, durable recovery journal, embedded Bitcoin light client and public
+relay. Release packaging and independent low-value mainnet drills remain before
+publication.
 See [the product plan](docs/PRODUCT.md) and [chain adapter plan](docs/CHAINS.md).
 
 ## DEX relay development server

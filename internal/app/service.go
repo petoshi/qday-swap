@@ -100,6 +100,7 @@ func (p *bitcoinManagerProcess) Stop() error { return p.manager.Stop() }
 type relayAPI interface {
 	Status(context.Context) (relayclient.Status, error)
 	Price(context.Context) (relay.MarketPrice, error)
+	Trades(context.Context, int, int64) (relay.TradeHistory, error)
 	Orders(context.Context, relay.Status, string, int, int) (relay.ResultPage, error)
 	Order(context.Context, string) (relay.Record, error)
 	Publish(context.Context, order.Signed) (relay.Record, error)
@@ -119,6 +120,10 @@ type Service struct {
 
 	mu             sync.RWMutex
 	relaySyncMu    sync.Mutex
+	negotiationMu  sync.Mutex
+	engineMu       sync.Mutex
+	workerCancel   context.CancelFunc
+	workerWG       sync.WaitGroup
 	lastRelaySync  time.Time
 	process        qdayProcess
 	client         qdayClient
@@ -234,6 +239,7 @@ func New(ctx context.Context, config Config) (*Service, error) {
 			service.lastError = err.Error()
 		}
 	}
+	service.startWorker()
 	return service, nil
 }
 
@@ -524,6 +530,15 @@ func (s *Service) MarketPrice(ctx context.Context) (relay.MarketPrice, error) {
 	return s.relay.Price(ctx)
 }
 
+func (s *Service) MarketTrades(ctx context.Context, limit int, since int64) (relay.TradeHistory, error) {
+	if limit < 1 || limit > 2_000 {
+		return relay.TradeHistory{}, errors.New("trade history limit must be between 1 and 2000")
+	} else if since < 0 {
+		return relay.TradeHistory{}, errors.New("trade history start time is invalid")
+	}
+	return s.relay.Trades(ctx, limit, since)
+}
+
 func (s *Service) CreateOffer(ctx context.Context, request CreateOfferRequest) (relay.Record, error) {
 	identity, messagePublic, cleanup, err := s.identities()
 	if err != nil {
@@ -642,6 +657,8 @@ func (s *Service) QuoteOffer(ctx context.Context, request QuoteOfferRequest) (Of
 	totalSatoshis := roundPositiveRat(new(big.Rat).Mul(totalBTC, big.NewRat(100_000_000, 1)))
 	if totalSatoshis.Sign() <= 0 {
 		return OfferQuote{}, errors.New("total is below one satoshi; increase the price or quantity")
+	} else if totalSatoshis.Cmp(big.NewInt(order.MinimumBitcoinSwapSatoshis)) < 0 {
+		return OfferQuote{}, fmt.Errorf("Bitcoin total must be at least %d satoshis (0.0001 BTC)", order.MinimumBitcoinSwapSatoshis)
 	}
 	maximumBitcoinSatoshis := big.NewInt(2_100_000_000_000_000)
 	if totalSatoshis.Cmp(maximumBitcoinSatoshis) > 0 {
@@ -711,6 +728,8 @@ func (s *Service) CancelOffer(ctx context.Context, orderID string) (relay.Record
 }
 
 func (s *Service) AcceptOffer(ctx context.Context, orderID string) (swapstate.Negotiation, error) {
+	s.negotiationMu.Lock()
+	defer s.negotiationMu.Unlock()
 	identity, messagePublic, cleanup, err := s.identities()
 	if err != nil {
 		return swapstate.Negotiation{}, err
@@ -740,15 +759,39 @@ func (s *Service) AcceptOffer(ctx context.Context, orderID string) (swapstate.Ne
 	if err != nil {
 		return swapstate.Negotiation{}, err
 	}
-	acceptance, err := trade.NewAcceptance(record.Signed, 15*time.Minute, identity, messagePublic, now)
-	if err != nil {
-		return swapstate.Negotiation{}, err
-	}
 	s.mu.RLock()
 	journal := s.journal
 	s.mu.RUnlock()
 	if journal == nil {
 		return swapstate.Negotiation{}, errors.New("swap journal is unavailable")
+	}
+	pendingRecords, err := journal.PendingAcceptances()
+	if err != nil {
+		return swapstate.Negotiation{}, err
+	}
+	for _, pending := range pendingRecords {
+		if pending.Order.ID != record.Signed.ID {
+			continue
+		}
+		if pending.Acceptance.Acceptance.ExpiresAt <= now.Unix() {
+			if err := journal.RemovePendingAcceptance(pending.Acceptance.ID); err != nil {
+				return swapstate.Negotiation{}, err
+			}
+			continue
+		}
+		if err := pending.Acceptance.Verify(record.Signed, now); err != nil {
+			return swapstate.Negotiation{}, fmt.Errorf("verify saved acceptance: %w", err)
+		}
+		// A timeout does not mean the relay rejected the acceptance. Resend the
+		// exact signed record so one click can be retried without opening a second trade.
+		if _, err := s.relay.Accept(ctx, orderID, pending.Acceptance); err != nil {
+			return pending, err
+		}
+		return pending, nil
+	}
+	acceptance, err := trade.NewAcceptance(record.Signed, 15*time.Minute, identity, messagePublic, now)
+	if err != nil {
+		return swapstate.Negotiation{}, err
 	}
 	pending, _, err := journal.SavePendingAcceptance(record.Signed, acceptance, now)
 	if err != nil {
@@ -761,6 +804,8 @@ func (s *Service) AcceptOffer(ctx context.Context, orderID string) (swapstate.Ne
 }
 
 func (s *Service) MatchAcceptance(ctx context.Context, acceptanceID string) (swapstate.Swap, error) {
+	s.negotiationMu.Lock()
+	defer s.negotiationMu.Unlock()
 	identity, _, cleanup, err := s.identities()
 	if err != nil {
 		return swapstate.Swap{}, err
@@ -772,20 +817,33 @@ func (s *Service) MatchAcceptance(ctx context.Context, acceptanceID string) (swa
 	if journal == nil {
 		return swapstate.Swap{}, errors.New("swap journal is unavailable")
 	}
+	return s.matchAcceptance(ctx, journal, identity, acceptanceID)
+}
+
+func (s *Service) matchAcceptance(ctx context.Context, journal *swapstate.Journal, identity ed25519.PrivateKey, acceptanceID string) (swapstate.Swap, error) {
 	negotiation, err := journal.IncomingAcceptance(acceptanceID)
 	if err != nil {
 		return swapstate.Swap{}, err
 	}
 	now := time.Now().UTC()
-	match, err := trade.NewMatch(negotiation.Order, negotiation.Acceptance, identity, now)
+	record, err := journal.Swap(negotiation.Acceptance.Acceptance.TradeID)
+	if errors.Is(err, swapstate.ErrNotFound) {
+		match, matchErr := trade.NewMatch(negotiation.Order, negotiation.Acceptance, identity, now)
+		if matchErr != nil {
+			return swapstate.Swap{}, matchErr
+		}
+		record, _, err = journal.Create(swapstate.RoleMaker, negotiation.Order, negotiation.Acceptance, match, now)
+	} else if err == nil {
+		if record.Role != swapstate.RoleMaker || record.Order.ID != negotiation.Order.ID || record.Acceptance.ID != negotiation.Acceptance.ID {
+			return swapstate.Swap{}, errors.New("trade ID is already bound to another local swap")
+		}
+	}
 	if err != nil {
 		return swapstate.Swap{}, err
 	}
-	record, _, err := journal.Create(swapstate.RoleMaker, negotiation.Order, negotiation.Acceptance, match, now)
-	if err != nil {
-		return swapstate.Swap{}, err
-	}
-	if _, err := s.relay.Match(ctx, negotiation.Order.ID, match); err != nil {
+	// The exact signed match is persisted before contacting the relay. A retry
+	// after a timeout must resend those bytes instead of creating another match.
+	if _, err := s.relay.Match(ctx, negotiation.Order.ID, record.Match); err != nil {
 		return record, err
 	}
 	if err := journal.RemoveIncomingAcceptance(acceptanceID); err != nil {
@@ -1031,10 +1089,31 @@ func (s *Service) syncRelay(ctx context.Context) error {
 				if orderRecord.Signed.Order.MakerPublicKey != identityPublic {
 					return errors.New("relay routed an acceptance to the wrong identity")
 				}
-				if acceptance.Acceptance.ExpiresAt > now.Unix() {
-					if _, _, err := journal.SaveIncomingAcceptance(orderRecord.Signed, acceptance, now); err != nil {
+				if orderRecord.Status == relay.StatusMatched {
+					if orderRecord.Acceptance != nil && orderRecord.Match != nil && orderRecord.Acceptance.ID == acceptance.ID {
+						if _, _, err := journal.Create(swapstate.RoleMaker, orderRecord.Signed, *orderRecord.Acceptance, *orderRecord.Match, now); err != nil {
+							return err
+						}
+					}
+					if err := journal.RemoveIncomingAcceptance(acceptance.ID); err != nil {
 						return err
 					}
+					continue
+				}
+				if orderRecord.Status != relay.StatusOpen || acceptance.Acceptance.ExpiresAt <= now.Unix() {
+					continue
+				}
+				if _, _, err := journal.SaveIncomingAcceptance(orderRecord.Signed, acceptance, now); err != nil {
+					return err
+				}
+				// An order has identical terms for every taker, so the first valid
+				// acceptance wins automatically. Funding still waits for the maker's
+				// explicit approval of the complete cross-chain agreement.
+				s.negotiationMu.Lock()
+				_, err = s.matchAcceptance(ctx, journal, identity, acceptance.ID)
+				s.negotiationMu.Unlock()
+				if err != nil {
+					return fmt.Errorf("automatically match acceptance: %w", err)
 				}
 			case relay.MailboxMatch:
 				if item.Match == nil {
@@ -1150,6 +1229,10 @@ func (s *Service) State(ctx context.Context) State {
 }
 
 func (s *Service) Close() error {
+	if s.workerCancel != nil {
+		s.workerCancel()
+		s.workerWG.Wait()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.root != nil {

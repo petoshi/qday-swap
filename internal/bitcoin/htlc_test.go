@@ -89,6 +89,9 @@ func TestContractClaimAndRefund(t *testing.T) {
 	} else if revealed != secret {
 		t.Fatal("claim revealed another secret")
 	}
+	if refund, err := contract.IsRefund(claim, funding); err == nil || refund {
+		t.Fatalf("claim was accepted as refund: refund=%v err=%v", refund, err)
+	}
 
 	refundRaw, err := contract.BuildRefund(funding, destination, 2_000, refund)
 	if err != nil {
@@ -97,6 +100,9 @@ func TestContractClaimAndRefund(t *testing.T) {
 	executeSpend(t, contract, refundRaw)
 	if _, err := contract.ExtractSecret(refundRaw, funding); err == nil {
 		t.Fatal("refund was accepted as a claim")
+	}
+	if refund, err := contract.IsRefund(refundRaw, funding); err != nil || !refund {
+		t.Fatalf("canonical refund was rejected: refund=%v err=%v", refund, err)
 	}
 }
 
