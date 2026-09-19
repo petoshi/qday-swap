@@ -136,7 +136,7 @@ func TestWebRoutesAndSecurityHeaders(t *testing.T) {
 	if err != nil || health.StatusCode != http.StatusOK || string(healthBody) != "ok\n" {
 		t.Fatalf("health status=%d body=%q err=%v", health.StatusCode, healthBody, err)
 	}
-	for _, route := range []string{"/", "/activity", "/protocol", "/order/example"} {
+	for _, route := range []string{"/", "/orders", "/activity", "/protocol", "/order/example"} {
 		response, err := server.Client().Get(server.URL + route)
 		if err != nil {
 			t.Fatal(err)
@@ -145,13 +145,13 @@ func TestWebRoutesAndSecurityHeaders(t *testing.T) {
 		response.Body.Close()
 		if err != nil {
 			t.Fatal(err)
-		} else if response.StatusCode != http.StatusOK || !bytes.Contains(body, []byte("QDAY DEX")) {
+		} else if response.StatusCode != http.StatusOK || !bytes.Contains(body, []byte("QDAY Order Explorer")) {
 			t.Fatalf("route %s status=%d", route, response.StatusCode)
 		} else if response.Header.Get("Content-Security-Policy") == "" || response.Header.Get("X-Content-Type-Options") != "nosniff" {
 			t.Fatalf("route %s missing security headers", route)
 		}
 	}
-	for _, asset := range []string{"/app.js?v=4", "/styles.css?v=4"} {
+	for _, asset := range []string{"/app.js?v=5", "/styles.css?v=5"} {
 		response, err := server.Client().Get(server.URL + asset)
 		if err != nil {
 			t.Fatal(err)

@@ -42,6 +42,7 @@ type Application interface {
 	BitcoinReceiveAddress() (string, error)
 	Orders(context.Context, string, int) (relay.ResultPage, error)
 	MarketPrice(context.Context) (relay.MarketPrice, error)
+	QuoteOffer(context.Context, app.QuoteOfferRequest) (app.OfferQuote, error)
 	CreateOffer(context.Context, app.CreateOfferRequest) (relay.Record, error)
 	CancelOffer(context.Context, string) (relay.Record, error)
 	AcceptOffer(context.Context, string) (swapstate.Negotiation, error)
@@ -237,6 +238,17 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, price)
+	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/offers/quote":
+		var request app.QuoteOfferRequest
+		if !decode(w, r, &request) {
+			return
+		}
+		quote, err := s.application.QuoteOffer(r.Context(), request)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, quote)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/orders":
 		var request app.CreateOfferRequest
 		if !decode(w, r, &request) {

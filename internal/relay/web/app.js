@@ -271,7 +271,7 @@ async function renderMarket(token, silent = false) {
   if (silent && document.querySelector('#market-orders')) {
     if (fingerprint !== viewFingerprint) {
       document.querySelector('#market-orders tbody').innerHTML = orderRows(orders.items);
-      document.querySelector('#market-pagination').innerHTML = pagination(orders.page, orders.totalPages, '/');
+      document.querySelector('#market-pagination').innerHTML = pagination(orders.page, orders.totalPages, '/orders');
       document.querySelectorAll('[data-filter]').forEach(button => button.classList.toggle('active', button.dataset.filter === directionFilter));
       viewFingerprint = fingerprint;
     }
@@ -288,7 +288,7 @@ async function renderMarket(token, silent = false) {
       <span class="update">UPDATED ${escapeHTML(new Date().toLocaleTimeString())}</span>
     </div>
     <section class="card" id="market-orders">${orderTable(orders.items)}</section>
-    <div id="market-pagination">${pagination(orders.page, orders.totalPages, '/')}</div>`;
+    <div id="market-pagination">${pagination(orders.page, orders.totalPages, '/orders')}</div>`;
 }
 
 async function renderActivity(token, silent = false) {
@@ -311,7 +311,7 @@ async function renderActivity(token, silent = false) {
     return;
   }
   viewFingerprint = fingerprint;
-  root.innerHTML = `<section class="page-header"><nav class="breadcrumbs"><a class="route-link" href="/">Order book</a><i>/</i><span>Activity</span></nav><h1>ORDER ACTIVITY.</h1><p>Open, cancelled and expired signed offers. Newest first.</p></section>
+  root.innerHTML = `<section class="page-header"><nav class="breadcrumbs"><a class="route-link" href="/orders">Order book</a><i>/</i><span>Activity</span></nav><h1>ORDER ACTIVITY.</h1><p>Open, cancelled and expired signed offers. Newest first.</p></section>
     <section class="card" id="activity-orders"><div class="card-header"><h2>Relay history</h2><span class="card-meta" id="activity-total">${commas(orders.total)} orders</span></div>${orderTable(orders.items, true)}</section>
     <div id="activity-pagination">${pagination(orders.page, orders.totalPages, '/activity')}</div>`;
 }
@@ -375,7 +375,7 @@ async function renderOrder(token, id) {
   const signed = record.signed;
   const terms = signed.order;
   const direction = side(terms);
-  root.innerHTML = `<section class="page-header"><nav class="breadcrumbs"><a class="route-link" href="/">Order book</a><i>/</i><span>${escapeHTML(short(signed.id))}</span></nav><h1>${direction.label}.</h1><p>Created ${escapeHTML(exactTime(terms.createdAt))}. ${record.status === 'open' ? `Expires in ${escapeHTML(relativeFuture(terms.expiresAt))}.` : `Status: ${escapeHTML(record.status)}.`}</p></section>
+  root.innerHTML = `<section class="page-header"><nav class="breadcrumbs"><a class="route-link" href="/orders">Order book</a><i>/</i><span>${escapeHTML(short(signed.id))}</span></nav><h1>${direction.label}.</h1><p>Created ${escapeHTML(exactTime(terms.createdAt))}. ${record.status === 'open' ? `Expires in ${escapeHTML(relativeFuture(terms.expiresAt))}.` : `Status: ${escapeHTML(record.status)}.`}</p></section>
     <section class="identifier"><div><span>Order ID</span><code>${escapeHTML(signed.id)}</code></div>${copyButton(signed.id)}</section>
     <div class="detail-grid">
       <section class="card"><div class="card-header"><h2>Immutable terms</h2>${statusBadge(record.status)}</div><div class="detail-list">
@@ -406,9 +406,8 @@ async function renderOrder(token, id) {
 }
 
 function renderProtocol() {
-  root.innerHTML = `<nav class="breadcrumbs protocol-breadcrumbs"><a class="route-link" href="/">Order book</a><i>/</i><span>Protocol</span></nav>
-    <section class="protocol-download">
-      <div class="download-intro"><span class="command">$ install qday-swap</span><h1>DOWNLOAD QDAY SWAP.</h1><p>This website shows the public order book. The swap itself runs in the QDAY Swap application on your computer. Download the app, open your local wallet, then create an offer or accept one from this order book.</p></div>
+  root.innerHTML = `<section class="protocol-download protocol-download-home">
+      <div class="download-intro"><span class="command">$ install qday-swap</span><h1>DOWNLOAD QDAY SWAP. FUCK KYC</h1><p>This explorer shows the public order book. The swap itself runs in the QDAY Swap application on your computer. Download the app, create your local wallet, save your seed phrase, and deposit funds to trade. Then create an offer or accept one from this order book.</p></div>
       <div class="download-grid">
         <a class="download-card" href="https://github.com/petoshi/qday-swap/releases/latest/download/QDAY-Swap-windows-amd64.zip">
           <svg class="os-icon" viewBox="0 0 64 64" aria-hidden="true"><path d="M7 11l22-3v22H7V11zm26-4l24-3v26H33V7zM7 34h22v22L7 53V34zm26 0h24v26l-24-3V34z"/></svg>
@@ -429,11 +428,11 @@ function renderProtocol() {
       </div>
     </section>
     <section class="quickstart">
-      <header><span class="command">$ qday-swap quickstart</span><h2>THE SWAP RUNS LOCALLY.</h2><p>The downloaded application opens its interface in your browser, but it runs on your own computer. Your recovery phrase, wallet keys and signatures stay inside that local application.</p></header>
+      <header><span class="command">$ qday-swap quickstart</span><h2>THE SWAP RUNS LOCALLY.</h2></header>
       <div class="quickstart-grid">
         <article><b>01</b><h3>OPEN THE APP.</h3><p>Extract the complete archive and run QDAY Swap. Your browser opens the local interface. Create a new wallet or import your existing 24 word recovery phrase.</p></article>
         <article><b>02</b><h3>LET IT SYNC.</h3><p>The app starts a validating QDAY node and a Bitcoin light client. The status bar shows both chains. You do not need to download the full Bitcoin blockchain.</p></article>
-        <article><b>03</b><h3>FUND YOUR WALLET.</h3><p>Open Settings, copy your QDAY or Native SegWit Bitcoin receive address, and send the asset you want to trade. Wait until the app confirms the balance.</p></article>
+        <article><b>03</b><h3>FUND YOUR WALLET.</h3><p>Open Settings, copy your QDAY or Native SegWit Bitcoin receive address, and send the asset you want to trade. Both addresses belong to your local wallet. You control the keys, and they never leave your computer.</p></article>
         <article><b>04</b><h3>CREATE OR TAKE.</h3><p>Create a signed offer in the app, or open an offer from this website. Review the exact amounts and expiry locally before approving the swap.</p></article>
       </div>
     </section>
@@ -459,15 +458,15 @@ async function route(silent = false) {
     root.innerHTML = '<section class="loading-page"><p><b>$</b> loading signed orders<span class="terminal-cursor">_</span></p></section>';
   }
   try {
-    if (pathname === '/') {
+    if (pathname === '/orders') {
       markNavigation('market');
       await renderMarket(token, silent);
-      refreshTimer = setTimeout(() => { if (location.pathname === '/') route(true); }, 20000);
+      refreshTimer = setTimeout(() => { if (location.pathname === '/orders') route(true); }, 20000);
     } else if (pathname === '/activity') {
       markNavigation('activity');
       await renderActivity(token, silent);
       refreshTimer = setTimeout(() => { if (location.pathname === '/activity') route(true); }, 20000);
-    } else if (pathname === '/protocol') {
+    } else if (pathname === '/' || pathname === '/protocol') {
       markNavigation('protocol');
       renderProtocol();
       await loadStatus().catch(() => {});

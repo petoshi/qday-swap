@@ -133,7 +133,7 @@ func (s *Server) handleStatus(response http.ResponseWriter, _ *http.Request) {
 		PublicURL  string `json:"publicURL"`
 		ServerTime string `json:"serverTime"`
 		Stats      Stats  `json:"stats"`
-	}{"QDAY DEX", s.version, s.network, s.publicURL, now.Format(time.RFC3339), stats})
+	}{"QDAY Order Relay", s.version, s.network, s.publicURL, now.Format(time.RFC3339), stats})
 }
 
 type MarketPrice struct {

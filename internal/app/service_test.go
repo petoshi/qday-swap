@@ -26,13 +26,18 @@ const fakeToken = "0001020304050607080900010203040506070809000102030405060708090
 
 func testRelayURL(t *testing.T) string {
 	t.Helper()
+	priceProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"data":{"amount":"80000.00","base":"BTC","currency":"USD"}}`)
+	}))
+	t.Cleanup(priceProvider.Close)
 	store, err := relay.OpenStore(filepath.Join(t.TempDir(), "relay.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	server, err := relay.NewServer(store, relay.Config{
 		Network: "mainnet", PublicURL: "https://dex.pqday.com", Version: "test",
-		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), PriceURL: priceProvider.URL,
 	})
 	if err != nil {
 		store.Close()
@@ -228,6 +233,36 @@ func TestTwoApplicationsPublishAcceptAndMatchOffer(t *testing.T) {
 
 	maker := newApplication("maker")
 	taker := newApplication("taker")
+	buyQuote, err := maker.QuoteOffer(context.Background(), QuoteOfferRequest{
+		Side: "buy", Quantity: "10", Price: "1", PriceCurrency: "USD",
+	})
+	if err != nil {
+		t.Fatal(err)
+	} else if buyQuote.GiveAsset != "BTC" || buyQuote.GiveAmount != "0.000125" || buyQuote.ReceiveAmount != "10" || buyQuote.USDTotal != "10.00" || buyQuote.BTCPerQDAY != "0.0000125" {
+		t.Fatalf("buy quote = %#v", buyQuote)
+	}
+	sellQuote, err := maker.QuoteOffer(context.Background(), QuoteOfferRequest{
+		Side: "sell", Quantity: "2.5", Price: "0.00001", PriceCurrency: "BTC",
+	})
+	if err != nil {
+		t.Fatal(err)
+	} else if sellQuote.GiveAsset != "QDAY" || sellQuote.GiveAmount != "2.5" || sellQuote.ReceiveAmount != "0.000025" || sellQuote.USDTotal != "2.00" {
+		t.Fatalf("sell quote = %#v", sellQuote)
+	}
+	if _, err := maker.QuoteOffer(context.Background(), QuoteOfferRequest{
+		Side: "buy", Quantity: "0.00000001", Price: "0.00000001", PriceCurrency: "BTC",
+	}); err == nil || !strings.Contains(err.Error(), "below one satoshi") {
+		t.Fatalf("sub-satoshi quote error = %v", err)
+	}
+	expensive, err := maker.CreateOffer(context.Background(), CreateOfferRequest{
+		GiveAsset: "QDAY", GiveAmount: "0.1", ReceiveAmount: "2", LifetimeMinutes: 60,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := taker.AcceptOffer(context.Background(), expensive.Signed.ID); err == nil || !strings.Contains(err.Error(), "insufficient confirmed BTC") {
+		t.Fatalf("underfunded taker error = %v", err)
+	}
 	offer, err := maker.CreateOffer(context.Background(), CreateOfferRequest{
 		GiveAsset: "QDAY", GiveAmount: "1.25", ReceiveAmount: "0.0001", LifetimeMinutes: 60,
 	})

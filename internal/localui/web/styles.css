@@ -97,6 +97,13 @@ main { width: min(100%,1540px); min-height: calc(100vh - 210px); margin: 0 auto;
 .metric span { color: #59625a; font-size: 8px; letter-spacing: .08em; }
 .metric strong { display: block; margin-top: 6px; overflow: hidden; color: var(--text); font-size: 18px; text-overflow: ellipsis; white-space: nowrap; }
 .metric small { display: block; margin-top: 5px; overflow: hidden; color: var(--muted); font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+.trade-actions { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 1px; margin-top: 22px; border: 1px solid var(--line); background: var(--line); }
+.trade-action { display: grid; min-height: 116px; grid-template-columns: 1fr auto; align-content: center; gap: 5px 18px; padding: 20px 22px; background: var(--panel); }
+.trade-action:hover { background: #091109; }
+.trade-action span { color: var(--text); font-size: 18px; font-weight: 700; }
+.trade-action small { grid-column: 1; color: var(--muted); font-size: 9px; }
+.trade-action b { grid-row: 1 / 3; grid-column: 2; align-self: center; color: var(--green); font-size: 10px; }
+.trade-action.sell b { color: #ff977d; }
 
 .page-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 25px; padding: 20px 0 25px; border-bottom: 1px solid var(--line-bright); }
 .page-head h1 { margin: 7px 0 0; font-size: clamp(27px,3vw,42px); line-height: 1; letter-spacing: -.04em; }
@@ -123,12 +130,47 @@ main { width: min(100%,1540px); min-height: calc(100vh - 210px); margin: 0 auto;
 .mine { display: block; margin-top: 4px; color: var(--green-dim); font-size: 7px; }
 .row-action { text-align: right; }
 
-.offer-form-card { max-width: 1000px; padding: 22px; }
+.trade-page-head { padding-bottom: 28px; }
+.side-picker { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 1px; margin-top: 22px; border: 1px solid var(--line); background: var(--line); }
+.side-picker button { display: flex; min-height: 86px; align-items: flex-start; justify-content: center; flex-direction: column; padding: 16px 20px; border: 0; background: var(--panel); color: var(--muted); text-align: left; cursor: pointer; }
+.side-picker button:hover { background: #0a0d0a; }
+.side-picker button.active { background: #071108; box-shadow: inset 0 2px 0 var(--green-dim); }
+.side-picker button:nth-child(2).active { background: #110907; box-shadow: inset 0 2px 0 #8c4030; }
+.side-picker b { color: var(--text); font-size: 16px; }
+.side-picker button.active:first-child b { color: var(--green); }
+.side-picker button.active:nth-child(2) b { color: #ff977d; }
+.side-picker span { margin-top: 5px; font-size: 9px; }
+.instant-offers { margin-top: 12px; }
+.trade-offers strong, .trade-offers small { display: block; }
+.trade-offers strong { color: #dce2dc; font-size: 11px; }
+.fiat-line { margin-top: 3px; color: var(--muted); font-size: 8px; }
+.offer-price { color: var(--green); }
+.offer-form-card { max-width: 1100px; padding: 0; }
+.custom-offer-head { padding: 22px 24px; border-bottom: 1px solid var(--line); }
+.custom-offer-head h2 { margin: 5px 0 0; font-size: 24px; }
+.custom-offer-head p { margin: 8px 0 0; color: var(--muted); font-size: 10px; }
+.offer-form-card form { padding: 4px 24px 24px; }
 .offer-fields { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 2px 18px; }
 .field.light > span { color: #687169; }
+.price-input { display: flex; }
+.price-input input { min-width: 0; flex: 1; }
+.currency-switch { display: grid; flex: 0 0 116px; grid-template-columns: 1fr 1fr; border: 1px solid var(--line-bright); border-left: 0; background: var(--line); }
+.currency-switch button { border: 0; background: var(--panel-up); color: var(--muted); font-size: 9px; cursor: pointer; }
+.currency-switch button.active { background: #0b1a0d; color: var(--green); }
+.available-balance { display: flex; min-height: 74px; justify-content: center; flex-direction: column; align-self: end; margin-top: 16px; padding: 10px 13px; border: 1px solid var(--line); background: #050605; }
+.available-balance span { color: #687169; font-size: 8px; letter-spacing: .07em; }
+.available-balance strong { margin-top: 4px; color: var(--text); font-size: 14px; }
+.available-balance small { margin-top: 2px; color: var(--muted); font-size: 8px; }
+.offer-summary { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 1px; margin-top: 22px; border: 1px solid var(--line-bright); background: var(--line); }
+.offer-summary > div { min-height: 112px; padding: 16px; background: #050705; }
+.offer-summary span, .final-quote span { display: block; color: #59625a; font-size: 8px; letter-spacing: .08em; }
+.offer-summary strong, .offer-summary small, .final-quote strong, .final-quote small { display: block; }
+.offer-summary strong { margin-top: 8px; overflow-wrap: anywhere; color: var(--text); font-size: 17px; }
+.offer-summary small { margin-top: 5px; color: var(--muted); font-size: 8px; }
+.balance-warning { margin: 12px 0 0; padding: 11px 13px; border: 1px solid #6b5228; background: #120e05; color: var(--amber); font-size: 9px; }
 .review-note { display: flex; gap: 18px; margin-top: 20px; padding: 14px; border: 1px solid var(--line); color: var(--muted); font-size: 10px; }
 .review-note strong { flex: 0 0 auto; color: var(--green); }
-.offer-form-card .primary { margin-top: 18px; }
+.offer-form-card .review-offer { min-width: 210px; margin-top: 18px; }
 .negotiation-list article { display: flex; min-height: 68px; align-items: center; gap: 18px; padding: 12px 15px; border-bottom: 1px solid var(--line); }
 .negotiation-list article:last-child { border-bottom: 0; }
 .negotiation-list article > div { min-width: 0; flex: 1; }
@@ -150,6 +192,10 @@ main { width: min(100%,1540px); min-height: calc(100vh - 210px); margin: 0 auto;
 .phrase span { min-width: 0; padding: 9px 10px; overflow: hidden; background: var(--bg); text-overflow: ellipsis; white-space: nowrap; counter-increment: word; }
 .phrase span::before { margin-right: 7px; color: #59615a; content: counter(word); font-size: 8px; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
+.final-quote { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 1px; border: 1px solid var(--line); background: var(--line); }
+.final-quote > div { min-height: 112px; padding: 16px; background: var(--bg); }
+.final-quote strong { margin-top: 7px; overflow-wrap: anywhere; color: var(--text); font-size: 15px; }
+.final-quote small { margin-top: 5px; color: var(--muted); font-size: 8px; }
 .address-box { padding: 13px; border: 1px solid var(--line-bright); overflow-wrap: anywhere; color: var(--green); }
 .toast { position: fixed; z-index: 120; right: 20px; bottom: 20px; padding: 9px 13px; transform: translateY(10px); border: 1px solid var(--green-dim); background: #071108; color: var(--green); font-size: 9px; opacity: 0; pointer-events: none; transition: .15s ease; }
 .toast.show { transform: translateY(0); opacity: 1; }
@@ -184,7 +230,9 @@ footer { display: flex; min-height: 90px; align-items: center; gap: 20px; paddin
   .metrics { grid-template-columns: repeat(2,minmax(0,1fr)); }
   .metric:nth-child(2) { border-right: 0; }
   .metric:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
-  .offer-fields, .settings-grid { grid-template-columns: 1fr; }
+  .trade-actions, .offer-fields, .settings-grid { grid-template-columns: 1fr; }
+  .offer-summary { grid-template-columns: 1fr; }
+  .offer-summary > div { min-height: 92px; }
   .page-head { align-items: flex-start; flex-direction: column; }
   .phrase { grid-template-columns: repeat(2,1fr); }
   footer { align-items: flex-start; flex-direction: column; padding-right: 16px; padding-left: 16px; }
@@ -197,6 +245,11 @@ footer { display: flex; min-height: 90px; align-items: center; gap: 20px; paddin
   .metric, .metric:nth-child(2) { border-right: 0; border-bottom: 1px solid var(--line); }
   .metric:last-child { border-bottom: 0; }
   .review-note { flex-direction: column; gap: 5px; }
+  .side-picker { grid-template-columns: 1fr; }
+  .side-picker button { min-height: 74px; }
+  .custom-offer-head, .offer-form-card form { padding-right: 16px; padding-left: 16px; }
+  .final-quote { grid-template-columns: 1fr; }
+  .final-quote > div { min-height: 92px; }
   .modal-head, .modal-body { padding-right: 19px; padding-left: 19px; }
 }
 @media (prefers-reduced-motion: reduce) { *,*::before,*::after { animation-duration:.01ms!important; animation-iteration-count:1!important; transition-duration:.01ms!important; } }

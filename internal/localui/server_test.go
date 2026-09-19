@@ -34,6 +34,9 @@ func (fakeApplication) Orders(context.Context, string, int) (relay.ResultPage, e
 func (fakeApplication) MarketPrice(context.Context) (relay.MarketPrice, error) {
 	return relay.MarketPrice{Pair: "BTC-USD", USD: "81401.385", Source: "test"}, nil
 }
+func (fakeApplication) QuoteOffer(context.Context, app.QuoteOfferRequest) (app.OfferQuote, error) {
+	return app.OfferQuote{Side: "buy", Quantity: "10", BTCAmount: "0.000125"}, nil
+}
 func (fakeApplication) CreateOffer(context.Context, app.CreateOfferRequest) (relay.Record, error) {
 	return relay.Record{}, nil
 }
@@ -84,6 +87,17 @@ func TestBootstrapSessionHostAndOriginProtection(t *testing.T) {
 	server.ServeHTTP(response, stateRequest)
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"configured":true`) {
 		t.Fatalf("state status=%d body=%q", response.Code, response.Body.String())
+	}
+
+	quoteRequest := httptest.NewRequest(http.MethodPost, "http://"+host+"/api/v1/offers/quote", strings.NewReader(`{"side":"buy","quantity":"10","price":"1","priceCurrency":"USD"}`))
+	quoteRequest.Host = host
+	quoteRequest.Header.Set("Content-Type", "application/json")
+	quoteRequest.Header.Set("Origin", "http://"+host)
+	quoteRequest.AddCookie(cookie)
+	response = httptest.NewRecorder()
+	server.ServeHTTP(response, quoteRequest)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"btcAmount":"0.000125"`) {
+		t.Fatalf("quote status=%d body=%q", response.Code, response.Body.String())
 	}
 
 	badOrigin := httptest.NewRequest(http.MethodPost, "http://"+host+"/api/v1/lock", strings.NewReader(`{}`))

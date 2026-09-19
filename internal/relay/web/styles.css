@@ -166,6 +166,7 @@ main { width: min(100%, 1540px); min-height: calc(100vh - 210px); margin: 0 auto
 .quickstart > header { display: grid; grid-template-columns: minmax(300px, .85fr) minmax(420px, 1.15fr); column-gap: 40px; align-items: end; margin-bottom: 24px; }
 .quickstart > header .command { grid-column: 1 / -1; }
 .quickstart > header h2 { margin: 0; font-size: clamp(24px, 3vw, 38px); line-height: 1; letter-spacing: -.04em; }
+.quickstart > header h2:only-of-type { grid-column: 1 / -1; }
 .quickstart > header p { margin: 0; color: var(--muted); font-size: 11px; }
 .quickstart-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; border: 1px solid var(--line); background: var(--line); }
 .quickstart-grid article { min-height: 205px; padding: 21px; background: var(--panel); }

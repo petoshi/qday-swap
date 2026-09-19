@@ -154,6 +154,31 @@ type CreateOfferRequest struct {
 	LifetimeMinutes uint32 `json:"lifetimeMinutes"`
 }
 
+type QuoteOfferRequest struct {
+	Side          string `json:"side"`
+	Quantity      string `json:"quantity"`
+	Price         string `json:"price"`
+	PriceCurrency string `json:"priceCurrency"`
+}
+
+type OfferQuote struct {
+	Side           string `json:"side"`
+	Quantity       string `json:"quantity"`
+	PriceCurrency  string `json:"priceCurrency"`
+	EnteredPrice   string `json:"enteredPrice"`
+	GiveAsset      string `json:"giveAsset"`
+	GiveAmount     string `json:"giveAmount"`
+	ReceiveAmount  string `json:"receiveAmount"`
+	BTCAmount      string `json:"btcAmount"`
+	BTCPerQDAY     string `json:"btcPerQDAY"`
+	USDTotal       string `json:"usdTotal,omitempty"`
+	USDPerQDAY     string `json:"usdPerQDAY,omitempty"`
+	BitcoinUSD     string `json:"bitcoinUSD,omitempty"`
+	PriceSource    string `json:"priceSource,omitempty"`
+	PriceUpdatedAt string `json:"priceUpdatedAt,omitempty"`
+	PriceStale     bool   `json:"priceStale,omitempty"`
+}
+
 type Negotiations struct {
 	Pending  []swapstate.Negotiation `json:"pending"`
 	Incoming []swapstate.Negotiation `json:"incoming"`
@@ -482,7 +507,7 @@ func (s *Service) Orders(ctx context.Context, giveAsset string, page int) (relay
 	if giveAsset != "" && giveAsset != "QDAY" && giveAsset != "BTC" {
 		return relay.ResultPage{}, errors.New("give asset must be QDAY or BTC")
 	}
-	result, err := s.relay.Orders(ctx, relay.StatusOpen, giveAsset, page, 20)
+	result, err := s.relay.Orders(ctx, relay.StatusOpen, giveAsset, page, 100)
 	if err != nil {
 		return relay.ResultPage{}, err
 	}
@@ -566,6 +591,101 @@ func (s *Service) CreateOffer(ctx context.Context, request CreateOfferRequest) (
 	return record, nil
 }
 
+func (s *Service) QuoteOffer(ctx context.Context, request QuoteOfferRequest) (OfferQuote, error) {
+	side := strings.ToLower(strings.TrimSpace(request.Side))
+	if side != "buy" && side != "sell" {
+		return OfferQuote{}, errors.New("choose BUY QDAY or SELL QDAY")
+	}
+	currency := strings.ToUpper(strings.TrimSpace(request.PriceCurrency))
+	if currency != "USD" && currency != "BTC" {
+		return OfferQuote{}, errors.New("price currency must be USD or BTC")
+	}
+	enteredPrice, err := positiveDecimal(request.Price, "price")
+	if err != nil {
+		return OfferQuote{}, err
+	}
+	qdayStatus, qdayBalance, bitcoinBalance, err := s.walletSnapshot(ctx)
+	if err != nil {
+		return OfferQuote{}, err
+	}
+	qdayAtomic, err := decimalToAtomic(request.Quantity, qdayStatus.UnitAtomic)
+	if err != nil {
+		return OfferQuote{}, fmt.Errorf("QDAY quantity: %w", err)
+	} else if len(qdayAtomic) > 64 {
+		return OfferQuote{}, errors.New("QDAY quantity is too large")
+	}
+	qdayAtoms, _ := new(big.Int).SetString(qdayAtomic, 10)
+	qdayUnit, _ := new(big.Int).SetString(qdayStatus.UnitAtomic, 10)
+	quantity := new(big.Rat).SetFrac(qdayAtoms, qdayUnit)
+
+	var market relay.MarketPrice
+	var bitcoinUSD *big.Rat
+	if currency == "USD" {
+		market, err = s.relay.Price(ctx)
+		if err != nil {
+			return OfferQuote{}, errors.New("BTC/USD price is temporarily unavailable; enter the price in BTC")
+		}
+		bitcoinUSD, err = positiveDecimal(market.USD, "BTC/USD price")
+		if err != nil {
+			return OfferQuote{}, errors.New("price relay returned an invalid BTC/USD price")
+		}
+	} else if fetched, priceErr := s.relay.Price(ctx); priceErr == nil {
+		if parsed, parseErr := positiveDecimal(fetched.USD, "BTC/USD price"); parseErr == nil {
+			market, bitcoinUSD = fetched, parsed
+		}
+	}
+
+	totalBTC := new(big.Rat).Mul(quantity, enteredPrice)
+	if currency == "USD" {
+		totalBTC.Quo(totalBTC, bitcoinUSD)
+	}
+	totalSatoshis := roundPositiveRat(new(big.Rat).Mul(totalBTC, big.NewRat(100_000_000, 1)))
+	if totalSatoshis.Sign() <= 0 {
+		return OfferQuote{}, errors.New("total is below one satoshi; increase the price or quantity")
+	}
+	maximumBitcoinSatoshis := big.NewInt(2_100_000_000_000_000)
+	if totalSatoshis.Cmp(maximumBitcoinSatoshis) > 0 {
+		return OfferQuote{}, errors.New("Bitcoin total exceeds the maximum supply")
+	}
+	satoshis := totalSatoshis.String()
+	if side == "buy" {
+		err = requireAvailable(satoshis, bitcoinBalance.Confirmed.Satoshis, "BTC")
+	} else {
+		err = requireAvailable(qdayAtomic, qdayBalance.Spendable.Atomic, "QDAY")
+	}
+	if err != nil {
+		return OfferQuote{}, err
+	}
+
+	btcAmount := atomicDecimal(satoshis, "100000000")
+	quantityText := atomicDecimal(qdayAtomic, qdayStatus.UnitAtomic)
+	effectiveBTCPerQDAY := new(big.Rat).SetFrac(
+		new(big.Int).Mul(totalSatoshis, qdayUnit),
+		new(big.Int).Mul(qdayAtoms, big.NewInt(100_000_000)),
+	)
+	quote := OfferQuote{
+		Side: side, Quantity: quantityText, PriceCurrency: currency,
+		EnteredPrice: strings.TrimSpace(request.Price), BTCAmount: btcAmount,
+		BTCPerQDAY: decimalRat(effectiveBTCPerQDAY, 16),
+	}
+	if side == "buy" {
+		quote.GiveAsset, quote.GiveAmount, quote.ReceiveAmount = "BTC", btcAmount, quantityText
+	} else {
+		quote.GiveAsset, quote.GiveAmount, quote.ReceiveAmount = "QDAY", quantityText, btcAmount
+	}
+	if bitcoinUSD != nil {
+		usdTotal := new(big.Rat).Mul(new(big.Rat).SetFrac(totalSatoshis, big.NewInt(100_000_000)), bitcoinUSD)
+		usdPerQDAY := new(big.Rat).Mul(effectiveBTCPerQDAY, bitcoinUSD)
+		quote.USDTotal = usdTotal.FloatString(2)
+		quote.USDPerQDAY = decimalRat(usdPerQDAY, 8)
+		quote.BitcoinUSD = market.USD
+		quote.PriceSource = market.Source
+		quote.PriceUpdatedAt = market.UpdatedAt
+		quote.PriceStale = market.Stale
+	}
+	return quote, nil
+}
+
 func (s *Service) CancelOffer(ctx context.Context, orderID string) (relay.Record, error) {
 	identity, _, cleanup, err := s.identities()
 	if err != nil {
@@ -606,11 +726,19 @@ func (s *Service) AcceptOffer(ctx context.Context, orderID string) (swapstate.Ne
 	} else if err := record.Signed.Verify(now); err != nil {
 		return swapstate.Negotiation{}, err
 	}
-	qdayStatus, _, _, err := s.walletSnapshot(ctx)
+	qdayStatus, qdayBalance, bitcoinBalance, err := s.walletSnapshot(ctx)
 	if err != nil {
 		return swapstate.Negotiation{}, err
 	} else if record.Signed.Order.QDAYUnitAtomic != qdayStatus.UnitAtomic {
 		return swapstate.Negotiation{}, errors.New("offer uses a different QDAY consensus unit")
+	}
+	if record.Signed.Order.Give.Asset == "QDAY" {
+		err = requireAvailable(record.Signed.Order.Receive.Atomic, bitcoinBalance.Confirmed.Satoshis, "BTC")
+	} else {
+		err = requireAvailable(record.Signed.Order.Receive.Atomic, qdayBalance.Spendable.Atomic, "QDAY")
+	}
+	if err != nil {
+		return swapstate.Negotiation{}, err
 	}
 	acceptance, err := trade.NewAcceptance(record.Signed, 15*time.Minute, identity, messagePublic, now)
 	if err != nil {
@@ -774,6 +902,64 @@ func decimalToAtomic(value, unit string) (string, error) {
 		return "", errors.New("amount must be greater than zero")
 	}
 	return encoded, nil
+}
+
+func positiveDecimal(value, name string) (*big.Rat, error) {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 64 || strings.HasPrefix(value, "+") || strings.HasPrefix(value, "-") || strings.ContainsAny(value, "eE") {
+		return nil, fmt.Errorf("%s must be a positive plain decimal", name)
+	}
+	dot, digit := false, false
+	for _, character := range value {
+		switch {
+		case character >= '0' && character <= '9':
+			digit = true
+		case character == '.' && !dot:
+			dot = true
+		default:
+			return nil, fmt.Errorf("%s must be a positive plain decimal", name)
+		}
+	}
+	result, ok := new(big.Rat).SetString(value)
+	if !digit || !ok || result.Sign() <= 0 {
+		return nil, fmt.Errorf("%s must be a positive plain decimal", name)
+	}
+	return result, nil
+}
+
+func roundPositiveRat(value *big.Rat) *big.Int {
+	quotient, remainder := new(big.Int), new(big.Int)
+	quotient.QuoRem(value.Num(), value.Denom(), remainder)
+	if new(big.Int).Lsh(remainder, 1).Cmp(value.Denom()) >= 0 {
+		quotient.Add(quotient, big.NewInt(1))
+	}
+	return quotient
+}
+
+func atomicDecimal(atomic, unit string) string {
+	digits := len(unit) - 1
+	value := atomic
+	if len(value) <= digits {
+		value = strings.Repeat("0", digits+1-len(value)) + value
+	}
+	whole := value[:len(value)-digits]
+	if digits == 0 {
+		return whole
+	}
+	fraction := strings.TrimRight(value[len(value)-digits:], "0")
+	if fraction == "" {
+		return whole
+	}
+	return whole + "." + fraction
+}
+
+func decimalRat(value *big.Rat, places int) string {
+	formatted := value.FloatString(places)
+	formatted = strings.TrimRight(strings.TrimRight(formatted, "0"), ".")
+	if formatted == "" || formatted == "-0" {
+		return "0"
+	}
+	return formatted
 }
 
 func requireAvailable(wanted, available, asset string) error {
