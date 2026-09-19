@@ -177,3 +177,30 @@ func TestMessageIdentityIsRecoverableAndSeparated(t *testing.T) {
 		t.Fatal("message identity overlaps the order identity or its public key")
 	}
 }
+
+func TestSwapSecretIsRecoverableAndTradeSpecific(t *testing.T) {
+	root := Root{8, 7, 6, 5}
+	firstID := "0102030405060708090001020304050607080900010203040506070809000102"
+	secondID := "1102030405060708090001020304050607080900010203040506070809000102"
+	first, firstHash, err := root.SwapSecret(firstID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repeated, repeatedHash, err := root.SwapSecret(firstID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, secondHash, err := root.SwapSecret(secondID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != repeated || firstHash != repeatedHash {
+		t.Fatal("swap secret is not recoverable")
+	}
+	if first == second || firstHash == secondHash {
+		t.Fatal("two trades derived the same secret")
+	}
+	if _, _, err := root.SwapSecret("ABC"); err == nil {
+		t.Fatal("invalid trade ID accepted")
+	}
+}

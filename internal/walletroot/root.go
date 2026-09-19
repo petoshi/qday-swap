@@ -7,6 +7,7 @@ import (
 	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/sha512"
 	"errors"
 	"fmt"
@@ -190,4 +191,36 @@ func (r Root) MessageIdentity() (privateKey, publicKey [32]byte, err error) {
 	copy(publicKey[:], encoded)
 	clear(encoded)
 	return privateKey, publicKey, nil
+}
+
+// SwapSecret returns the deterministic 32-byte hash preimage owned by the
+// maker of a matched trade. It is recoverable from the phrase and trade ID, so
+// a crash cannot strand the counterparty's contract after the first claim.
+func (r Root) SwapSecret(tradeID string) (secret, secretHash [32]byte, err error) {
+	if len(tradeID) != 64 {
+		return secret, secretHash, errors.New("trade ID must be 32 hexadecimal bytes")
+	}
+	tradeBytes := make([]byte, 32)
+	for index := 0; index < len(tradeBytes); index++ {
+		var high, low byte
+		for position, destination := range [](*byte){&high, &low} {
+			value := tradeID[index*2+position]
+			switch {
+			case value >= '0' && value <= '9':
+				*destination = value - '0'
+			case value >= 'a' && value <= 'f':
+				*destination = value - 'a' + 10
+			default:
+				return secret, secretHash, errors.New("trade ID must be 32 lowercase hexadecimal bytes")
+			}
+		}
+		tradeBytes[index] = high<<4 | low
+	}
+	secret, err = r.DomainSeed("swap-secret-sha256-v1", tradeBytes)
+	clear(tradeBytes)
+	if err != nil {
+		return secret, secretHash, err
+	}
+	secretHash = sha256.Sum256(secret[:])
+	return secret, secretHash, nil
 }
