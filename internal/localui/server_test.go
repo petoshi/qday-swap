@@ -25,6 +25,7 @@ func (fakeApplication) RecoveryPhrase() (string, error)      { return "word", ni
 func (fakeApplication) QDAYReceiveAddress(context.Context) (walletd.Address, error) {
 	return walletd.Address{Address: "qday1ptest"}, nil
 }
+func (fakeApplication) BitcoinReceiveAddress() (string, error) { return "bc1qtest", nil }
 
 func TestBootstrapSessionHostAndOriginProtection(t *testing.T) {
 	const host = "127.0.0.1:42424"

@@ -13,10 +13,10 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/btcsuite/btcd/address/v2"
 	"github.com/btcsuite/btcd/btcec/v2"
-	"github.com/btcsuite/btcd/btcutil"
-	"github.com/btcsuite/btcd/btcutil/hdkeychain"
-	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcd/btcutil/v2/hdkeychain"
+	"github.com/btcsuite/btcd/chaincfg/v2"
 	"github.com/tyler-smith/go-bip39"
 	"golang.org/x/crypto/curve25519"
 )
@@ -59,14 +59,28 @@ func (r Root) Phrase() (string, error) {
 // QDAYSeed returns the entropy format expected by QDAY's existing wallet.
 func (r Root) QDAYSeed() [32]byte { return [32]byte(r) }
 
-func (r Root) bip32Master() (*hdkeychain.ExtendedKey, error) {
+// BitcoinSeed returns the BIP39 seed consumed by Bitcoin HD wallets. The
+// caller must clear the returned bytes after importing them into the wallet.
+// QDAY intentionally continues to consume the raw 32-byte entropy above.
+func (r Root) BitcoinSeed() ([64]byte, error) {
+	var result [64]byte
 	phrase, err := r.Phrase()
+	if err != nil {
+		return result, err
+	}
+	seed := bip39.NewSeed(phrase, "")
+	copy(result[:], seed)
+	clear(seed)
+	return result, nil
+}
+
+func (r Root) bip32Master() (*hdkeychain.ExtendedKey, error) {
+	seed, err := r.BitcoinSeed()
 	if err != nil {
 		return nil, err
 	}
-	seed := bip39.NewSeed(phrase, "")
-	defer clear(seed)
-	return hdkeychain.NewMaster(seed, &chaincfg.MainNetParams)
+	defer clear(seed[:])
+	return hdkeychain.NewMaster(seed[:], &chaincfg.MainNetParams)
 }
 
 // BIPKey derives m/purpose'/coin_type'/account'/change/index. Purpose and coin
@@ -114,12 +128,12 @@ func (r Root) BitcoinAddress(account, change, index uint32, network *chaincfg.Pa
 	if err != nil {
 		return "", err
 	}
-	program := btcutil.Hash160(key.PubKey().SerializeCompressed())
-	address, err := btcutil.NewAddressWitnessPubKeyHash(program, network)
+	program := address.Hash160(key.PubKey().SerializeCompressed())
+	encoded, err := address.NewAddressWitnessPubKeyHash(program, network)
 	if err != nil {
 		return "", fmt.Errorf("encode native SegWit address: %w", err)
 	}
-	return address.EncodeAddress(), nil
+	return encoded.EncodeAddress(), nil
 }
 
 // LitecoinKey derives the native SegWit branch m/84'/2'/account'/change/index.

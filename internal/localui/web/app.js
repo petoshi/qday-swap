@@ -72,8 +72,11 @@ function updateChrome() {
   } else if (!state.qday?.synced) {
     nodePill.classList.add('waiting');
     label.textContent = state.qday ? `SYNC ${commas(state.qday.scanHeight)} / ${commas(state.qday.height)}` : 'STARTING';
+  } else if (!state.bitcoin?.headersSynced || !state.bitcoin?.walletSynced) {
+    nodePill.classList.add('waiting');
+    label.textContent = state.bitcoin ? `BTC SYNC ${commas(state.bitcoin.walletHeight)} / ${commas(state.bitcoin.headerHeight)}` : 'BTC STARTING';
   } else {
-    label.textContent = `${state.qday.connections} PEERS · ${commas(state.qday.height)}`;
+    label.textContent = `${state.qday.connections} QDAY · ${state.bitcoin.peers} BTC`;
   }
 }
 
@@ -111,16 +114,18 @@ function metric(label, value, note) {
 function renderMarket() {
   const balance = state.balance?.spendable?.qday ?? '0';
   const pending = state.balance?.pendingIn?.qday ?? '0';
+  const bitcoin = state.bitcoinBalance?.confirmed?.btc ?? '0';
+  const bitcoinPending = state.bitcoinBalance?.pending?.btc ?? '0';
   root.innerHTML = `${state.error ? `<div class="alert"><strong>QDAY node needs attention</strong>${escapeHTML(state.error)}</div>` : ''}
     <section class="hero">
       <div><span class="eyebrow">QDAY ↔ BITCOIN</span><h1>SWAP WITHOUT PERMISSION.</h1><p>Signed public offers. Bitcoin Native SegWit contracts. QDAY contracts protected by Ed25519 and SLH DSA. Your keys remain here.</p></div>
-      <div class="wallet-card"><div><span>Spendable QDAY</span><strong>${escapeHTML(commas(balance))}</strong><small>exact balance from your local node</small></div><div><span>Pending</span><strong>${escapeHTML(commas(pending))}</strong><small>unconfirmed QDAY</small></div></div>
+      <div class="wallet-card"><div><span>Spendable QDAY</span><strong>${escapeHTML(commas(balance))}</strong><small>exact balance from your local node</small></div><div><span>Pending QDAY</span><strong>${escapeHTML(commas(pending))}</strong><small>unconfirmed QDAY</small></div><div><span>Confirmed BTC</span><strong>${escapeHTML(commas(bitcoin))}</strong><small>verified by the local light client</small></div><div><span>Pending BTC</span><strong>${escapeHTML(commas(bitcoinPending))}</strong><small>unconfirmed Bitcoin</small></div></div>
     </section>
     <section class="metrics">
       ${metric('QDAY height', state.qday ? commas(state.qday.height) : 'STARTING', state.qday?.synced ? 'fully synchronized' : 'synchronizing')}
-      ${metric('QDAY peers', state.qday?.connections ?? '0', 'local full node')}
+      ${metric('Bitcoin height', state.bitcoin ? commas(state.bitcoin.headerHeight) : 'STARTING', state.bitcoin?.walletSynced ? 'wallet synchronized' : 'compact-filter sync')}
+      ${metric('Network peers', `${state.qday?.connections ?? 0} / ${state.bitcoin?.peers ?? 0}`, 'QDAY / Bitcoin')}
       ${metric('Open offers', '0', 'signed relay orders')}
-      ${metric('Active swaps', '0', 'automatic claim or refund')}
     </section>
     <section class="card"><div class="card-head"><h2>Open QDAY ↔ BTC offers</h2><span>DEX RELAY</span></div><div class="empty"><strong>NO OPEN OFFERS YET.</strong><p>Create the first signed offer or wait for another trader. The relay can publish terms. It cannot touch funds.</p></div></section>`;
 }
@@ -134,6 +139,7 @@ function renderSettings() {
     ${state.error ? `<div class="alert"><strong>Local node error</strong>${escapeHTML(state.error)}</div>` : ''}
     <section class="settings-grid">
       <article class="card setting"><h2>QDAY RECEIVE.</h2><p>Generate the wallet address used to fund swaps and ordinary QDAY transfers.</p><button class="secondary" id="receive-qday">SHOW ADDRESS</button></article>
+      <article class="card setting"><h2>BITCOIN RECEIVE.</h2><p>Show your standard Native SegWit address for funding BTC swaps.</p><button class="secondary" id="receive-bitcoin">SHOW ADDRESS</button></article>
       <article class="card setting"><h2>RECOVERY PHRASE.</h2><p>Reveal the 24 words that restore every chain branch and swap identity.</p><button class="secondary" id="show-recovery">REVEAL 24 WORDS</button></article>
       <article class="card setting"><h2>PUBLIC MARKET.</h2><p>${escapeHTML(state.relayURL || 'Relay is not configured')}</p><a class="secondary" href="${escapeHTML(state.relayURL || '#')}" target="_blank" rel="noreferrer">OPEN DEX RELAY</a></article>
       <article class="card setting"><h2>LOCK WALLET.</h2><p>Clear private material from memory while the QDAY node continues syncing.</p><button class="danger" id="lock-wallet">LOCK NOW</button></article>
@@ -194,6 +200,14 @@ document.addEventListener('click', async event => {
       openModal(`<div class="modal-head"><span class="eyebrow">QDAY WALLET</span><h2>RECEIVE QDAY.</h2></div><div class="modal-body"><p>Send ordinary QDAY transfers to this address. Wait for confirmations before opening a swap.</p><div class="address-box">${escapeHTML(address.address)}</div><div class="modal-actions"><button class="secondary" id="close-modal">CLOSE</button><button class="primary" id="copy-address">COPY ADDRESS</button></div></div>`);
       document.querySelector('#close-modal').addEventListener('click', closeModal);
       document.querySelector('#copy-address').addEventListener('click', async () => { await navigator.clipboard.writeText(address.address); showToast('Address copied'); });
+    } catch (error) { showToast(error.message); }
+  }
+  if (event.target.closest('#receive-bitcoin')) {
+    try {
+      const result = await api('/api/v1/bitcoin/address');
+      openModal(`<div class="modal-head"><span class="eyebrow">BITCOIN WALLET</span><h2>RECEIVE BTC.</h2></div><div class="modal-body"><p>Send BTC to this Native SegWit address. The local light client verifies confirmations without downloading the full Bitcoin chain.</p><div class="address-box">${escapeHTML(result.address)}</div><div class="modal-actions"><button class="secondary" id="close-modal">CLOSE</button><button class="primary" id="copy-address">COPY ADDRESS</button></div></div>`);
+      document.querySelector('#close-modal').addEventListener('click', closeModal);
+      document.querySelector('#copy-address').addEventListener('click', async () => { await navigator.clipboard.writeText(result.address); showToast('Bitcoin address copied'); });
     } catch (error) { showToast(error.message); }
   }
   if (event.target.closest('#show-recovery')) {

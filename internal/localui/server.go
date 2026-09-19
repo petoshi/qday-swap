@@ -36,6 +36,7 @@ type Application interface {
 	Lock(context.Context) error
 	RecoveryPhrase() (string, error)
 	QDAYReceiveAddress(context.Context) (walletd.Address, error)
+	BitcoinReceiveAddress() (string, error)
 }
 
 type Server struct {
@@ -196,6 +197,13 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, address)
+	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/bitcoin/address":
+		address, err := s.application.BitcoinReceiveAddress()
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"address": address})
 	default:
 		writeError(w, http.StatusNotFound, "API endpoint not found")
 	}

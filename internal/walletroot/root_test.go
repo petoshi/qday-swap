@@ -5,8 +5,8 @@ import (
 	"crypto/ed25519"
 	"testing"
 
-	"github.com/btcsuite/btcd/btcutil"
-	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcd/address/v2"
+	"github.com/btcsuite/btcd/chaincfg/v2"
 )
 
 const zeroPhrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art"
@@ -123,15 +123,39 @@ func TestBitcoinAddressUsesNativeSegWit(t *testing.T) {
 	} else if change == first {
 		t.Fatal("receive and change branches derived the same address")
 	}
-	decoded, err := btcutil.DecodeAddress(first, &chaincfg.MainNetParams)
+	decoded, err := address.DecodeAddress(first, &chaincfg.MainNetParams)
 	if err != nil {
 		t.Fatal(err)
-	} else if _, ok := decoded.(*btcutil.AddressWitnessPubKeyHash); !ok {
+	} else if _, ok := decoded.(*address.AddressWitnessPubKeyHash); !ok {
 		t.Fatalf("Bitcoin address has type %T, expected native P2WPKH", decoded)
 	}
 	if _, err := root.BitcoinAddress(0, 0, 0, nil); err == nil {
 		t.Fatal("nil Bitcoin network parameters accepted")
 	}
+}
+
+func TestBitcoinSeedIsDeterministicAndSeparatedFromQDAYSeed(t *testing.T) {
+	root, err := ParsePhrase(zeroPhrase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := root.BitcoinSeed()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := root.BitcoinSeed()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second {
+		t.Fatal("Bitcoin BIP39 seed is not deterministic")
+	}
+	qday := root.QDAYSeed()
+	if string(first[:32]) == string(qday[:]) {
+		t.Fatal("Bitcoin BIP39 seed reused QDAY raw entropy")
+	}
+	clear(first[:])
+	clear(second[:])
 }
 
 func TestOrderIdentityIsRecoverableAndSeparated(t *testing.T) {

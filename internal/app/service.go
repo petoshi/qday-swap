@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/petoshi/qday-swap/internal/bitcoinwallet"
 	"github.com/petoshi/qday-swap/internal/keystore"
 	"github.com/petoshi/qday-swap/internal/swapstate"
 	"github.com/petoshi/qday-swap/internal/walletd"
@@ -28,6 +29,9 @@ type Config struct {
 	NetworkManifest string
 	Network         string
 	RelayURL        string
+	BitcoinNetwork  string
+	BitcoinPeers    []string
+	BitcoinAddPeers []string
 }
 
 func DefaultDataDir() string {
@@ -57,27 +61,60 @@ type qdayProcess interface {
 
 type processFactory func(dataDir string) (qdayProcess, error)
 
-type Service struct {
-	config  Config
-	ctx     context.Context
-	factory processFactory
+type bitcoinClient interface {
+	Status() (bitcoinwallet.Status, error)
+	Balance() (bitcoinwallet.Balance, error)
+	Unlock(string) error
+	Lock()
+	ReceiveAddress() (string, error)
+}
 
-	mu        sync.RWMutex
-	process   qdayProcess
-	client    qdayClient
-	journal   *swapstate.Journal
-	root      *walletroot.Root
-	lastError string
+type bitcoinProcess interface {
+	Initialize(context.Context, walletroot.Root, string, time.Time) error
+	Start(context.Context) (bitcoinClient, error)
+	Stop() error
+}
+
+type bitcoinProcessFactory func(dataDir string) (bitcoinProcess, error)
+
+type bitcoinManagerProcess struct{ manager *bitcoinwallet.Manager }
+
+func (p *bitcoinManagerProcess) Initialize(ctx context.Context, root walletroot.Root, password string, birthday time.Time) error {
+	return p.manager.Initialize(ctx, root, password, birthday)
+}
+
+func (p *bitcoinManagerProcess) Start(ctx context.Context) (bitcoinClient, error) {
+	return p.manager.Start(ctx)
+}
+
+func (p *bitcoinManagerProcess) Stop() error { return p.manager.Stop() }
+
+type Service struct {
+	config         Config
+	ctx            context.Context
+	factory        processFactory
+	bitcoinFactory bitcoinProcessFactory
+
+	mu             sync.RWMutex
+	process        qdayProcess
+	client         qdayClient
+	bitcoinProcess bitcoinProcess
+	bitcoinClient  bitcoinClient
+	journal        *swapstate.Journal
+	root           *walletroot.Root
+	lastError      string
 }
 
 type State struct {
-	Configured bool             `json:"configured"`
-	Unlocked   bool             `json:"unlocked"`
-	Network    string           `json:"network"`
-	RelayURL   string           `json:"relayURL"`
-	QDAY       *walletd.Status  `json:"qday,omitempty"`
-	Balance    *walletd.Balance `json:"balance,omitempty"`
-	Error      string           `json:"error,omitempty"`
+	Configured     bool                   `json:"configured"`
+	Unlocked       bool                   `json:"unlocked"`
+	Network        string                 `json:"network"`
+	RelayURL       string                 `json:"relayURL"`
+	QDAY           *walletd.Status        `json:"qday,omitempty"`
+	Balance        *walletd.Balance       `json:"balance,omitempty"`
+	Bitcoin        *bitcoinwallet.Status  `json:"bitcoin,omitempty"`
+	BitcoinBalance *bitcoinwallet.Balance `json:"bitcoinBalance,omitempty"`
+	Error          string                 `json:"error,omitempty"`
 }
 
 type SetupResult struct {
@@ -95,6 +132,9 @@ func New(ctx context.Context, config Config) (*Service, error) {
 	if config.Network == "" {
 		config.Network = "mainnet"
 	}
+	if config.BitcoinNetwork == "" {
+		config.BitcoinNetwork = "mainnet"
+	}
 	service := &Service{config: config, ctx: ctx}
 	service.factory = func(dataDir string) (qdayProcess, error) {
 		return walletd.NewManager(walletd.ManagerConfig{
@@ -102,6 +142,16 @@ func New(ctx context.Context, config Config) (*Service, error) {
 			Listen: config.QDAYListen, P2P: config.QDAYP2P, Peers: config.QDAYPeers,
 			NetworkManifest: config.NetworkManifest,
 		})
+	}
+	service.bitcoinFactory = func(dataDir string) (bitcoinProcess, error) {
+		manager, err := bitcoinwallet.NewManager(bitcoinwallet.Config{
+			DataDir: dataDir, Network: config.BitcoinNetwork,
+			ConnectPeers: config.BitcoinPeers, AddPeers: config.BitcoinAddPeers,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return &bitcoinManagerProcess{manager: manager}, nil
 	}
 	if service.Configured() {
 		if err := service.open(); err != nil {
@@ -137,7 +187,7 @@ func (s *Service) open() error {
 }
 
 func (s *Service) openLocked() error {
-	if s.process != nil && s.client != nil && s.journal != nil {
+	if s.process != nil && s.client != nil && s.bitcoinProcess != nil && s.bitcoinClient != nil && s.journal != nil {
 		return nil
 	}
 	process, err := s.factory(filepath.Join(s.config.DataDir, "qday"))
@@ -153,7 +203,21 @@ func (s *Service) openLocked() error {
 		_ = journal.Close()
 		return err
 	}
+	bitcoinProcess, err := s.bitcoinFactory(filepath.Join(s.config.DataDir, "bitcoin"))
+	if err != nil {
+		_ = process.Stop()
+		_ = journal.Close()
+		return err
+	}
+	bitcoinClient, err := bitcoinProcess.Start(s.ctx)
+	if err != nil {
+		_ = bitcoinProcess.Stop()
+		_ = process.Stop()
+		_ = journal.Close()
+		return err
+	}
 	s.process, s.client, s.journal = process, client, journal
+	s.bitcoinProcess, s.bitcoinClient = bitcoinProcess, bitcoinClient
 	s.lastError = ""
 	return nil
 }
@@ -213,6 +277,19 @@ func (s *Service) Setup(ctx context.Context, password, phrase string) (SetupResu
 		clear(root[:])
 		return SetupResult{}, err
 	}
+	bitcoinProcess, err := s.bitcoinFactory(filepath.Join(stage, "bitcoin"))
+	if err != nil {
+		clear(root[:])
+		return SetupResult{}, err
+	}
+	birthday := time.Now().UTC()
+	if !generated {
+		birthday = time.Unix(0, 0).UTC()
+	}
+	if err := bitcoinProcess.Initialize(ctx, root, password, birthday); err != nil {
+		clear(root[:])
+		return SetupResult{}, err
+	}
 	journal, err := swapstate.Open(filepath.Join(stage, "swaps.db"))
 	if err != nil {
 		clear(root[:])
@@ -241,6 +318,12 @@ func (s *Service) Setup(ctx context.Context, password, phrase string) (SetupResu
 	err = s.openLocked()
 	if err == nil {
 		err = s.client.Unlock(ctx, password)
+	}
+	if err == nil {
+		err = s.bitcoinClient.Unlock(password)
+		if err != nil {
+			_ = s.client.Lock(ctx)
+		}
 	}
 	if err != nil {
 		s.lastError = err.Error()
@@ -275,6 +358,11 @@ func (s *Service) Unlock(ctx context.Context, password string) error {
 		clear(root[:])
 		return err
 	}
+	if err := s.bitcoinClient.Unlock(password); err != nil {
+		_ = s.client.Lock(ctx)
+		clear(root[:])
+		return err
+	}
 	if s.root != nil {
 		clear(s.root[:])
 	}
@@ -291,9 +379,16 @@ func (s *Service) Lock(ctx context.Context) error {
 		s.root = nil
 	}
 	if s.client == nil {
+		if s.bitcoinClient != nil {
+			s.bitcoinClient.Lock()
+		}
 		return nil
 	}
-	return s.client.Lock(ctx)
+	err := s.client.Lock(ctx)
+	if s.bitcoinClient != nil {
+		s.bitcoinClient.Lock()
+	}
+	return err
 }
 
 func (s *Service) RecoveryPhrase() (string, error) {
@@ -317,28 +412,53 @@ func (s *Service) QDAYReceiveAddress(ctx context.Context) (walletd.Address, erro
 	return client.CreateAddress(ctx, "qday-swap-main-receive-v1")
 }
 
+func (s *Service) BitcoinReceiveAddress() (string, error) {
+	s.mu.RLock()
+	client, unlocked := s.bitcoinClient, s.root != nil
+	s.mu.RUnlock()
+	if client == nil {
+		return "", errors.New("Bitcoin wallet is unavailable")
+	} else if !unlocked {
+		return "", errors.New("wallet is locked")
+	}
+	return client.ReceiveAddress()
+}
+
 func (s *Service) State(ctx context.Context) State {
 	s.mu.RLock()
 	state := State{Configured: s.Configured(), Unlocked: s.root != nil, Network: s.config.Network, RelayURL: s.config.RelayURL, Error: s.lastError}
-	client := s.client
+	client, bitcoinClient := s.client, s.bitcoinClient
 	s.mu.RUnlock()
-	if client == nil {
-		return state
-	}
 	queryCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	status, err := client.Status(queryCtx)
-	if err != nil {
-		state.Error = err.Error()
-		return state
-	}
-	state.QDAY = &status
-	if status.Synced {
-		balance, err := client.Balance(queryCtx)
+	if client != nil {
+		status, err := client.Status(queryCtx)
 		if err != nil {
-			state.Error = err.Error()
+			state.Error = joinError(state.Error, err)
 		} else {
-			state.Balance = &balance
+			state.QDAY = &status
+			if status.Synced {
+				balance, err := client.Balance(queryCtx)
+				if err != nil {
+					state.Error = joinError(state.Error, err)
+				} else {
+					state.Balance = &balance
+				}
+			}
+		}
+	}
+	if bitcoinClient != nil {
+		status, err := bitcoinClient.Status()
+		if err != nil {
+			state.Error = joinError(state.Error, err)
+		} else {
+			state.Bitcoin = &status
+			balance, err := bitcoinClient.Balance()
+			if err != nil {
+				state.Error = joinError(state.Error, err)
+			} else {
+				state.BitcoinBalance = &balance
+			}
 		}
 	}
 	return state
@@ -357,6 +477,9 @@ func (s *Service) Close() error {
 		_ = s.client.Lock(lockCtx)
 		cancel()
 	}
+	if s.bitcoinClient != nil {
+		s.bitcoinClient.Lock()
+	}
 	if s.journal != nil {
 		result = s.journal.Close()
 	}
@@ -365,8 +488,22 @@ func (s *Service) Close() error {
 			result = err
 		}
 	}
-	s.process, s.client, s.journal = nil, nil, nil
+	if s.bitcoinProcess != nil {
+		if err := s.bitcoinProcess.Stop(); result == nil {
+			result = err
+		}
+	}
+	s.process, s.client, s.bitcoinProcess, s.bitcoinClient, s.journal = nil, nil, nil, nil, nil
 	return result
+}
+
+func joinError(existing string, err error) string {
+	if err == nil {
+		return existing
+	} else if existing == "" {
+		return err.Error()
+	}
+	return existing + "; " + err.Error()
 }
 
 func syncDirectory(path string) error {

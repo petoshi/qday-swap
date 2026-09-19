@@ -1,0 +1,65 @@
+package bitcoinwallet
+
+import (
+	"context"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/btcsuite/btcd/chaincfg/v2"
+	"github.com/btcsuite/btcwallet/wallet"
+	"github.com/petoshi/qday-swap/internal/walletroot"
+)
+
+const testPhrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art"
+
+func TestInitializeCreatesRecoverableEncryptedBitcoinWallet(t *testing.T) {
+	root, err := walletroot.ParsePhrase(testPhrase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := filepath.Join(t.TempDir(), "bitcoin")
+	manager, err := NewManager(Config{DataDir: directory, Network: "regtest"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	birthday := time.Unix(1_700_000_000, 0)
+	if err := manager.Initialize(context.Background(), root, "correct horse battery staple", birthday); err != nil {
+		t.Fatal(err)
+	}
+	loader := wallet.NewLoader(&chaincfg.RegressionNetParams, filepath.Join(directory, "wallet"), false, wallet.DefaultDBTimeout, recoveryWindow)
+	loaded, err := loader.OpenExistingWallet([]byte(wallet.InsecurePubPassphrase), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// btcwallet intentionally stores a 48-hour safety margin so a timestamp
+	// near a block boundary cannot hide a transaction.
+	if got, want := loaded.Manager.Birthday(), birthday.Add(-48*time.Hour); !got.Equal(want) {
+		t.Fatalf("birthday = %v, want %v", got, want)
+	}
+	if err := loaded.Unlock([]byte("wrong password"), nil); err == nil {
+		t.Fatal("wrong password unlocked Bitcoin wallet")
+	}
+	if err := loaded.Unlock([]byte("correct horse battery staple"), nil); err != nil {
+		t.Fatal(err)
+	}
+	loaded.Lock()
+	if err := loader.UnloadWallet(); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Initialize(context.Background(), root, "correct horse battery staple", birthday); err == nil {
+		t.Fatal("initialized an existing Bitcoin wallet twice")
+	}
+}
+
+func TestFormatBTCExact(t *testing.T) {
+	tests := map[int64]string{
+		0: "0", 1: "0.00000001", 100_000_000: "1", 123_456_789: "1.23456789",
+		-150_000_000: "-1.5",
+	}
+	for satoshis, expected := range tests {
+		if actual := formatBTC(satoshis); actual != expected {
+			t.Fatalf("formatBTC(%d) = %q, want %q", satoshis, actual, expected)
+		}
+	}
+}

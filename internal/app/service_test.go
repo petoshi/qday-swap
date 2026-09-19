@@ -10,7 +10,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/petoshi/qday-swap/internal/bitcoinwallet"
 	"github.com/petoshi/qday-swap/internal/walletd"
 	"github.com/petoshi/qday-swap/internal/walletroot"
 )
@@ -37,6 +39,41 @@ func (f *fakeWalletd) Start(context.Context) (*walletd.Client, error) {
 }
 
 func (f *fakeWalletd) Stop() error { return nil }
+
+type fakeBitcoin struct{ unlocked bool }
+
+func (f *fakeBitcoin) Initialize(_ context.Context, _ walletroot.Root, password string, _ time.Time) error {
+	if password != "correct horse battery staple" {
+		return os.ErrPermission
+	}
+	return nil
+}
+
+func (f *fakeBitcoin) Start(context.Context) (bitcoinClient, error) { return f, nil }
+func (f *fakeBitcoin) Stop() error                                  { return nil }
+func (f *fakeBitcoin) Status() (bitcoinwallet.Status, error) {
+	return bitcoinwallet.Status{Network: "mainnet", HeaderHeight: 900_000, WalletHeight: 900_000, Peers: 8, HeadersSynced: true, WalletSynced: true, Unlocked: f.unlocked}, nil
+}
+func (f *fakeBitcoin) Balance() (bitcoinwallet.Balance, error) {
+	return bitcoinwallet.Balance{
+		Confirmed: bitcoinwallet.Amount{Satoshis: "125000000", BTC: "1.25"},
+		Total:     bitcoinwallet.Amount{Satoshis: "125000000", BTC: "1.25"},
+	}, nil
+}
+func (f *fakeBitcoin) Unlock(password string) error {
+	if password != "correct horse battery staple" {
+		return os.ErrPermission
+	}
+	f.unlocked = true
+	return nil
+}
+func (f *fakeBitcoin) Lock() { f.unlocked = false }
+func (f *fakeBitcoin) ReceiveAddress() (string, error) {
+	if !f.unlocked {
+		return "", os.ErrPermission
+	}
+	return "bc1qtest", nil
+}
 
 func TestSetupLockUnlockAndReceiveAddress(t *testing.T) {
 	var mu sync.Mutex
@@ -77,6 +114,8 @@ func TestSetupLockUnlockAndReceiveAddress(t *testing.T) {
 	service.factory = func(path string) (qdayProcess, error) {
 		return &fakeWalletd{dataDir: path, server: server}, nil
 	}
+	bitcoin := &fakeBitcoin{}
+	service.bitcoinFactory = func(string) (bitcoinProcess, error) { return bitcoin, nil }
 	result, err := service.Setup(ctx, "correct horse battery staple", "")
 	if err != nil {
 		t.Fatal(err)
@@ -87,6 +126,9 @@ func TestSetupLockUnlockAndReceiveAddress(t *testing.T) {
 	if result.State.QDAY == nil || result.State.QDAY.Height != 123 || result.State.Balance == nil || result.State.Balance.Spendable.QDAY != "5" {
 		t.Fatalf("setup state does not include QDAY status: %#v", result.State)
 	}
+	if result.State.Bitcoin == nil || result.State.Bitcoin.HeaderHeight != 900_000 || result.State.BitcoinBalance == nil || result.State.BitcoinBalance.Confirmed.BTC != "1.25" {
+		t.Fatalf("setup state does not include Bitcoin status: %#v", result.State)
+	}
 	phrase, err := service.RecoveryPhrase()
 	if err != nil || phrase != result.Phrase {
 		t.Fatalf("recovery phrase=%q err=%v", phrase, err)
@@ -94,6 +136,10 @@ func TestSetupLockUnlockAndReceiveAddress(t *testing.T) {
 	address, err := service.QDAYReceiveAddress(ctx)
 	if err != nil || address.Address != "qday1ptest" {
 		t.Fatalf("address=%#v err=%v", address, err)
+	}
+	bitcoinAddress, err := service.BitcoinReceiveAddress()
+	if err != nil || bitcoinAddress != "bc1qtest" {
+		t.Fatalf("Bitcoin address=%q err=%v", bitcoinAddress, err)
 	}
 	if err := service.Lock(ctx); err != nil {
 		t.Fatal(err)
