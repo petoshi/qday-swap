@@ -142,6 +142,23 @@ main { width: min(100%, 1540px); min-height: calc(100vh - 210px); margin: 0 auto
 .button:hover { background: #071108; }
 
 .protocol-breadcrumbs { margin: 0; padding: 8px 0 24px; }
+.protocol-page { position: relative; isolation: isolate; }
+.protocol-page::after {
+  position: absolute;
+  z-index: 3;
+  top: 0;
+  left: 50%;
+  width: min(100vw, 1688px);
+  aspect-ratio: 1688 / 932;
+  transform: translateX(-50%);
+  background-image: url("/assets/protocol-slogan.webp?v=1"), url("/assets/protocol-art.webp?v=2");
+  background-repeat: no-repeat;
+  background-position: 43% 82%, top center;
+  background-size: 21% auto, 100% auto;
+  content: "";
+  pointer-events: none;
+}
+.protocol-page > * { position: relative; z-index: 1; }
 .protocol-download { display: grid; grid-template-columns: minmax(300px, .72fr) minmax(620px, 1.28fr); gap: 34px; padding: 30px 0 38px; border-bottom: 1px solid var(--line-bright); }
 .download-intro { align-self: center; }
 .download-intro h1 { max-width: 570px; margin: 0; color: var(--text); font-size: clamp(32px, 4vw, 58px); line-height: .95; letter-spacing: -.055em; }
@@ -177,6 +194,7 @@ main { width: min(100%, 1540px); min-height: calc(100vh - 210px); margin: 0 auto
 .quickstart-grid b { color: var(--green-dim); font-size: 17px; }
 .quickstart-grid h3 { margin: 18px 0 8px; color: #dce2dd; font-size: 12px; }
 .quickstart-grid p { margin: 0; color: var(--muted); font-size: 10px; }
+.protocol-art-space { min-height: clamp(190px, 18vw, 300px); }
 .protocol-header { padding-top: 42px; }
 .protocol-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; margin-top: 22px; border: 1px solid var(--line); background: var(--line); }
 .protocol-step { min-height: 230px; padding: 23px; background: var(--panel); }
@@ -234,6 +252,16 @@ footer { display: flex; min-height: 90px; align-items: center; gap: 20px; paddin
   .download-card { min-height: 120px; }
   .quickstart-grid { grid-template-columns: 1fr; }
   .quickstart-grid article { min-height: 0; }
+  .protocol-page::after { display: none; }
+  .protocol-art-space {
+    min-height: 390px;
+    margin-right: -16px;
+    margin-left: -16px;
+    background-image: url("/assets/protocol-slogan.webp?v=1"), url("/assets/protocol-art.webp?v=2");
+    background-repeat: no-repeat;
+    background-position: 17% 88%, 67% bottom;
+    background-size: 43% auto, auto 390px;
+  }
   .protocol-grid { grid-template-columns: 1fr; }
   footer { align-items: flex-start; flex-direction: column; padding-right: 16px; padding-left: 16px; }
   .footer-links { flex-wrap: wrap; margin-left: 0; }

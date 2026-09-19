@@ -151,14 +151,22 @@ func TestWebRoutesAndSecurityHeaders(t *testing.T) {
 			t.Fatalf("route %s missing security headers", route)
 		}
 	}
-	for _, asset := range []string{"/app.js?v=5", "/styles.css?v=5"} {
-		response, err := server.Client().Get(server.URL + asset)
+	for _, asset := range []struct {
+		path         string
+		cacheControl string
+	}{
+		{"/app.js?v=7", "no-cache"},
+		{"/styles.css?v=7", "no-cache"},
+		{"/assets/protocol-art.webp", "public, max-age=86400"},
+		{"/assets/protocol-slogan.webp", "public, max-age=86400"},
+	} {
+		response, err := server.Client().Get(server.URL + asset.path)
 		if err != nil {
 			t.Fatal(err)
 		}
 		response.Body.Close()
-		if response.StatusCode != http.StatusOK || response.Header.Get("Cache-Control") != "no-cache" {
-			t.Fatalf("asset %s status=%d cache-control=%q", asset, response.StatusCode, response.Header.Get("Cache-Control"))
+		if response.StatusCode != http.StatusOK || response.Header.Get("Cache-Control") != asset.cacheControl {
+			t.Fatalf("asset %s status=%d cache-control=%q", asset.path, response.StatusCode, response.Header.Get("Cache-Control"))
 		}
 	}
 	response, err := server.Client().Get(server.URL + "/api/nope")

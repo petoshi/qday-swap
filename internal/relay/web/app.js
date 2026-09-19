@@ -406,7 +406,7 @@ async function renderOrder(token, id) {
 }
 
 function renderProtocol() {
-  root.innerHTML = `<section class="protocol-download protocol-download-home">
+  root.innerHTML = `<div class="protocol-page"><section class="protocol-download protocol-download-home">
       <div class="download-intro"><span class="command">$ install qday-swap</span><h1>DOWNLOAD QDAY SWAP. FUCK KYC</h1><p>This explorer shows the public order book. The swap itself runs in the QDAY Swap application on your computer. Download the app, create your local wallet, save your seed phrase, and deposit funds to trade. Then create an offer or accept one from this order book.</p></div>
       <div class="download-grid">
         <a class="download-card" href="https://github.com/petoshi/qday-swap/releases/download/v1.0.0/QDAY-Swap-windows-amd64.zip">
@@ -436,13 +436,14 @@ function renderProtocol() {
         <article><b>04</b><h3>CREATE OR TAKE.</h3><p>Create a signed offer in the app, or open an offer from this website. Review the exact amounts and expiry locally before approving the swap.</p></article>
       </div>
     </section>
+    <div class="protocol-art-space" aria-hidden="true"></div>
     <section class="page-header protocol-header"><h1>HYBRID POST QUANTUM ATOMIC SWAPS.</h1><p>QDAY and Bitcoin use different signature systems and share one SHA 256 hashlock.</p></section>
     <section class="protocol-grid">
       <article class="protocol-step"><b>01</b><h2>SIGN AN OFFER.</h2><p>The local application signs exact QDAY and Bitcoin atomic amounts, direction, expiry and network. The relay cannot edit a byte without breaking the signature.</p></article>
       <article class="protocol-step"><b>02</b><h2>LOCK ON BOTH CHAINS.</h2><p>Two local applications agree on the immutable terms and create independent hashlocked contracts. Private keys never reach this server.</p></article>
       <article class="protocol-step"><b>03</b><h2>CLAIM OR REFUND.</h2><p>A claim reveals one shared secret and completes the other side. If either peer disappears, both users retain a unilateral timed refund path.</p></article>
     </section>
-    <div class="protocol-note"><strong>Hybrid means both sides are described honestly.</strong> QDAY spends require Ed25519 and SLH DSA. Bitcoin still uses secp256k1. The atomic protocol joins them without pretending Bitcoin is post quantum.</div>`;
+    <div class="protocol-note"><strong>Hybrid means both sides are described honestly.</strong> QDAY spends require Ed25519 and SLH DSA. Bitcoin still uses secp256k1. The atomic protocol joins them without pretending Bitcoin is post quantum.</div></div>`;
 }
 
 function markNavigation(route) {
