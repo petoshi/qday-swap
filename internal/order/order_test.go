@@ -14,7 +14,8 @@ func signedTestOrder(t *testing.T, now time.Time) (Signed, ed25519.PrivateKey) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	payload, err := NewPayload("mainnet", QDAYLegacyUnit, Amount{Asset: "QDAY", Atomic: "2500000000000000000000000"}, Amount{Asset: "BTC", Atomic: "150000"}, time.Hour, publicKey, now)
+	messageKey := [32]byte{1}
+	payload, err := NewPayload("mainnet", QDAYLegacyUnit, Amount{Asset: "QDAY", Atomic: "2500000000000000000000000"}, Amount{Asset: "BTC", Atomic: "150000"}, time.Hour, publicKey, messageKey, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,6 +42,7 @@ func TestSignedOrderRoundTripAndTampering(t *testing.T) {
 		{"expiry", func(order *Signed) { order.Order.ExpiresAt++ }},
 		{"id", func(order *Signed) { order.ID = strings.Repeat("0", 64) }},
 		{"signature", func(order *Signed) { order.Signature = strings.Repeat("0", 128) }},
+		{"message key", func(order *Signed) { order.Order.MakerMessageKey = strings.Repeat("1", 64) }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

@@ -23,7 +23,8 @@ func testSigner(t *testing.T) (ed25519.PublicKey, ed25519.PrivateKey) {
 
 func testSignedOrder(t *testing.T, publicKey ed25519.PublicKey, privateKey ed25519.PrivateKey, now time.Time, index int) order.Signed {
 	t.Helper()
-	payload, err := order.NewPayload("mainnet", order.QDAYLegacyUnit, order.Amount{Asset: "QDAY", Atomic: fmt.Sprintf("%d000000000000000000000000", index+1)}, order.Amount{Asset: "BTC", Atomic: fmt.Sprintf("%d000", index+1)}, time.Hour, publicKey, now.Add(time.Duration(index)*time.Second))
+	messageKey := [32]byte{byte(index + 1)}
+	payload, err := order.NewPayload("mainnet", order.QDAYLegacyUnit, order.Amount{Asset: "QDAY", Atomic: fmt.Sprintf("%d000000000000000000000000", index+1)}, order.Amount{Asset: "BTC", Atomic: fmt.Sprintf("%d000", index+1)}, time.Hour, publicKey, messageKey, now.Add(time.Duration(index)*time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -263,7 +263,7 @@ function canonicalOrder(order) {
   return concatBytes([
     new TextEncoder().encode('QDAY_SWAP_ORDER_V1'), u16(order.version),
     textField(order.network), textField(order.market), textField(order.qdayUnitAtomic),
-    textField(order.makerPublicKey), textField(order.give.asset), textField(order.give.atomic),
+    textField(order.makerPublicKey), textField(order.makerMessageKey), textField(order.give.asset), textField(order.give.atomic),
     textField(order.receive.asset), textField(order.receive.atomic), i64(order.createdAt),
     i64(order.expiresAt), textField(order.nonce)
   ]);

@@ -90,7 +90,8 @@ terms. The relay cannot change an amount, address, key, hash or timeout.
 - stores signed, short-lived offers and signed cancellations
 - exposes a small versioned API to installed applications
 - serves a public read-only order explorer at `dex.pqday.com`
-- relays negotiation messages between local applications in the next phase
+- relays signed acceptance, atomic maker selection and end-to-end encrypted
+  negotiation messages between local applications
 - stores no wallet seed or signing key
 - cannot alter, spend, redirect or complete a swap
 - may delay, hide or delete messages, so clients always retain unilateral refund
@@ -126,11 +127,13 @@ several relays and installed applications.
 3. Implement the persistent two-party state machine and encrypted key store.
 4. Run QDAY/BTC and QDAY/LTC regtest scenarios through that state machine,
    including restarts, stalled peers and reorganizations.
-5. Add the single public signed-order relay and web order explorer.
-6. Add relayed acceptance, the local UI and one-click automatic recovery.
-7. Complete two small QDAY/BTC mainnet swaps between independent machines.
-8. Add peer-to-peer order discovery when real usage justifies it.
-9. Add EVM and XRP adapters, then DOGE, LTC and BCH markets.
+5. Add the single public signed-order relay and web order explorer. Complete.
+6. Add signed acceptance and the encrypted durable relay mailbox. Complete.
+7. Connect the local UI to the persistent swap state machine and one-click
+   automatic recovery.
+8. Complete two small QDAY/BTC mainnet swaps between independent machines.
+9. Add peer-to-peer order discovery when real usage justifies it.
+10. Add EVM and XRP adapters, then DOGE, LTC and BCH markets.
 
 No public release is ready until a fresh install can complete and refund a
 trade without a command line, a foreign full-chain download or a manual API

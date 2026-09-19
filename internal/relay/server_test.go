@@ -2,6 +2,7 @@ package relay
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/petoshi/qday-swap/internal/order"
+	"github.com/petoshi/qday-swap/internal/trade"
 )
 
 func testHTTPServer(t *testing.T, now time.Time) (*httptest.Server, *Store) {
@@ -101,7 +103,8 @@ func TestOrderAPIRejectsWrongNetworkAndTampering(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 	server, _ := testHTTPServer(t, now)
 	publicKey, privateKey := testSigner(t)
-	payload, err := order.NewPayload("testnet", order.QDAYLegacyUnit, order.Amount{Asset: "QDAY", Atomic: order.QDAYLegacyUnit}, order.Amount{Asset: "BTC", Atomic: "1000"}, time.Hour, publicKey, now)
+	messageKey := [32]byte{1}
+	payload, err := order.NewPayload("testnet", order.QDAYLegacyUnit, order.Amount{Asset: "QDAY", Atomic: order.QDAYLegacyUnit}, order.Amount{Asset: "BTC", Atomic: "1000"}, time.Hour, publicKey, messageKey, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,5 +158,62 @@ func TestWebRoutesAndSecurityHeaders(t *testing.T) {
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusNotFound || !strings.HasPrefix(response.Header.Get("Content-Type"), "application/json") {
 		t.Fatalf("unknown API status=%d content-type=%q", response.StatusCode, response.Header.Get("Content-Type"))
+	}
+}
+
+func TestNegotiationAndEncryptedMailboxAPI(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	server, _ := testHTTPServer(t, now)
+	fixture := newRelayTradeFixture(t, now)
+
+	response, _ := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/v1/orders", fixture.order)
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("publish status=%d", response.StatusCode)
+	}
+	response, decoded := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/v1/orders/"+fixture.order.ID+"/accept", fixture.acceptance)
+	if response.StatusCode != http.StatusCreated || decoded["signed"].(map[string]any)["id"] != fixture.acceptance.ID {
+		t.Fatalf("accept status=%d body=%#v", response.StatusCode, decoded)
+	}
+
+	makerPoll, err := trade.NewPoll("mainnet", 0, 20, fixture.makerPrivate, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, decoded = requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/v1/mailbox/poll", makerPoll)
+	items := decoded["items"].([]any)
+	if response.StatusCode != http.StatusOK || len(items) != 1 || items[0].(map[string]any)["kind"] != string(MailboxAcceptance) {
+		t.Fatalf("maker poll status=%d body=%#v", response.StatusCode, decoded)
+	}
+
+	response, decoded = requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/v1/orders/"+fixture.order.ID+"/match", fixture.match)
+	if response.StatusCode != http.StatusOK || decoded["status"] != string(StatusMatched) {
+		t.Fatalf("match status=%d body=%#v", response.StatusCode, decoded)
+	}
+	message, err := trade.EncryptMessage("mainnet", fixture.order.ID, fixture.acceptance.Acceptance.TradeID, 1,
+		fixture.makerPrivate, fixture.takerPrivate.Public().(ed25519.PublicKey), fixture.makerMessagePrivate,
+		fixture.takerMessagePublic, []byte("signed contract proposal"), time.Hour, now.Add(2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, decoded = requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/v1/messages", message)
+	if response.StatusCode != http.StatusCreated || decoded["id"] != message.ID {
+		t.Fatalf("message status=%d body=%#v", response.StatusCode, decoded)
+	}
+
+	takerPoll, err := trade.NewPoll("mainnet", 0, 20, fixture.takerPrivate, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, decoded = requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/v1/mailbox/poll", takerPoll)
+	items = decoded["items"].([]any)
+	if response.StatusCode != http.StatusOK || len(items) != 2 || items[0].(map[string]any)["kind"] != string(MailboxMatch) || items[1].(map[string]any)["kind"] != string(MailboxMessage) {
+		t.Fatalf("taker poll status=%d body=%#v", response.StatusCode, decoded)
+	}
+
+	tamperedPoll := takerPoll
+	tamperedPoll.Poll.After = 10
+	response, decoded = requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/v1/mailbox/poll", tamperedPoll)
+	if response.StatusCode != http.StatusBadRequest || !strings.Contains(decoded["error"].(string), "signature") {
+		t.Fatalf("tampered poll status=%d body=%#v", response.StatusCode, decoded)
 	}
 }

@@ -9,16 +9,25 @@ import (
 	"time"
 
 	"github.com/petoshi/qday-swap/internal/order"
+	"github.com/petoshi/qday-swap/internal/trade"
 	"go.etcd.io/bbolt"
 )
 
 const MaxOpenOrdersPerMaker = 100
 
 var (
-	ordersBucket  = []byte("orders")
-	ErrNotFound   = errors.New("order not found")
-	ErrNotOpen    = errors.New("order is not open")
-	ErrMakerLimit = errors.New("maker has too many open orders")
+	ordersBucket          = []byte("orders")
+	acceptancesBucket     = []byte("acceptances")
+	messagesBucket        = []byte("messages")
+	messageSequenceBucket = []byte("message-sequences")
+	messageHeadBucket     = []byte("message-heads")
+	mailboxesBucket       = []byte("mailboxes")
+	ErrNotFound           = errors.New("order not found")
+	ErrNotOpen            = errors.New("order is not open")
+	ErrMakerLimit         = errors.New("maker has too many open orders")
+	ErrAcceptanceLimit    = errors.New("order has too many pending acceptances")
+	ErrAlreadyAccepted    = errors.New("taker already accepted this order")
+	ErrMessageSequence    = errors.New("message sequence is not the next expected value")
 )
 
 type Status string
@@ -27,6 +36,7 @@ const (
 	StatusOpen      Status = "open"
 	StatusCancelled Status = "cancelled"
 	StatusExpired   Status = "expired"
+	StatusMatched   Status = "matched"
 )
 
 type Record struct {
@@ -35,6 +45,9 @@ type Record struct {
 	ReceivedAt   int64                     `json:"receivedAt"`
 	CancelledAt  int64                     `json:"cancelledAt,omitempty"`
 	Cancellation *order.SignedCancellation `json:"cancellation,omitempty"`
+	MatchedAt    int64                     `json:"matchedAt,omitempty"`
+	Acceptance   *trade.SignedAcceptance   `json:"acceptance,omitempty"`
+	Match        *trade.SignedMatch        `json:"match,omitempty"`
 }
 
 func (record Record) EffectiveStatus(now time.Time) Status {
@@ -69,6 +82,7 @@ type Stats struct {
 	Open       int `json:"open"`
 	Cancelled  int `json:"cancelled"`
 	Expired    int `json:"expired"`
+	Matched    int `json:"matched"`
 	Total      int `json:"total"`
 	Created24h int `json:"created24h"`
 }
@@ -81,8 +95,12 @@ func OpenStore(path string) (*Store, error) {
 		return nil, fmt.Errorf("open relay store: %w", err)
 	}
 	if err := db.Update(func(tx *bbolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists(ordersBucket)
-		return err
+		for _, name := range [][]byte{ordersBucket, acceptancesBucket, messagesBucket, messageSequenceBucket, messageHeadBucket, mailboxesBucket} {
+			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
+				return err
+			}
+		}
+		return nil
 	}); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("initialize relay store: %w", err)
@@ -263,6 +281,8 @@ func (s *Store) Stats(now time.Time) (Stats, error) {
 				stats.Cancelled++
 			case StatusExpired:
 				stats.Expired++
+			case StatusMatched:
+				stats.Matched++
 			}
 			return nil
 		})

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/petoshi/qday-swap/internal/order"
+	"github.com/petoshi/qday-swap/internal/trade"
 )
 
 const maxRequestBody = 64 << 10
@@ -85,6 +86,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/orders", s.handlePublish)
 	mux.HandleFunc("GET /api/v1/orders/{id}", s.handleOrder)
 	mux.HandleFunc("POST /api/v1/orders/{id}/cancel", s.handleCancel)
+	mux.HandleFunc("POST /api/v1/orders/{id}/accept", s.handleAccept)
+	mux.HandleFunc("POST /api/v1/orders/{id}/match", s.handleMatch)
+	mux.HandleFunc("POST /api/v1/messages", s.handleMessage)
+	mux.HandleFunc("POST /api/v1/mailbox/poll", s.handleMailboxPoll)
 	mux.HandleFunc("/api/", func(response http.ResponseWriter, request *http.Request) {
 		writeError(response, http.StatusNotFound, "API endpoint not found")
 	})
@@ -125,7 +130,7 @@ func (s *Server) handleOrders(response http.ResponseWriter, request *http.Reques
 	if status == "" {
 		status = StatusOpen
 	}
-	if status != StatusOpen && status != StatusCancelled && status != StatusExpired && status != "all" {
+	if status != StatusOpen && status != StatusCancelled && status != StatusExpired && status != StatusMatched && status != "all" {
 		writeError(response, http.StatusBadRequest, "invalid status")
 		return
 	}
@@ -145,6 +150,111 @@ func (s *Server) handleOrders(response http.ResponseWriter, request *http.Reques
 		return
 	}
 	writeJSON(response, http.StatusOK, result)
+}
+
+func (s *Server) handleAccept(response http.ResponseWriter, request *http.Request) {
+	var acceptance trade.SignedAcceptance
+	if err := decodeJSON(response, request, &acceptance); err != nil {
+		writeError(response, http.StatusBadRequest, err.Error())
+		return
+	}
+	if acceptance.Acceptance.OrderID != request.PathValue("id") {
+		writeError(response, http.StatusBadRequest, "path order ID does not match acceptance")
+		return
+	}
+	if acceptance.Acceptance.Network != s.network {
+		writeError(response, http.StatusBadRequest, fmt.Sprintf("relay accepts only %s trades", s.network))
+		return
+	}
+	record, created, err := s.store.SubmitAcceptance(request.PathValue("id"), acceptance, s.now())
+	switch {
+	case errors.Is(err, ErrNotFound):
+		writeError(response, http.StatusNotFound, ErrNotFound.Error())
+	case errors.Is(err, ErrNotOpen), errors.Is(err, ErrAlreadyAccepted):
+		writeError(response, http.StatusConflict, err.Error())
+	case errors.Is(err, ErrAcceptanceLimit):
+		writeError(response, http.StatusTooManyRequests, err.Error())
+	case err != nil:
+		writeError(response, http.StatusBadRequest, err.Error())
+	default:
+		status := http.StatusOK
+		if created {
+			status = http.StatusCreated
+		}
+		writeJSON(response, status, record)
+	}
+}
+
+func (s *Server) handleMatch(response http.ResponseWriter, request *http.Request) {
+	var match trade.SignedMatch
+	if err := decodeJSON(response, request, &match); err != nil {
+		writeError(response, http.StatusBadRequest, err.Error())
+		return
+	}
+	if match.Match.OrderID != request.PathValue("id") {
+		writeError(response, http.StatusBadRequest, "path order ID does not match selection")
+		return
+	}
+	if match.Match.Network != s.network {
+		writeError(response, http.StatusBadRequest, fmt.Sprintf("relay accepts only %s trades", s.network))
+		return
+	}
+	record, _, err := s.store.ConfirmMatch(request.PathValue("id"), match, s.now())
+	switch {
+	case errors.Is(err, ErrNotFound):
+		writeError(response, http.StatusNotFound, ErrNotFound.Error())
+	case errors.Is(err, ErrNotOpen):
+		writeError(response, http.StatusConflict, ErrNotOpen.Error())
+	case err != nil:
+		writeError(response, http.StatusBadRequest, err.Error())
+	default:
+		writeJSON(response, http.StatusOK, record)
+	}
+}
+
+func (s *Server) handleMessage(response http.ResponseWriter, request *http.Request) {
+	var message trade.SignedMessage
+	if err := decodeJSON(response, request, &message); err != nil {
+		writeError(response, http.StatusBadRequest, err.Error())
+		return
+	}
+	if message.Message.Network != s.network {
+		writeError(response, http.StatusBadRequest, fmt.Sprintf("relay accepts only %s messages", s.network))
+		return
+	}
+	stored, created, err := s.store.PublishMessage(message, s.now())
+	switch {
+	case errors.Is(err, ErrNotFound):
+		writeError(response, http.StatusNotFound, ErrNotFound.Error())
+	case errors.Is(err, ErrMessageSequence):
+		writeError(response, http.StatusConflict, ErrMessageSequence.Error())
+	case err != nil:
+		writeError(response, http.StatusBadRequest, err.Error())
+	default:
+		status := http.StatusOK
+		if created {
+			status = http.StatusCreated
+		}
+		writeJSON(response, status, stored)
+	}
+}
+
+func (s *Server) handleMailboxPoll(response http.ResponseWriter, request *http.Request) {
+	var poll trade.SignedPoll
+	if err := decodeJSON(response, request, &poll); err != nil {
+		writeError(response, http.StatusBadRequest, err.Error())
+		return
+	}
+	if poll.Poll.Network != s.network {
+		writeError(response, http.StatusBadRequest, fmt.Sprintf("relay serves only %s mailboxes", s.network))
+		return
+	}
+	page, err := s.store.PollMailbox(poll, s.now())
+	if err != nil {
+		writeError(response, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(response, http.StatusOK, page)
 }
 
 func (s *Server) handleOrder(response http.ResponseWriter, request *http.Request) {

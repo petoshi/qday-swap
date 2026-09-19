@@ -155,3 +155,25 @@ func TestOrderIdentityIsRecoverableAndSeparated(t *testing.T) {
 		t.Fatal("order identity overlaps a chain key or has an invalid public key")
 	}
 }
+
+func TestMessageIdentityIsRecoverableAndSeparated(t *testing.T) {
+	root := Root{4, 3, 2, 1}
+	privateKey, publicKey, err := root.MessageIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	repeatedPrivate, repeatedPublic, err := root.MessageIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if privateKey != repeatedPrivate || publicKey != repeatedPublic {
+		t.Fatal("message identity is not recoverable")
+	}
+	orderKey, err := root.OrderIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(privateKey[:], orderKey.Seed()) || privateKey == publicKey {
+		t.Fatal("message identity overlaps the order identity or its public key")
+	}
+}

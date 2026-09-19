@@ -18,9 +18,12 @@ Planned adapter order:
 The product has one local interface, one recovery phrase, signed public offers,
 exact integer accounting and automatic claim or refund. The first public order
 book runs at `dex.pqday.com`. It stores signed offers and cancellations and has
-a read-only web explorer. It never receives a wallet seed, signing key or spend
-authority. A peer-to-peer discovery mesh can replace this first relay when the
-market is large enough without changing the signed order format.
+a read-only web explorer. Signed acceptances and matches choose exactly one
+taker, then an end-to-end encrypted mailbox carries the trade protocol between
+the two installed applications. The relay never receives a wallet seed,
+signing key, plaintext contract message or spend authority. A peer-to-peer
+discovery mesh can replace this first relay when the market is large enough
+without changing the signed records.
 
 QDAY uses its native SHA-256 hashlock policy with Ed25519 and SLH-DSA. Each
 external adapter locks its asset against the same 32-byte secret using that

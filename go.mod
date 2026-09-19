@@ -11,6 +11,7 @@ require (
 	github.com/btcsuite/btcd/wire/v2 v2.0.0
 	github.com/tyler-smith/go-bip39 v1.1.0
 	go.etcd.io/bbolt v1.5.0
+	golang.org/x/crypto v0.40.0
 )
 
 require (
@@ -21,6 +22,5 @@ require (
 	github.com/decred/dcrd/crypto/blake256 v1.1.0 // indirect
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.0 // indirect
 	github.com/kcalvinalvin/anet v0.0.0-20251112173137-d8ddc1f6dbee // indirect
-	golang.org/x/crypto v0.40.0 // indirect
 	golang.org/x/sys v0.45.0 // indirect
 )

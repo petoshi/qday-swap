@@ -23,6 +23,7 @@ const (
 	maximumLifetime     = 30 * 24 * time.Hour
 	maximumClockSkew    = 5 * time.Minute
 	maximumAtomicDigits = 64
+	messageKeySize      = 32
 )
 
 var (
@@ -36,16 +37,17 @@ type Amount struct {
 }
 
 type Payload struct {
-	Version        uint16 `json:"version"`
-	Network        string `json:"network"`
-	Market         string `json:"market"`
-	QDAYUnitAtomic string `json:"qdayUnitAtomic"`
-	MakerPublicKey string `json:"makerPublicKey"`
-	Give           Amount `json:"give"`
-	Receive        Amount `json:"receive"`
-	CreatedAt      int64  `json:"createdAt"`
-	ExpiresAt      int64  `json:"expiresAt"`
-	Nonce          string `json:"nonce"`
+	Version         uint16 `json:"version"`
+	Network         string `json:"network"`
+	Market          string `json:"market"`
+	QDAYUnitAtomic  string `json:"qdayUnitAtomic"`
+	MakerPublicKey  string `json:"makerPublicKey"`
+	MakerMessageKey string `json:"makerMessageKey"`
+	Give            Amount `json:"give"`
+	Receive         Amount `json:"receive"`
+	CreatedAt       int64  `json:"createdAt"`
+	ExpiresAt       int64  `json:"expiresAt"`
+	Nonce           string `json:"nonce"`
 }
 
 type Signed struct {
@@ -66,7 +68,7 @@ type SignedCancellation struct {
 	Signature    string              `json:"signature"`
 }
 
-func NewPayload(network, qdayUnitAtomic string, give, receive Amount, lifetime time.Duration, publicKey ed25519.PublicKey, now time.Time) (Payload, error) {
+func NewPayload(network, qdayUnitAtomic string, give, receive Amount, lifetime time.Duration, publicKey ed25519.PublicKey, messageKey [messageKeySize]byte, now time.Time) (Payload, error) {
 	if lifetime < minimumLifetime || lifetime > maximumLifetime {
 		return Payload{}, fmt.Errorf("order lifetime must be between %s and %s", minimumLifetime, maximumLifetime)
 	}
@@ -75,16 +77,17 @@ func NewPayload(network, qdayUnitAtomic string, give, receive Amount, lifetime t
 		return Payload{}, fmt.Errorf("generate nonce: %w", err)
 	}
 	payload := Payload{
-		Version:        ProtocolVersion,
-		Network:        network,
-		Market:         MarketQDAYBTC,
-		QDAYUnitAtomic: qdayUnitAtomic,
-		MakerPublicKey: hex.EncodeToString(publicKey),
-		Give:           give,
-		Receive:        receive,
-		CreatedAt:      now.Unix(),
-		ExpiresAt:      now.Add(lifetime).Unix(),
-		Nonce:          hex.EncodeToString(nonce),
+		Version:         ProtocolVersion,
+		Network:         network,
+		Market:          MarketQDAYBTC,
+		QDAYUnitAtomic:  qdayUnitAtomic,
+		MakerPublicKey:  hex.EncodeToString(publicKey),
+		MakerMessageKey: hex.EncodeToString(messageKey[:]),
+		Give:            give,
+		Receive:         receive,
+		CreatedAt:       now.Unix(),
+		ExpiresAt:       now.Add(lifetime).Unix(),
+		Nonce:           hex.EncodeToString(nonce),
 	}
 	if err := payload.Validate(now); err != nil {
 		return Payload{}, err
@@ -111,6 +114,9 @@ func (p Payload) Validate(now time.Time) error {
 		return err
 	}
 	if _, err := parsePublicKey(p.MakerPublicKey); err != nil {
+		return err
+	}
+	if _, err := parseMessageKey(p.MakerMessageKey); err != nil {
 		return err
 	}
 	nonce, err := hex.DecodeString(p.Nonce)
@@ -170,6 +176,7 @@ func (p Payload) signingBytes() []byte {
 	encoder.text(p.Market)
 	encoder.text(p.QDAYUnitAtomic)
 	encoder.text(p.MakerPublicKey)
+	encoder.text(p.MakerMessageKey)
 	encoder.text(p.Give.Asset)
 	encoder.text(p.Give.Atomic)
 	encoder.text(p.Receive.Asset)
@@ -283,6 +290,21 @@ func parsePublicKey(encoded string) (ed25519.PublicKey, error) {
 		return nil, errors.New("maker public key must be 32 lowercase hexadecimal bytes")
 	}
 	return ed25519.PublicKey(decoded), nil
+}
+
+func parseMessageKey(encoded string) ([]byte, error) {
+	decoded, err := hex.DecodeString(encoded)
+	if err != nil || len(decoded) != messageKeySize || encoded != strings.ToLower(encoded) {
+		return nil, errors.New("maker message key must be 32 lowercase hexadecimal bytes")
+	}
+	allZero := true
+	for _, value := range decoded {
+		allZero = allZero && value == 0
+	}
+	if allZero {
+		return nil, errors.New("maker message key must not be zero")
+	}
+	return decoded, nil
 }
 
 func parseSignature(encoded string) ([]byte, error) {

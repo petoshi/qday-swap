@@ -17,6 +17,7 @@ import (
 	"github.com/btcsuite/btcd/btcutil/hdkeychain"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/tyler-smith/go-bip39"
+	"golang.org/x/crypto/curve25519"
 )
 
 const hardened = hdkeychain.HardenedKeyStart
@@ -171,4 +172,22 @@ func (r Root) OrderIdentity() (ed25519.PrivateKey, error) {
 	privateKey := ed25519.NewKeyFromSeed(seed[:])
 	clear(seed[:])
 	return privateKey, nil
+}
+
+// MessageIdentity derives the static X25519 key used to encrypt relay
+// messages. It is separate from the Ed25519 order identity and from every
+// on-chain key. The private key never leaves the local application.
+func (r Root) MessageIdentity() (privateKey, publicKey [32]byte, err error) {
+	privateKey, err = r.DomainSeed("relay-message-x25519-v1", nil)
+	if err != nil {
+		return privateKey, publicKey, err
+	}
+	encoded, err := curve25519.X25519(privateKey[:], curve25519.Basepoint)
+	if err != nil {
+		clear(privateKey[:])
+		return privateKey, publicKey, fmt.Errorf("derive relay message public key: %w", err)
+	}
+	copy(publicKey[:], encoded)
+	clear(encoded)
+	return privateKey, publicKey, nil
 }

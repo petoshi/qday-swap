@@ -12,6 +12,7 @@ An order binds all economic terms needed to identify an offer:
 - protocol version and network;
 - canonical `QDAY-BTC` market;
 - maker Ed25519 public key;
+- maker X25519 message key;
 - exact give and receive amounts as unsigned atomic integers;
 - the QDAY consensus unit used to interpret its atomic amount;
 - creation and expiration Unix timestamps;
@@ -37,6 +38,10 @@ GET  /api/v1/orders?status=open&page=1&limit=20
 GET  /api/v1/orders/{orderID}
 POST /api/v1/orders
 POST /api/v1/orders/{orderID}/cancel
+POST /api/v1/orders/{orderID}/accept
+POST /api/v1/orders/{orderID}/match
+POST /api/v1/messages
+POST /api/v1/mailbox/poll
 ```
 
 `POST /api/v1/orders` accepts the signed record:
@@ -49,6 +54,7 @@ POST /api/v1/orders/{orderID}/cancel
     "market": "QDAY-BTC",
     "qdayUnitAtomic": "1000000000000000000000000",
     "makerPublicKey": "...",
+    "makerMessageKey": "...",
     "give": {"asset": "QDAY", "atomic": "2500000000000000000000000"},
     "receive": {"asset": "BTC", "atomic": "150000"},
     "createdAt": 1800000000,
@@ -70,6 +76,33 @@ identity. HTTP request bodies are capped at 64 KiB. Public deployment also
 applies connection and write limits at the reverse proxy while keeping read-only
 order pages available.
 
+## Trade negotiation
+
+A taker selects an order by signing an acceptance containing a random 32-byte
+trade ID, its Ed25519 identity and its X25519 message key. The acceptance lasts
+at most 15 minutes and cannot outlive the order. It does not close the public
+offer by itself. The maker chooses one valid acceptance and signs a match that
+binds the order ID, acceptance ID, trade ID and both identities. The store
+changes the order from `open` to `matched` atomically, so two concurrent takers
+cannot both acquire the same offer.
+
+Acceptances appear only in the maker's authenticated mailbox. The chosen match
+appears in the taker's mailbox. A mailbox poll contains a fresh timestamp,
+random nonce and cursor and is signed by the recipient identity. The relay
+cannot read another identity's mailbox by inventing a request.
+
+After a match, either peer may submit strictly ordered encrypted messages. Each
+message binds the network, order, trade, sender, recipient, sequence, creation
+time and expiry. The body is encrypted end to end with X25519 and NaCl box and
+the complete envelope is signed with Ed25519. The relay can verify the sender
+and route the ciphertext, but cannot read or replace contract data. Duplicate
+submissions are idempotent. Reusing or skipping a sequence number is rejected.
+
+Mailbox cursors and messages live in the same bbolt transaction as the signed
+record. A successful API response therefore survives an immediate relay
+restart. Clients persist the last processed cursor locally and may safely poll
+again after a crash.
+
 ## Browser explorer
 
 The embedded website lists open offers, complete relay history and individual
@@ -78,11 +111,10 @@ the SHA-256 ID and verifies the Ed25519 signature again with browser WebCrypto.
 The `Open in QDAY Swap` action passes only the public order ID to the installed
 application.
 
-## Remaining relay work
+## Remaining application work
 
-The next protocol layer adds signed acceptance and a durable message mailbox so
-two installed applications behind NAT can negotiate one trade through this
-server. Every message will bind its order ID, trade ID, sender, recipient and
-sequence number. Contract construction, signing, chain observation, claim and
-refund stay local. The later discovery mesh will transport the same signed
-orders and messages.
+Contract construction, chain observation, signing, claim and refund stay in the
+installed application. The next implementation step connects this relay
+protocol to the durable local swap state machine and browser UI. The later
+discovery mesh can transport these same signed orders, acceptances and encrypted
+messages without changing their canonical format.
