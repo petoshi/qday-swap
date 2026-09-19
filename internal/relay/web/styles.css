@@ -162,6 +162,10 @@ main { width: min(100%, 1540px); min-height: calc(100vh - 210px); margin: 0 auto
 .download-card small { margin-top: 2px; color: var(--muted); font-size: 9px; }
 .download-card b { align-self: start; color: var(--green-dim); font-size: 9px; font-weight: 500; }
 .download-card:hover b { color: var(--green); }
+.linux-icon .tux-body { fill: #a9b1aa; }
+.linux-icon .tux-belly, .linux-icon .tux-eye { fill: #e9ede9; }
+.linux-icon .tux-pupil { fill: #111; }
+.linux-icon .tux-beak, .linux-icon .tux-foot { fill: #e3a129; }
 .quickstart { padding: 38px 0; border-bottom: 1px solid var(--line-bright); }
 .quickstart > header { display: grid; grid-template-columns: minmax(300px, .85fr) minmax(420px, 1.15fr); column-gap: 40px; align-items: end; margin-bottom: 24px; }
 .quickstart > header .command { grid-column: 1 / -1; }
