@@ -15,9 +15,12 @@ import (
 	"io/fs"
 	"mime"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/petoshi/qday-swap/internal/app"
+	"github.com/petoshi/qday-swap/internal/relay"
+	"github.com/petoshi/qday-swap/internal/swapstate"
 	"github.com/petoshi/qday-swap/internal/walletd"
 )
 
@@ -37,6 +40,13 @@ type Application interface {
 	RecoveryPhrase() (string, error)
 	QDAYReceiveAddress(context.Context) (walletd.Address, error)
 	BitcoinReceiveAddress() (string, error)
+	Orders(context.Context, string, int) (relay.ResultPage, error)
+	MarketPrice(context.Context) (relay.MarketPrice, error)
+	CreateOffer(context.Context, app.CreateOfferRequest) (relay.Record, error)
+	CancelOffer(context.Context, string) (relay.Record, error)
+	AcceptOffer(context.Context, string) (swapstate.Negotiation, error)
+	MatchAcceptance(context.Context, string) (swapstate.Swap, error)
+	Negotiations() (app.Negotiations, error)
 }
 
 type Server struct {
@@ -204,9 +214,94 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"address": address})
+	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/orders":
+		page := 1
+		if raw := r.URL.Query().Get("page"); raw != "" {
+			var err error
+			page, err = strconv.Atoi(raw)
+			if err != nil || page < 1 {
+				writeError(w, http.StatusBadRequest, "invalid page")
+				return
+			}
+		}
+		orders, err := s.application.Orders(r.Context(), r.URL.Query().Get("giveAsset"), page)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, orders)
+	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/price":
+		price, err := s.application.MarketPrice(r.Context())
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, price)
+	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/orders":
+		var request app.CreateOfferRequest
+		if !decode(w, r, &request) {
+			return
+		}
+		record, err := s.application.CreateOffer(r.Context(), request)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusCreated, record)
+	case r.Method == http.MethodPost && routeID(r.URL.Path, "/api/v1/orders/", "/cancel") != "":
+		var request struct{}
+		if !decode(w, r, &request) {
+			return
+		}
+		record, err := s.application.CancelOffer(r.Context(), routeID(r.URL.Path, "/api/v1/orders/", "/cancel"))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, record)
+	case r.Method == http.MethodPost && routeID(r.URL.Path, "/api/v1/orders/", "/accept") != "":
+		var request struct{}
+		if !decode(w, r, &request) {
+			return
+		}
+		negotiation, err := s.application.AcceptOffer(r.Context(), routeID(r.URL.Path, "/api/v1/orders/", "/accept"))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusCreated, negotiation)
+	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/negotiations":
+		negotiations, err := s.application.Negotiations()
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, negotiations)
+	case r.Method == http.MethodPost && routeID(r.URL.Path, "/api/v1/acceptances/", "/match") != "":
+		var request struct{}
+		if !decode(w, r, &request) {
+			return
+		}
+		swap, err := s.application.MatchAcceptance(r.Context(), routeID(r.URL.Path, "/api/v1/acceptances/", "/match"))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, swap)
 	default:
 		writeError(w, http.StatusNotFound, "API endpoint not found")
 	}
+}
+
+func routeID(path, prefix, suffix string) string {
+	if !strings.HasPrefix(path, prefix) || !strings.HasSuffix(path, suffix) {
+		return ""
+	}
+	id := strings.TrimSuffix(strings.TrimPrefix(path, prefix), suffix)
+	if id == "" || strings.Contains(id, "/") {
+		return ""
+	}
+	return id
 }
 
 func decode(w http.ResponseWriter, r *http.Request, target any) bool {

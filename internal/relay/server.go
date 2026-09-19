@@ -8,11 +8,13 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"math"
 	"mime"
 	"net/http"
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/petoshi/qday-swap/internal/order"
@@ -25,22 +27,31 @@ const maxRequestBody = 64 << 10
 var embeddedWeb embed.FS
 
 type Config struct {
-	Network   string
-	PublicURL string
-	Version   string
-	Logger    *slog.Logger
-	Now       func() time.Time
+	Network    string
+	PublicURL  string
+	Version    string
+	Logger     *slog.Logger
+	Now        func() time.Time
+	PriceURL   string
+	HTTPClient *http.Client
+	PriceTTL   time.Duration
 }
 
 type Server struct {
-	store     *Store
-	network   string
-	publicURL string
-	version   string
-	logger    *slog.Logger
-	now       func() time.Time
-	static    http.Handler
-	index     []byte
+	store      *Store
+	network    string
+	publicURL  string
+	version    string
+	logger     *slog.Logger
+	now        func() time.Time
+	priceURL   string
+	httpClient *http.Client
+	priceTTL   time.Duration
+	priceMu    sync.Mutex
+	price      MarketPrice
+	priceAt    time.Time
+	static     http.Handler
+	index      []byte
 }
 
 func NewServer(store *Store, config Config) (*Server, error) {
@@ -58,6 +69,15 @@ func NewServer(store *Store, config Config) (*Server, error) {
 	if config.Now == nil {
 		config.Now = time.Now
 	}
+	if config.PriceURL == "" {
+		config.PriceURL = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
+	}
+	if config.HTTPClient == nil {
+		config.HTTPClient = &http.Client{Timeout: 5 * time.Second}
+	}
+	if config.PriceTTL <= 0 {
+		config.PriceTTL = 20 * time.Second
+	}
 	root, err := fs.Sub(embeddedWeb, "web")
 	if err != nil {
 		return nil, err
@@ -69,6 +89,7 @@ func NewServer(store *Store, config Config) (*Server, error) {
 	return &Server{
 		store: store, network: config.Network, publicURL: strings.TrimRight(config.PublicURL, "/"),
 		version: config.Version, logger: config.Logger, now: config.Now,
+		priceURL: config.PriceURL, httpClient: config.HTTPClient, priceTTL: config.PriceTTL,
 		static: http.FileServer(http.FS(root)), index: index,
 	}, nil
 }
@@ -82,6 +103,7 @@ func (s *Server) Handler() http.Handler {
 		_, _ = response.Write([]byte("ok\n"))
 	})
 	mux.HandleFunc("GET /api/v1/status", s.handleStatus)
+	mux.HandleFunc("GET /api/v1/price", s.handlePrice)
 	mux.HandleFunc("GET /api/v1/orders", s.handleOrders)
 	mux.HandleFunc("POST /api/v1/orders", s.handlePublish)
 	mux.HandleFunc("GET /api/v1/orders/{id}", s.handleOrder)
@@ -112,6 +134,76 @@ func (s *Server) handleStatus(response http.ResponseWriter, _ *http.Request) {
 		ServerTime string `json:"serverTime"`
 		Stats      Stats  `json:"stats"`
 	}{"QDAY DEX", s.version, s.network, s.publicURL, now.Format(time.RFC3339), stats})
+}
+
+type MarketPrice struct {
+	Pair      string `json:"pair"`
+	USD       string `json:"usd"`
+	Source    string `json:"source"`
+	UpdatedAt string `json:"updatedAt"`
+	Stale     bool   `json:"stale,omitempty"`
+}
+
+func (s *Server) handlePrice(response http.ResponseWriter, request *http.Request) {
+	price, err := s.bitcoinUSD(request)
+	if err != nil {
+		s.logger.Warn("BTC/USD price unavailable", "error", err)
+		writeError(response, http.StatusBadGateway, "BTC/USD price unavailable")
+		return
+	}
+	writeJSON(response, http.StatusOK, price)
+}
+
+func (s *Server) bitcoinUSD(incoming *http.Request) (MarketPrice, error) {
+	s.priceMu.Lock()
+	defer s.priceMu.Unlock()
+
+	now := s.now().UTC()
+	if s.price.USD != "" && now.Sub(s.priceAt) < s.priceTTL {
+		return s.price, nil
+	}
+	request, err := http.NewRequestWithContext(incoming.Context(), http.MethodGet, s.priceURL, nil)
+	if err == nil {
+		request.Header.Set("Accept", "application/json")
+		request.Header.Set("User-Agent", "qday-swap-relay/"+s.version)
+		var upstream *http.Response
+		upstream, err = s.httpClient.Do(request)
+		if err == nil {
+			defer upstream.Body.Close()
+			if upstream.StatusCode != http.StatusOK {
+				err = fmt.Errorf("price provider returned HTTP %d", upstream.StatusCode)
+			} else {
+				var payload struct {
+					Data struct {
+						Amount   string `json:"amount"`
+						Base     string `json:"base"`
+						Currency string `json:"currency"`
+					} `json:"data"`
+				}
+				decoder := json.NewDecoder(io.LimitReader(upstream.Body, 8<<10))
+				if decodeErr := decoder.Decode(&payload); decodeErr != nil {
+					err = fmt.Errorf("decode price: %w", decodeErr)
+				} else if payload.Data.Base != "BTC" || payload.Data.Currency != "USD" {
+					err = errors.New("price provider returned the wrong market")
+				} else if numeric, parseErr := strconv.ParseFloat(payload.Data.Amount, 64); parseErr != nil || numeric <= 0 || numeric > 1_000_000_000 || math.IsInf(numeric, 0) || math.IsNaN(numeric) {
+					err = errors.New("price provider returned an invalid amount")
+				} else {
+					s.price = MarketPrice{
+						Pair: "BTC-USD", USD: payload.Data.Amount, Source: "Coinbase",
+						UpdatedAt: now.Format(time.RFC3339),
+					}
+					s.priceAt = now
+					return s.price, nil
+				}
+			}
+		}
+	}
+	if s.price.USD != "" {
+		stale := s.price
+		stale.Stale = true
+		return stale, nil
+	}
+	return MarketPrice{}, err
 }
 
 func (s *Server) handleOrders(response http.ResponseWriter, request *http.Request) {
@@ -325,8 +417,13 @@ func (s *Server) handleWeb(response http.ResponseWriter, request *http.Request) 
 	requested := strings.TrimPrefix(path.Clean(request.URL.Path), "/")
 	if requested != "." && requested != "" && fs.ValidPath(requested) {
 		if info, err := fs.Stat(embeddedWeb, "web/"+requested); err == nil && !info.IsDir() {
-			if strings.Contains(requested, ".") {
-				response.Header().Set("Cache-Control", "public, max-age=3600")
+			switch path.Ext(requested) {
+			case ".js", ".css":
+				// These files are served from stable paths. Revalidate them so a
+				// deployed UI fix cannot remain hidden by an hour-old browser copy.
+				response.Header().Set("Cache-Control", "no-cache")
+			case ".webp", ".svg", ".ttf", ".woff", ".woff2":
+				response.Header().Set("Cache-Control", "public, max-age=86400")
 			}
 			s.static.ServeHTTP(response, request)
 			return

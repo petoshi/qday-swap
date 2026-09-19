@@ -4,6 +4,7 @@
 package swapstate
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,8 +17,13 @@ import (
 )
 
 var (
-	tradesBucket  = []byte("trades")
-	actionsBucket = []byte("actions")
+	tradesBucket              = []byte("trades")
+	actionsBucket             = []byte("actions")
+	pendingAcceptancesBucket  = []byte("pending-acceptances")
+	incomingAcceptancesBucket = []byte("incoming-acceptances")
+	relayMessagesBucket       = []byte("relay-messages")
+	metadataBucket            = []byte("metadata")
+	relayCursorKey            = []byte("relay-mailbox-cursor")
 
 	ErrNotFound       = errors.New("swap not found")
 	ErrPhaseChanged   = errors.New("swap phase changed")
@@ -88,6 +94,13 @@ type Action struct {
 	UpdatedAt      int64        `json:"updatedAt"`
 }
 
+type Negotiation struct {
+	Order      order.Signed           `json:"order"`
+	Acceptance trade.SignedAcceptance `json:"acceptance"`
+	CreatedAt  int64                  `json:"createdAt"`
+	UpdatedAt  int64                  `json:"updatedAt"`
+}
+
 type Journal struct{ db *bbolt.DB }
 
 func Open(path string) (*Journal, error) {
@@ -96,7 +109,7 @@ func Open(path string) (*Journal, error) {
 		return nil, fmt.Errorf("open swap journal: %w", err)
 	}
 	if err := db.Update(func(tx *bbolt.Tx) error {
-		for _, name := range [][]byte{tradesBucket, actionsBucket} {
+		for _, name := range [][]byte{tradesBucket, actionsBucket, pendingAcceptancesBucket, incomingAcceptancesBucket, relayMessagesBucket, metadataBucket} {
 			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
 				return err
 			}
@@ -111,11 +124,183 @@ func Open(path string) (*Journal, error) {
 
 func (j *Journal) Close() error { return j.db.Close() }
 
+func (j *Journal) SavePendingAcceptance(signedOrder order.Signed, acceptance trade.SignedAcceptance, now time.Time) (Negotiation, bool, error) {
+	return j.saveAcceptance(pendingAcceptancesBucket, signedOrder, acceptance, now)
+}
+
+func (j *Journal) SaveIncomingAcceptance(signedOrder order.Signed, acceptance trade.SignedAcceptance, now time.Time) (Negotiation, bool, error) {
+	return j.saveAcceptance(incomingAcceptancesBucket, signedOrder, acceptance, now)
+}
+
+func (j *Journal) PendingAcceptances() ([]Negotiation, error) {
+	return j.acceptances(pendingAcceptancesBucket)
+}
+
+func (j *Journal) IncomingAcceptances() ([]Negotiation, error) {
+	return j.acceptances(incomingAcceptancesBucket)
+}
+
+func (j *Journal) PendingAcceptanceByMatch(match trade.SignedMatch) (Negotiation, error) {
+	records, err := j.PendingAcceptances()
+	if err != nil {
+		return Negotiation{}, err
+	}
+	for _, record := range records {
+		if record.Acceptance.ID == match.Match.AcceptanceID && record.Acceptance.Acceptance.TradeID == match.Match.TradeID {
+			return record, nil
+		}
+	}
+	return Negotiation{}, ErrNotFound
+}
+
+func (j *Journal) IncomingAcceptance(id string) (Negotiation, error) {
+	var record Negotiation
+	err := j.db.View(func(tx *bbolt.Tx) error {
+		encoded := tx.Bucket(incomingAcceptancesBucket).Get([]byte(id))
+		if encoded == nil {
+			return ErrNotFound
+		}
+		return json.Unmarshal(encoded, &record)
+	})
+	return record, err
+}
+
+func (j *Journal) RemovePendingAcceptance(id string) error {
+	return j.removeAcceptance(pendingAcceptancesBucket, id)
+}
+
+func (j *Journal) RemoveIncomingAcceptance(id string) error {
+	return j.removeAcceptance(incomingAcceptancesBucket, id)
+}
+
+func (j *Journal) SaveRelayMessage(message trade.SignedMessage, now time.Time) (bool, error) {
+	// Mailbox delivery can happen after a message expires. Its signed creation
+	// time is the stable point for structural and signature verification.
+	if err := message.Verify(time.Unix(message.Message.CreatedAt, 0)); err != nil {
+		return false, err
+	}
+	created := false
+	err := j.db.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(relayMessagesBucket)
+		if existing := bucket.Get([]byte(message.ID)); existing != nil {
+			return nil
+		}
+		encoded, err := json.Marshal(message)
+		if err != nil {
+			return err
+		}
+		created = true
+		return bucket.Put([]byte(message.ID), encoded)
+	})
+	return created, err
+}
+
+func (j *Journal) RelayMessages(tradeID string) ([]trade.SignedMessage, error) {
+	var records []trade.SignedMessage
+	err := j.db.View(func(tx *bbolt.Tx) error {
+		return tx.Bucket(relayMessagesBucket).ForEach(func(_, encoded []byte) error {
+			var message trade.SignedMessage
+			if err := json.Unmarshal(encoded, &message); err != nil {
+				return err
+			}
+			if message.Message.TradeID == tradeID {
+				records = append(records, message)
+			}
+			return nil
+		})
+	})
+	sort.Slice(records, func(i, k int) bool { return records[i].Message.Sequence < records[k].Message.Sequence })
+	if records == nil {
+		records = []trade.SignedMessage{}
+	}
+	return records, err
+}
+
+func (j *Journal) RelayCursor() (uint64, error) {
+	var cursor uint64
+	err := j.db.View(func(tx *bbolt.Tx) error {
+		encoded := tx.Bucket(metadataBucket).Get(relayCursorKey)
+		if len(encoded) == 8 {
+			cursor = binary.BigEndian.Uint64(encoded)
+		}
+		return nil
+	})
+	return cursor, err
+}
+
+func (j *Journal) SetRelayCursor(cursor uint64) error {
+	return j.db.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(metadataBucket)
+		current := bucket.Get(relayCursorKey)
+		if len(current) == 8 && cursor < binary.BigEndian.Uint64(current) {
+			return errors.New("relay mailbox cursor cannot move backwards")
+		}
+		var encoded [8]byte
+		binary.BigEndian.PutUint64(encoded[:], cursor)
+		return bucket.Put(relayCursorKey, encoded[:])
+	})
+}
+
+func (j *Journal) saveAcceptance(bucketName []byte, signedOrder order.Signed, acceptance trade.SignedAcceptance, now time.Time) (Negotiation, bool, error) {
+	if err := acceptance.Verify(signedOrder, now); err != nil {
+		return Negotiation{}, false, err
+	}
+	record := Negotiation{Order: signedOrder, Acceptance: acceptance, CreatedAt: now.Unix(), UpdatedAt: now.Unix()}
+	created := false
+	err := j.db.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(bucketName)
+		key := []byte(acceptance.ID)
+		if encoded := bucket.Get(key); encoded != nil {
+			var existing Negotiation
+			if err := json.Unmarshal(encoded, &existing); err != nil {
+				return err
+			}
+			if existing.Order.ID != signedOrder.ID || existing.Acceptance.Acceptance.TradeID != acceptance.Acceptance.TradeID {
+				return errors.New("acceptance ID is already bound to different negotiation data")
+			}
+			record = existing
+			return nil
+		}
+		encoded, err := json.Marshal(record)
+		if err != nil {
+			return err
+		}
+		created = true
+		return bucket.Put(key, encoded)
+	})
+	return record, created, err
+}
+
+func (j *Journal) acceptances(bucketName []byte) ([]Negotiation, error) {
+	var records []Negotiation
+	err := j.db.View(func(tx *bbolt.Tx) error {
+		return tx.Bucket(bucketName).ForEach(func(_, encoded []byte) error {
+			var record Negotiation
+			if err := json.Unmarshal(encoded, &record); err != nil {
+				return err
+			}
+			records = append(records, record)
+			return nil
+		})
+	})
+	sort.Slice(records, func(i, k int) bool { return records[i].UpdatedAt > records[k].UpdatedAt })
+	if records == nil {
+		records = []Negotiation{}
+	}
+	return records, err
+}
+
+func (j *Journal) removeAcceptance(bucketName []byte, id string) error {
+	return j.db.Update(func(tx *bbolt.Tx) error { return tx.Bucket(bucketName).Delete([]byte(id)) })
+}
+
 func (j *Journal) Create(role Role, signedOrder order.Signed, acceptance trade.SignedAcceptance, match trade.SignedMatch, now time.Time) (Swap, bool, error) {
 	if role != RoleMaker && role != RoleTaker {
 		return Swap{}, false, errors.New("swap role must be maker or taker")
 	}
-	if err := match.Verify(signedOrder, acceptance, now); err != nil {
+	// A matched swap remains valid after its short acceptance window expires.
+	// Verify against the signed match time rather than the local restart time.
+	if err := match.Verify(signedOrder, acceptance, time.Unix(match.Match.CreatedAt, 0)); err != nil {
 		return Swap{}, false, err
 	}
 	record := Swap{

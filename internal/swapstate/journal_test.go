@@ -168,3 +168,50 @@ func TestPhaseGraphAndMonotonicMailboxCursor(t *testing.T) {
 		t.Fatal("mailbox cursor moved backwards")
 	}
 }
+
+func TestNegotiationsAndRelayCursorSurviveRestart(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	signedOrder, acceptance, match := matchedFixture(t, now)
+	path := filepath.Join(t.TempDir(), "swaps.db")
+	journal, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, created, err := journal.SavePendingAcceptance(signedOrder, acceptance, now); err != nil || !created {
+		t.Fatalf("save pending created=%v err=%v", created, err)
+	}
+	if _, created, err := journal.SavePendingAcceptance(signedOrder, acceptance, now); err != nil || created {
+		t.Fatalf("idempotent pending created=%v err=%v", created, err)
+	}
+	if _, created, err := journal.SaveIncomingAcceptance(signedOrder, acceptance, now); err != nil || !created {
+		t.Fatalf("save incoming created=%v err=%v", created, err)
+	}
+	if found, err := journal.PendingAcceptanceByMatch(match); err != nil || found.Acceptance.ID != acceptance.ID {
+		t.Fatalf("pending by match=%#v err=%v", found, err)
+	}
+	if err := journal.SetRelayCursor(12); err != nil {
+		t.Fatal(err)
+	} else if err := journal.SetRelayCursor(11); err == nil {
+		t.Fatal("relay cursor moved backwards")
+	}
+	if err := journal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	journal, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer journal.Close()
+	if cursor, err := journal.RelayCursor(); err != nil || cursor != 12 {
+		t.Fatalf("cursor=%d err=%v", cursor, err)
+	}
+	if records, err := journal.PendingAcceptances(); err != nil || len(records) != 1 {
+		t.Fatalf("pending=%#v err=%v", records, err)
+	}
+	if err := journal.RemovePendingAcceptance(acceptance.ID); err != nil {
+		t.Fatal(err)
+	}
+	if records, err := journal.PendingAcceptances(); err != nil || len(records) != 0 {
+		t.Fatalf("pending after remove=%#v err=%v", records, err)
+	}
+}

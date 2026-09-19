@@ -79,12 +79,20 @@ type ResultPage struct {
 }
 
 type Stats struct {
-	Open       int `json:"open"`
-	Cancelled  int `json:"cancelled"`
-	Expired    int `json:"expired"`
-	Matched    int `json:"matched"`
-	Total      int `json:"total"`
-	Created24h int `json:"created24h"`
+	Open       int         `json:"open"`
+	Cancelled  int         `json:"cancelled"`
+	Expired    int         `json:"expired"`
+	Matched    int         `json:"matched"`
+	Total      int         `json:"total"`
+	Created24h int         `json:"created24h"`
+	LastTrade  *TradePrice `json:"lastTrade,omitempty"`
+}
+
+type TradePrice struct {
+	QDAYAtomic     string `json:"qdayAtomic"`
+	BTCAtomic      string `json:"btcAtomic"`
+	QDAYUnitAtomic string `json:"qdayUnitAtomic"`
+	MatchedAt      int64  `json:"matchedAt"`
 }
 
 type Store struct{ db *bbolt.DB }
@@ -283,6 +291,16 @@ func (s *Store) Stats(now time.Time) (Stats, error) {
 				stats.Expired++
 			case StatusMatched:
 				stats.Matched++
+				if stats.LastTrade == nil || record.MatchedAt > stats.LastTrade.MatchedAt {
+					terms := record.Signed.Order
+					tradePrice := &TradePrice{QDAYUnitAtomic: terms.QDAYUnitAtomic, MatchedAt: record.MatchedAt}
+					if terms.Give.Asset == "QDAY" {
+						tradePrice.QDAYAtomic, tradePrice.BTCAtomic = terms.Give.Atomic, terms.Receive.Atomic
+					} else {
+						tradePrice.QDAYAtomic, tradePrice.BTCAtomic = terms.Receive.Atomic, terms.Give.Atomic
+					}
+					stats.LastTrade = tradePrice
+				}
 			}
 			return nil
 		})

@@ -1,14 +1,25 @@
 const root = document.querySelector('#app');
 const nav = document.querySelector('#main-nav');
 const nodePill = document.querySelector('#node-pill');
+const headerQDAY = document.querySelector('#header-qday');
+const headerBitcoin = document.querySelector('#header-bitcoin');
+const headerSwaps = document.querySelector('#header-swaps');
+const headerBitcoinUSD = document.querySelector('#header-btc-usd');
+const headerQDAYUSD = document.querySelector('#header-qday-usd');
 const modalBackdrop = document.querySelector('#modal-backdrop');
 const modal = document.querySelector('#modal');
 const toast = document.querySelector('#toast');
 
 let state;
+let orders = {items: [], page: 1, total: 0, totalPages: 0};
+let negotiations = {pending: [], incoming: [], swaps: []};
+let marketError = '';
 let setupMode = 'new';
 let toastTimer;
 let refreshTimer;
+let renderFingerprint = '';
+let bitcoinUSD = 0;
+let lastTrade = null;
 
 const escapeHTML = value => String(value ?? '').replace(/[&<>'"]/g, character => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
@@ -49,6 +60,80 @@ function commas(value) {
   return `${whole.replace(/\B(?=(\d{3})+(?!\d))/g, ',')}${fraction ? `.${fraction}` : ''}`;
 }
 
+function decimalsFromUnit(unit) {
+  const value = String(unit || '');
+  return /^10*$/.test(value) ? value.length - 1 : null;
+}
+
+function formatUnits(atomic, unit, maximumPlaces = 8) {
+  const decimals = decimalsFromUnit(unit);
+  if (decimals === null) return commas(atomic);
+  let digits = String(atomic || '0').padStart(decimals + 1, '0');
+  const whole = digits.slice(0, -decimals) || '0';
+  let fraction = decimals ? digits.slice(-decimals) : '';
+  if (fraction.length > maximumPlaces) fraction = fraction.slice(0, maximumPlaces);
+  fraction = fraction.replace(/0+$/, '');
+  return `${commas(whole)}${fraction ? `.${fraction}` : ''}`;
+}
+
+function amountText(amount, qdayUnit) {
+  const unit = amount.asset === 'BTC' ? '100000000' : qdayUnit;
+  return `${formatUnits(amount.atomic, unit, amount.asset === 'BTC' ? 8 : 4)} ${amount.asset}`;
+}
+
+function orderPrice(terms) {
+  const give = BigInt(terms.give.atomic);
+  const receive = BigInt(terms.receive.atomic);
+  const qday = terms.give.asset === 'QDAY' ? give : receive;
+  const sats = terms.give.asset === 'BTC' ? give : receive;
+  if (qday === 0n) return '—';
+  const scale = 100000000n;
+  const scaled = (sats * BigInt(terms.qdayUnitAtomic) * scale) / (qday * 100000000n);
+  return formatUnits(String(scaled), String(scale), 8);
+}
+
+function dollars(value, bitcoin = false) {
+  if (!Number.isFinite(value) || value <= 0) return '$—';
+  const maximumFractionDigits = bitcoin ? 0 : value >= 1 ? 4 : value >= .01 ? 6 : 8;
+  return new Intl.NumberFormat('en-US', {
+    style: 'currency', currency: 'USD', minimumFractionDigits: 0, maximumFractionDigits
+  }).format(value);
+}
+
+function refreshQDAYDollarPrice() {
+  if (!lastTrade) {
+    headerQDAYUSD.textContent = 'N/A';
+    headerQDAYUSD.title = 'No matched trades yet';
+    return;
+  }
+  if (!bitcoinUSD) {
+    headerQDAYUSD.textContent = '—';
+    return;
+  }
+  const scale = 1000000000000n;
+  const numerator = BigInt(lastTrade.btcAtomic) * BigInt(lastTrade.qdayUnitAtomic) * scale;
+  const denominator = BigInt(lastTrade.qdayAtomic) * 100000000n;
+  const btcPerQDAY = Number(numerator / denominator) / Number(scale);
+  headerQDAYUSD.textContent = dollars(btcPerQDAY * bitcoinUSD);
+  headerQDAYUSD.title = `Last matched trade · ${new Date(lastTrade.matchedAt * 1000).toLocaleString()}`;
+}
+
+async function refreshPriceLoop() {
+  try {
+    const result = await api('/api/v1/price');
+    const numeric = Number(result.usd);
+    if (Number.isFinite(numeric) && numeric > 0) {
+      bitcoinUSD = numeric;
+      headerBitcoinUSD.textContent = dollars(bitcoinUSD, true);
+      headerBitcoinUSD.title = `${result.source} · ${new Date(result.updatedAt).toLocaleTimeString()}${result.stale ? ' · stale' : ''}`;
+      refreshQDAYDollarPrice();
+    }
+  } catch (_) {
+    if (!bitcoinUSD) headerBitcoinUSD.textContent = '—';
+  }
+  setTimeout(refreshPriceLoop, 20000);
+}
+
 function short(value, left = 8, right = 6) {
   const text = String(value || '');
   return text.length > left + right + 1 ? `${text.slice(0, left)}…${text.slice(-right)}` : text;
@@ -63,6 +148,11 @@ function updateChrome() {
   nav.querySelectorAll('a').forEach(link => link.classList.toggle('active', link.dataset.route === route()));
   nodePill.classList.remove('waiting', 'error');
   const label = nodePill.querySelector('span');
+  headerQDAY.textContent = state?.qday ? commas(state.qday.height) : '—';
+  headerBitcoin.textContent = state?.bitcoin ? commas(state.bitcoin.headerHeight) : '—';
+  headerSwaps.textContent = commas(state?.activeSwaps ?? 0);
+  lastTrade = state?.relay?.stats?.lastTrade || null;
+  refreshQDAYDollarPrice();
   if (!state?.configured) {
     nodePill.classList.add('waiting');
     label.textContent = 'SETUP';
@@ -116,18 +206,70 @@ function renderMarket() {
   const pending = state.balance?.pendingIn?.qday ?? '0';
   const bitcoin = state.bitcoinBalance?.confirmed?.btc ?? '0';
   const bitcoinPending = state.bitcoinBalance?.pending?.btc ?? '0';
-  root.innerHTML = `${state.error ? `<div class="alert"><strong>QDAY node needs attention</strong>${escapeHTML(state.error)}</div>` : ''}
-    <section class="hero">
-      <div><span class="eyebrow">QDAY ↔ BITCOIN</span><h1>SWAP WITHOUT PERMISSION.</h1><p>Signed public offers. Bitcoin Native SegWit contracts. QDAY contracts protected by Ed25519 and SLH DSA. Your keys remain here.</p></div>
-      <div class="wallet-card"><div><span>Spendable QDAY</span><strong>${escapeHTML(commas(balance))}</strong><small>exact balance from your local node</small></div><div><span>Pending QDAY</span><strong>${escapeHTML(commas(pending))}</strong><small>unconfirmed QDAY</small></div><div><span>Confirmed BTC</span><strong>${escapeHTML(commas(bitcoin))}</strong><small>verified by the local light client</small></div><div><span>Pending BTC</span><strong>${escapeHTML(commas(bitcoinPending))}</strong><small>unconfirmed Bitcoin</small></div></div>
+  root.innerHTML = `${state.error ? `<div class="alert"><strong>Local chain needs attention</strong>${escapeHTML(state.error)}</div>` : ''}
+    ${state.relayError || marketError ? `<div class="alert"><strong>DEX relay needs attention</strong>${escapeHTML(state.relayError || marketError)}</div>` : ''}
+    <section class="terminal-head">
+      <div><span class="command">$ qday-swap wallet --market QDAY/BTC</span><h1>LOCAL ORDER TERMINAL</h1><p>Wallets, keys and signatures stay on this computer.</p></div>
+      <pre class="ascii-swap" aria-label="QDAY to Bitcoin atomic swap">+---------------------+       +---------------------+
+| QDAY                |       | BITCOIN             |
+| ED25519 + SLH-DSA   |&lt;-----&gt;| NATIVE SEGWIT HTLC |
++---------------------+ SHA256 +---------------------+</pre>
     </section>
     <section class="metrics">
-      ${metric('QDAY height', state.qday ? commas(state.qday.height) : 'STARTING', state.qday?.synced ? 'fully synchronized' : 'synchronizing')}
-      ${metric('Bitcoin height', state.bitcoin ? commas(state.bitcoin.headerHeight) : 'STARTING', state.bitcoin?.walletSynced ? 'wallet synchronized' : 'compact-filter sync')}
+      ${metric('Spendable QDAY', commas(balance), `${commas(pending)} pending`)}
+      ${metric('Confirmed BTC', commas(bitcoin), `${commas(bitcoinPending)} pending`)}
       ${metric('Network peers', `${state.qday?.connections ?? 0} / ${state.bitcoin?.peers ?? 0}`, 'QDAY / Bitcoin')}
-      ${metric('Open offers', '0', 'signed relay orders')}
+      ${metric('Open offers', state.relay?.stats?.open ?? orders.total ?? '0', 'signed orders')}
     </section>
-    <section class="card"><div class="card-head"><h2>Open QDAY ↔ BTC offers</h2><span>DEX RELAY</span></div><div class="empty"><strong>NO OPEN OFFERS YET.</strong><p>Create the first signed offer or wait for another trader. The relay can publish terms. It cannot touch funds.</p></div></section>`;
+    <section class="card"><div class="card-head"><h2>Open QDAY ↔ BTC offers</h2><span>${escapeHTML(orders.total)} SIGNED</span></div>${orderList(orders.items)}</section>`;
+}
+
+function orderList(records) {
+  if (!records?.length) return `<div class="empty"><strong>NO OPEN OFFERS YET.</strong><p>Create the first signed offer or wait for another trader.</p></div>`;
+  return `<div class="table-scroll"><table class="offers"><thead><tr><th>Side</th><th>Maker gives</th><th>Maker wants</th><th>Price</th><th>Expires</th><th></th></tr></thead><tbody>${records.map(record => {
+    const terms = record.signed.order;
+    const mine = terms.makerPublicKey === state.identityPublicKey;
+    const side = terms.give.asset === 'QDAY' ? 'SELL QDAY' : 'BUY QDAY';
+    const remaining = Math.max(0, terms.expiresAt - Math.floor(Date.now() / 1000));
+    return `<tr><td><span class="side ${terms.give.asset === 'QDAY' ? 'sell' : 'buy'}">${side}</span>${mine ? '<small class="mine">MY OFFER</small>' : ''}</td><td>${escapeHTML(amountText(terms.give, terms.qdayUnitAtomic))}</td><td>${escapeHTML(amountText(terms.receive, terms.qdayUnitAtomic))}</td><td>${escapeHTML(orderPrice(terms))} BTC/QDAY</td><td>${Math.ceil(remaining / 60)}m</td><td class="row-action">${mine ? `<button class="text-button" data-cancel-order="${escapeHTML(record.signed.id)}">CANCEL</button>` : `<button class="secondary" data-accept-order="${escapeHTML(record.signed.id)}">ACCEPT</button>`}</td></tr>`;
+  }).join('')}</tbody></table></div>`;
+}
+
+function renderCreate() {
+  root.innerHTML = `<section class="page-head"><div><span class="eyebrow">SIGNED PUBLIC OFFER</span><h1>CREATE OFFER.</h1><p>Choose exact amounts. Another wallet can fill the whole offer once.</p></div></section>
+    <section class="card offer-form-card"><form id="create-offer-form">
+      <div class="offer-fields">
+        <label class="field light"><span>You give</span><select name="giveAsset"><option value="QDAY">QDAY</option><option value="BTC">Bitcoin</option></select></label>
+        <label class="field light"><span>Exact amount you give</span><input name="giveAmount" inputmode="decimal" placeholder="100" required></label>
+        <label class="field light"><span>Exact amount you receive</span><input name="receiveAmount" inputmode="decimal" placeholder="0.001" required></label>
+        <label class="field light"><span>Offer expires</span><select name="lifetimeMinutes"><option value="60">1 hour</option><option value="360">6 hours</option><option value="1440">24 hours</option><option value="10080">7 days</option></select></label>
+      </div>
+      <div class="review-note"><strong>One fill. Exact amounts.</strong><span>The offer is signed locally. Publishing it does not move funds. Contract funding still requires approval after a maker accepts a taker.</span></div>
+      <p class="form-error dark" id="form-error" hidden></p><button class="primary" type="submit">SIGN AND PUBLISH OFFER</button>
+    </form></section>`;
+}
+
+function negotiationTerms(record) {
+  const terms = record.order.order;
+  return `${amountText(terms.give, terms.qdayUnitAtomic)} → ${amountText(terms.receive, terms.qdayUnitAtomic)}`;
+}
+
+function renderSwaps(historyOnly = false) {
+  const completed = new Set(['complete', 'refunded']);
+  const swaps = negotiations.swaps.filter(swap => historyOnly ? completed.has(swap.phase) : !completed.has(swap.phase));
+  if (historyOnly) {
+    root.innerHTML = `<section class="page-head"><div><span class="eyebrow">LOCAL JOURNAL</span><h1>HISTORY.</h1><p>Completed and refunded swaps remain auditable on this computer.</p></div></section>${swapTable(swaps)}`;
+    return;
+  }
+  root.innerHTML = `<section class="page-head"><div><span class="eyebrow">LOCAL JOURNAL</span><h1>ACTIVE SWAPS.</h1><p>Acceptances, matches and contract progress survive restarts.</p></div></section>
+    ${negotiations.incoming.length ? `<section class="card"><div class="card-head"><h2>Waiting for your choice</h2><span>${negotiations.incoming.length}</span></div><div class="negotiation-list">${negotiations.incoming.map(item => `<article><div><strong>${escapeHTML(negotiationTerms(item))}</strong><small>Taker ${escapeHTML(short(item.acceptance.acceptance.takerPublicKey))}</small></div><button class="primary" data-match-acceptance="${escapeHTML(item.acceptance.id)}">MATCH TAKER</button></article>`).join('')}</div></section>` : ''}
+    ${negotiations.pending.length ? `<section class="card"><div class="card-head"><h2>Waiting for maker</h2><span>${negotiations.pending.length}</span></div><div class="negotiation-list">${negotiations.pending.map(item => `<article><div><strong>${escapeHTML(negotiationTerms(item))}</strong><small>Acceptance expires ${escapeHTML(new Date(item.acceptance.acceptance.expiresAt * 1000).toLocaleString())}</small></div><span class="waiting-label">PENDING</span></article>`).join('')}</div></section>` : ''}
+    ${swapTable(swaps)}`;
+}
+
+function swapTable(swaps) {
+  if (!swaps.length) return `<section class="card"><div class="empty"><strong>NOTHING HERE YET.</strong><p>Matched swaps will appear here before either wallet broadcasts a contract.</p></div></section>`;
+  return `<section class="card"><div class="card-head"><h2>Swaps</h2><span>${swaps.length}</span></div><div class="negotiation-list">${swaps.map(swap => `<article><div><strong>${escapeHTML(negotiationTerms(swap))}</strong><small>${escapeHTML(swap.role.toUpperCase())} · ${escapeHTML(swap.id)}</small></div><span class="phase">${escapeHTML(swap.phase.replaceAll('_', ' ').toUpperCase())}</span></article>`).join('')}</div></section>`;
 }
 
 function renderEmpty(title, copy, action = '') {
@@ -146,26 +288,50 @@ function renderSettings() {
     </section>`;
 }
 
+function currentFingerprint() {
+  const current = route();
+  if (!state.configured) return 'setup';
+  if (!state.unlocked) return 'locked';
+  if (current === 'create') return 'create';
+  if (current === 'settings') return JSON.stringify({current, error: state.error, relay: state.relayURL});
+  if (current === 'swaps' || current === 'history') return JSON.stringify({current, negotiations, relayError: state.relayError});
+  return JSON.stringify({current: 'market', orders, balance: state.balance, bitcoinBalance: state.bitcoinBalance, relay: state.relay, error: state.error, relayError: state.relayError, marketError});
+}
+
 function render() {
   clearTimeout(refreshTimer);
   updateChrome();
-  if (!state.configured) renderSetup();
-  else if (!state.unlocked) renderUnlock();
-  else {
-    switch (route()) {
-      case 'create': renderEmpty('CREATE OFFER.', 'Choose what you give, what you receive and the exact price.'); break;
-      case 'swaps': renderEmpty('ACTIVE SWAPS.', 'Funding, confirmations, claims and refunds appear here.'); break;
-      case 'history': renderEmpty('HISTORY.', 'Every completed or refunded swap remains auditable here.'); break;
-      case 'settings': renderSettings(); break;
-      default: renderMarket();
+  const fingerprint = currentFingerprint();
+  if (fingerprint !== renderFingerprint) {
+    renderFingerprint = fingerprint;
+    if (!state.configured) renderSetup();
+    else if (!state.unlocked) renderUnlock();
+    else {
+      switch (route()) {
+        case 'create': renderCreate(); break;
+        case 'swaps': renderSwaps(); break;
+        case 'history': renderSwaps(true); break;
+        case 'settings': renderSettings(); break;
+        default: renderMarket();
+      }
     }
   }
-  refreshTimer = setTimeout(refreshState, state.configured ? 5000 : 15000);
+  if (state.configured && state.unlocked) refreshTimer = setTimeout(refreshState, 5000);
 }
 
 async function refreshState() {
   try {
     state = await api('/api/v1/state');
+    marketError = '';
+    if (state.configured && state.unlocked) {
+      const [orderResult, negotiationResult] = await Promise.allSettled([
+        api('/api/v1/orders?page=1'), api('/api/v1/negotiations')
+      ]);
+      if (orderResult.status === 'fulfilled') orders = orderResult.value;
+      else marketError = orderResult.reason.message;
+      if (negotiationResult.status === 'fulfilled') negotiations = negotiationResult.value;
+      else marketError = marketError || negotiationResult.reason.message;
+    }
     render();
   } catch (error) {
     root.innerHTML = `<div class="alert"><strong>Local application unavailable</strong>${escapeHTML(error.message)}</div>`;
@@ -214,6 +380,24 @@ document.addEventListener('click', async event => {
     if (!confirm('Reveal the recovery phrase on this screen?')) return;
     try { recoveryModal((await post('/api/v1/recovery')).phrase); } catch (error) { showToast(error.message); }
   }
+  const accept = event.target.closest('[data-accept-order]');
+  if (accept) {
+    if (!confirm('Accept this exact signed offer? No funds move until contract funding is approved.')) return;
+    accept.disabled = true;
+    try { await post(`/api/v1/orders/${accept.dataset.acceptOrder}/accept`); location.hash = 'swaps'; renderFingerprint = ''; await refreshState(); } catch (error) { showToast(error.message); accept.disabled = false; }
+  }
+  const cancel = event.target.closest('[data-cancel-order]');
+  if (cancel) {
+    if (!confirm('Cancel this offer?')) return;
+    cancel.disabled = true;
+    try { await post(`/api/v1/orders/${cancel.dataset.cancelOrder}/cancel`); renderFingerprint = ''; await refreshState(); } catch (error) { showToast(error.message); cancel.disabled = false; }
+  }
+  const match = event.target.closest('[data-match-acceptance]');
+  if (match) {
+    if (!confirm('Match this taker and close the public offer?')) return;
+    match.disabled = true;
+    try { await post(`/api/v1/acceptances/${match.dataset.matchAcceptance}/match`); renderFingerprint = ''; await refreshState(); } catch (error) { showToast(error.message); match.disabled = false; }
+  }
 });
 
 document.addEventListener('submit', async event => {
@@ -249,8 +433,27 @@ document.addEventListener('submit', async event => {
       button.disabled = false; button.textContent = 'UNLOCK WALLET';
     }
   }
+  if (event.target.id === 'create-offer-form') {
+    const form = event.target;
+    const button = form.querySelector('[type=submit]');
+    const errorBox = form.querySelector('#form-error');
+    button.disabled = true; button.textContent = 'SIGNING AND PUBLISHING…';
+    try {
+      await post('/api/v1/orders', {
+        giveAsset: form.elements.giveAsset.value,
+        giveAmount: form.elements.giveAmount.value.trim(),
+        receiveAmount: form.elements.receiveAmount.value.trim(),
+        lifetimeMinutes: Number(form.elements.lifetimeMinutes.value)
+      });
+      form.reset(); location.hash = 'market'; renderFingerprint = ''; await refreshState(); showToast('Offer published');
+    } catch (error) {
+      errorBox.textContent = error.message; errorBox.hidden = false;
+      button.disabled = false; button.textContent = 'SIGN AND PUBLISH OFFER';
+    }
+  }
 });
 
-window.addEventListener('hashchange', () => state && render());
+window.addEventListener('hashchange', () => { renderFingerprint = ''; if (state) render(); });
 modalBackdrop.addEventListener('click', event => { if (event.target === modalBackdrop) closeModal(); });
+refreshPriceLoop();
 refreshState();

@@ -5,17 +5,25 @@ package app
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/petoshi/qday-swap/internal/bitcoinwallet"
 	"github.com/petoshi/qday-swap/internal/keystore"
+	"github.com/petoshi/qday-swap/internal/order"
+	"github.com/petoshi/qday-swap/internal/relay"
+	"github.com/petoshi/qday-swap/internal/relayclient"
 	"github.com/petoshi/qday-swap/internal/swapstate"
+	"github.com/petoshi/qday-swap/internal/trade"
 	"github.com/petoshi/qday-swap/internal/walletd"
 	"github.com/petoshi/qday-swap/internal/walletroot"
 )
@@ -89,13 +97,29 @@ func (p *bitcoinManagerProcess) Start(ctx context.Context) (bitcoinClient, error
 
 func (p *bitcoinManagerProcess) Stop() error { return p.manager.Stop() }
 
+type relayAPI interface {
+	Status(context.Context) (relayclient.Status, error)
+	Price(context.Context) (relay.MarketPrice, error)
+	Orders(context.Context, relay.Status, string, int, int) (relay.ResultPage, error)
+	Order(context.Context, string) (relay.Record, error)
+	Publish(context.Context, order.Signed) (relay.Record, error)
+	Cancel(context.Context, string, order.SignedCancellation) (relay.Record, error)
+	Accept(context.Context, string, trade.SignedAcceptance) (relay.AcceptanceRecord, error)
+	Match(context.Context, string, trade.SignedMatch) (relay.Record, error)
+	Message(context.Context, trade.SignedMessage) (trade.SignedMessage, error)
+	Poll(context.Context, trade.SignedPoll) (relay.MailboxPage, error)
+}
+
 type Service struct {
 	config         Config
 	ctx            context.Context
 	factory        processFactory
 	bitcoinFactory bitcoinProcessFactory
+	relay          relayAPI
 
 	mu             sync.RWMutex
+	relaySyncMu    sync.Mutex
+	lastRelaySync  time.Time
 	process        qdayProcess
 	client         qdayClient
 	bitcoinProcess bitcoinProcess
@@ -106,15 +130,34 @@ type Service struct {
 }
 
 type State struct {
-	Configured     bool                   `json:"configured"`
-	Unlocked       bool                   `json:"unlocked"`
-	Network        string                 `json:"network"`
-	RelayURL       string                 `json:"relayURL"`
-	QDAY           *walletd.Status        `json:"qday,omitempty"`
-	Balance        *walletd.Balance       `json:"balance,omitempty"`
-	Bitcoin        *bitcoinwallet.Status  `json:"bitcoin,omitempty"`
-	BitcoinBalance *bitcoinwallet.Balance `json:"bitcoinBalance,omitempty"`
-	Error          string                 `json:"error,omitempty"`
+	Configured        bool                   `json:"configured"`
+	Unlocked          bool                   `json:"unlocked"`
+	Network           string                 `json:"network"`
+	RelayURL          string                 `json:"relayURL"`
+	QDAY              *walletd.Status        `json:"qday,omitempty"`
+	Balance           *walletd.Balance       `json:"balance,omitempty"`
+	Bitcoin           *bitcoinwallet.Status  `json:"bitcoin,omitempty"`
+	BitcoinBalance    *bitcoinwallet.Balance `json:"bitcoinBalance,omitempty"`
+	Relay             *relayclient.Status    `json:"relay,omitempty"`
+	PendingTrades     int                    `json:"pendingTrades"`
+	IncomingTrades    int                    `json:"incomingTrades"`
+	ActiveSwaps       int                    `json:"activeSwaps"`
+	IdentityPublicKey string                 `json:"identityPublicKey,omitempty"`
+	RelayError        string                 `json:"relayError,omitempty"`
+	Error             string                 `json:"error,omitempty"`
+}
+
+type CreateOfferRequest struct {
+	GiveAsset       string `json:"giveAsset"`
+	GiveAmount      string `json:"giveAmount"`
+	ReceiveAmount   string `json:"receiveAmount"`
+	LifetimeMinutes uint32 `json:"lifetimeMinutes"`
+}
+
+type Negotiations struct {
+	Pending  []swapstate.Negotiation `json:"pending"`
+	Incoming []swapstate.Negotiation `json:"incoming"`
+	Swaps    []swapstate.Swap        `json:"swaps"`
 }
 
 type SetupResult struct {
@@ -135,7 +178,15 @@ func New(ctx context.Context, config Config) (*Service, error) {
 	if config.BitcoinNetwork == "" {
 		config.BitcoinNetwork = "mainnet"
 	}
+	if config.RelayURL == "" {
+		config.RelayURL = "https://dex.pqday.com"
+	}
 	service := &Service{config: config, ctx: ctx}
+	relayClient, err := relayclient.New(config.RelayURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	service.relay = relayClient
 	service.factory = func(dataDir string) (qdayProcess, error) {
 		return walletd.NewManager(walletd.ManagerConfig{
 			Binary: config.WalletdBinary, DataDir: dataDir,
@@ -424,11 +475,442 @@ func (s *Service) BitcoinReceiveAddress() (string, error) {
 	return client.ReceiveAddress()
 }
 
+func (s *Service) Orders(ctx context.Context, giveAsset string, page int) (relay.ResultPage, error) {
+	if page < 1 {
+		page = 1
+	}
+	if giveAsset != "" && giveAsset != "QDAY" && giveAsset != "BTC" {
+		return relay.ResultPage{}, errors.New("give asset must be QDAY or BTC")
+	}
+	result, err := s.relay.Orders(ctx, relay.StatusOpen, giveAsset, page, 20)
+	if err != nil {
+		return relay.ResultPage{}, err
+	}
+	now := time.Now()
+	for _, record := range result.Items {
+		if err := record.Signed.Verify(now); err != nil {
+			return relay.ResultPage{}, fmt.Errorf("relay returned invalid order %s: %w", record.Signed.ID, err)
+		}
+	}
+	return result, nil
+}
+
+func (s *Service) MarketPrice(ctx context.Context) (relay.MarketPrice, error) {
+	return s.relay.Price(ctx)
+}
+
+func (s *Service) CreateOffer(ctx context.Context, request CreateOfferRequest) (relay.Record, error) {
+	identity, messagePublic, cleanup, err := s.identities()
+	if err != nil {
+		return relay.Record{}, err
+	}
+	defer cleanup()
+	if request.GiveAsset != "QDAY" && request.GiveAsset != "BTC" {
+		return relay.Record{}, errors.New("give asset must be QDAY or BTC")
+	}
+	if request.LifetimeMinutes == 0 {
+		request.LifetimeMinutes = 60
+	}
+	lifetime := time.Duration(request.LifetimeMinutes) * time.Minute
+	if lifetime < time.Minute || lifetime > 30*24*time.Hour {
+		return relay.Record{}, errors.New("offer lifetime must be between 1 minute and 30 days")
+	}
+	qdayStatus, qdayBalance, bitcoinBalance, err := s.walletSnapshot(ctx)
+	if err != nil {
+		return relay.Record{}, err
+	}
+	var give, receive order.Amount
+	if request.GiveAsset == "QDAY" {
+		give = order.Amount{Asset: "QDAY", Atomic: ""}
+		receive = order.Amount{Asset: "BTC", Atomic: ""}
+		give.Atomic, err = decimalToAtomic(request.GiveAmount, qdayStatus.UnitAtomic)
+		if err == nil {
+			receive.Atomic, err = decimalToAtomic(request.ReceiveAmount, "100000000")
+		}
+		if err == nil {
+			err = requireAvailable(give.Atomic, qdayBalance.Spendable.Atomic, "QDAY")
+		}
+	} else {
+		give = order.Amount{Asset: "BTC", Atomic: ""}
+		receive = order.Amount{Asset: "QDAY", Atomic: ""}
+		give.Atomic, err = decimalToAtomic(request.GiveAmount, "100000000")
+		if err == nil {
+			receive.Atomic, err = decimalToAtomic(request.ReceiveAmount, qdayStatus.UnitAtomic)
+		}
+		if err == nil {
+			err = requireAvailable(give.Atomic, bitcoinBalance.Confirmed.Satoshis, "BTC")
+		}
+	}
+	if err != nil {
+		return relay.Record{}, err
+	}
+	now := time.Now().UTC()
+	payload, err := order.NewPayload(s.config.Network, qdayStatus.UnitAtomic, give, receive, lifetime, identity.Public().(ed25519.PublicKey), messagePublic, now)
+	if err != nil {
+		return relay.Record{}, err
+	}
+	signed, err := order.Sign(payload, identity, now)
+	if err != nil {
+		return relay.Record{}, err
+	}
+	record, err := s.relay.Publish(ctx, signed)
+	if err != nil {
+		return relay.Record{}, err
+	}
+	if err := record.Signed.Verify(now); err != nil || record.Signed.ID != signed.ID {
+		if err == nil {
+			err = errors.New("relay returned a different order")
+		}
+		return relay.Record{}, err
+	}
+	return record, nil
+}
+
+func (s *Service) CancelOffer(ctx context.Context, orderID string) (relay.Record, error) {
+	identity, _, cleanup, err := s.identities()
+	if err != nil {
+		return relay.Record{}, err
+	}
+	defer cleanup()
+	now := time.Now().UTC()
+	record, err := s.relay.Order(ctx, orderID)
+	if err != nil {
+		return relay.Record{}, err
+	}
+	if err := record.Signed.Verify(now); err != nil {
+		return relay.Record{}, err
+	}
+	if record.Signed.Order.MakerPublicKey != hex.EncodeToString(identity.Public().(ed25519.PublicKey)) {
+		return relay.Record{}, errors.New("this wallet does not own the offer")
+	}
+	cancellation, err := order.NewCancellation(record.Signed, identity, now)
+	if err != nil {
+		return relay.Record{}, err
+	}
+	return s.relay.Cancel(ctx, orderID, cancellation)
+}
+
+func (s *Service) AcceptOffer(ctx context.Context, orderID string) (swapstate.Negotiation, error) {
+	identity, messagePublic, cleanup, err := s.identities()
+	if err != nil {
+		return swapstate.Negotiation{}, err
+	}
+	defer cleanup()
+	now := time.Now().UTC()
+	record, err := s.relay.Order(ctx, orderID)
+	if err != nil {
+		return swapstate.Negotiation{}, err
+	}
+	if record.Status != relay.StatusOpen {
+		return swapstate.Negotiation{}, errors.New("offer is no longer open")
+	} else if err := record.Signed.Verify(now); err != nil {
+		return swapstate.Negotiation{}, err
+	}
+	qdayStatus, _, _, err := s.walletSnapshot(ctx)
+	if err != nil {
+		return swapstate.Negotiation{}, err
+	} else if record.Signed.Order.QDAYUnitAtomic != qdayStatus.UnitAtomic {
+		return swapstate.Negotiation{}, errors.New("offer uses a different QDAY consensus unit")
+	}
+	acceptance, err := trade.NewAcceptance(record.Signed, 15*time.Minute, identity, messagePublic, now)
+	if err != nil {
+		return swapstate.Negotiation{}, err
+	}
+	s.mu.RLock()
+	journal := s.journal
+	s.mu.RUnlock()
+	if journal == nil {
+		return swapstate.Negotiation{}, errors.New("swap journal is unavailable")
+	}
+	pending, _, err := journal.SavePendingAcceptance(record.Signed, acceptance, now)
+	if err != nil {
+		return swapstate.Negotiation{}, err
+	}
+	if _, err := s.relay.Accept(ctx, orderID, acceptance); err != nil {
+		return pending, err
+	}
+	return pending, nil
+}
+
+func (s *Service) MatchAcceptance(ctx context.Context, acceptanceID string) (swapstate.Swap, error) {
+	identity, _, cleanup, err := s.identities()
+	if err != nil {
+		return swapstate.Swap{}, err
+	}
+	defer cleanup()
+	s.mu.RLock()
+	journal := s.journal
+	s.mu.RUnlock()
+	if journal == nil {
+		return swapstate.Swap{}, errors.New("swap journal is unavailable")
+	}
+	negotiation, err := journal.IncomingAcceptance(acceptanceID)
+	if err != nil {
+		return swapstate.Swap{}, err
+	}
+	now := time.Now().UTC()
+	match, err := trade.NewMatch(negotiation.Order, negotiation.Acceptance, identity, now)
+	if err != nil {
+		return swapstate.Swap{}, err
+	}
+	record, _, err := journal.Create(swapstate.RoleMaker, negotiation.Order, negotiation.Acceptance, match, now)
+	if err != nil {
+		return swapstate.Swap{}, err
+	}
+	if _, err := s.relay.Match(ctx, negotiation.Order.ID, match); err != nil {
+		return record, err
+	}
+	if err := journal.RemoveIncomingAcceptance(acceptanceID); err != nil {
+		return record, err
+	}
+	return record, nil
+}
+
+func (s *Service) Negotiations() (Negotiations, error) {
+	s.mu.RLock()
+	journal := s.journal
+	s.mu.RUnlock()
+	if journal == nil {
+		return Negotiations{}, errors.New("swap journal is unavailable")
+	}
+	pending, err := journal.PendingAcceptances()
+	if err != nil {
+		return Negotiations{}, err
+	}
+	incoming, err := journal.IncomingAcceptances()
+	if err != nil {
+		return Negotiations{}, err
+	}
+	swaps, err := journal.List()
+	return Negotiations{Pending: pending, Incoming: incoming, Swaps: swaps}, err
+}
+
+func (s *Service) identities() (ed25519.PrivateKey, [32]byte, func(), error) {
+	s.mu.RLock()
+	if s.root == nil {
+		s.mu.RUnlock()
+		return nil, [32]byte{}, func() {}, errors.New("wallet is locked")
+	}
+	root := *s.root
+	s.mu.RUnlock()
+	identity, err := root.OrderIdentity()
+	if err != nil {
+		clear(root[:])
+		return nil, [32]byte{}, func() {}, err
+	}
+	messagePrivate, messagePublic, err := root.MessageIdentity()
+	clear(root[:])
+	if err != nil {
+		clear(identity)
+		return nil, [32]byte{}, func() {}, err
+	}
+	cleanup := func() {
+		clear(identity)
+		clear(messagePrivate[:])
+	}
+	return identity, messagePublic, cleanup, nil
+}
+
+func (s *Service) walletSnapshot(ctx context.Context) (walletd.Status, walletd.Balance, bitcoinwallet.Balance, error) {
+	s.mu.RLock()
+	qdayClient, bitcoinClient := s.client, s.bitcoinClient
+	s.mu.RUnlock()
+	if qdayClient == nil || bitcoinClient == nil {
+		return walletd.Status{}, walletd.Balance{}, bitcoinwallet.Balance{}, errors.New("local wallets are unavailable")
+	}
+	status, err := qdayClient.Status(ctx)
+	if err != nil {
+		return walletd.Status{}, walletd.Balance{}, bitcoinwallet.Balance{}, err
+	} else if !status.Synced {
+		return walletd.Status{}, walletd.Balance{}, bitcoinwallet.Balance{}, errors.New("QDAY wallet is still synchronizing")
+	}
+	qdayBalance, err := qdayClient.Balance(ctx)
+	if err != nil {
+		return walletd.Status{}, walletd.Balance{}, bitcoinwallet.Balance{}, err
+	}
+	bitcoinStatus, err := bitcoinClient.Status()
+	if err != nil {
+		return walletd.Status{}, walletd.Balance{}, bitcoinwallet.Balance{}, err
+	} else if !bitcoinStatus.WalletSynced {
+		return walletd.Status{}, walletd.Balance{}, bitcoinwallet.Balance{}, errors.New("Bitcoin wallet is still synchronizing")
+	}
+	bitcoinBalance, err := bitcoinClient.Balance()
+	return status, qdayBalance, bitcoinBalance, err
+}
+
+func decimalToAtomic(value, unit string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.HasPrefix(value, "+") || strings.HasPrefix(value, "-") {
+		return "", errors.New("amount must be a positive decimal number")
+	}
+	decimals := len(unit) - 1
+	if decimals < 0 || unit != "1"+strings.Repeat("0", decimals) {
+		return "", errors.New("asset unit is not a decimal power")
+	}
+	parts := strings.Split(value, ".")
+	if len(parts) > 2 || parts[0] == "" || (len(parts) == 2 && parts[1] == "") {
+		return "", errors.New("amount must be a plain decimal number")
+	}
+	whole, fraction := parts[0], ""
+	if len(parts) == 2 {
+		fraction = parts[1]
+	}
+	if len(fraction) > decimals {
+		return "", fmt.Errorf("amount has more than %d decimal places", decimals)
+	}
+	for _, part := range []string{whole, fraction} {
+		for _, character := range part {
+			if character < '0' || character > '9' {
+				return "", errors.New("amount must be a plain decimal number")
+			}
+		}
+	}
+	whole = strings.TrimLeft(whole, "0")
+	if whole == "" {
+		whole = "0"
+	}
+	encoded := strings.TrimLeft(whole+fraction+strings.Repeat("0", decimals-len(fraction)), "0")
+	if encoded == "" {
+		return "", errors.New("amount must be greater than zero")
+	}
+	return encoded, nil
+}
+
+func requireAvailable(wanted, available, asset string) error {
+	want, okWant := new(big.Int).SetString(wanted, 10)
+	have, okHave := new(big.Int).SetString(available, 10)
+	if !okWant || !okHave || have.Sign() < 0 {
+		return errors.New("wallet returned an invalid balance")
+	}
+	if want.Cmp(have) > 0 {
+		return fmt.Errorf("insufficient confirmed %s balance", asset)
+	}
+	return nil
+}
+
+func (s *Service) syncRelay(ctx context.Context) error {
+	s.mu.RLock()
+	unlocked := s.root != nil
+	journal := s.journal
+	s.mu.RUnlock()
+	if !unlocked || journal == nil {
+		return nil
+	}
+	if !s.relaySyncMu.TryLock() {
+		return nil
+	}
+	defer s.relaySyncMu.Unlock()
+	if time.Since(s.lastRelaySync) < 3*time.Second {
+		return nil
+	}
+	s.lastRelaySync = time.Now()
+	identity, _, cleanup, err := s.identities()
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	identityPublic := hex.EncodeToString(identity.Public().(ed25519.PublicKey))
+	cursor, err := journal.RelayCursor()
+	if err != nil {
+		return err
+	}
+	for pages := 0; pages < 10; pages++ {
+		now := time.Now().UTC()
+		poll, err := trade.NewPoll(s.config.Network, cursor, 100, identity, now)
+		if err != nil {
+			return err
+		}
+		page, err := s.relay.Poll(ctx, poll)
+		if err != nil {
+			return err
+		}
+		for _, item := range page.Items {
+			switch item.Kind {
+			case relay.MailboxAcceptance:
+				if item.Acceptance == nil {
+					return errors.New("relay returned an empty acceptance mailbox item")
+				}
+				acceptance := item.Acceptance.Signed
+				orderRecord, err := s.relay.Order(ctx, acceptance.Acceptance.OrderID)
+				if err != nil {
+					return err
+				}
+				verificationTime := now
+				if acceptance.Acceptance.ExpiresAt <= now.Unix() {
+					verificationTime = time.Unix(item.ReceivedAt, 0)
+				}
+				if err := acceptance.Verify(orderRecord.Signed, verificationTime); err != nil {
+					return fmt.Errorf("invalid acceptance in relay mailbox: %w", err)
+				}
+				if orderRecord.Signed.Order.MakerPublicKey != identityPublic {
+					return errors.New("relay routed an acceptance to the wrong identity")
+				}
+				if acceptance.Acceptance.ExpiresAt > now.Unix() {
+					if _, _, err := journal.SaveIncomingAcceptance(orderRecord.Signed, acceptance, now); err != nil {
+						return err
+					}
+				}
+			case relay.MailboxMatch:
+				if item.Match == nil {
+					return errors.New("relay returned an empty match mailbox item")
+				}
+				negotiation, err := journal.PendingAcceptanceByMatch(*item.Match)
+				if errors.Is(err, swapstate.ErrNotFound) {
+					orderRecord, fetchErr := s.relay.Order(ctx, item.Match.Match.OrderID)
+					if fetchErr != nil {
+						return fetchErr
+					} else if orderRecord.Acceptance == nil {
+						return errors.New("matched order does not contain its acceptance")
+					}
+					negotiation = swapstate.Negotiation{Order: orderRecord.Signed, Acceptance: *orderRecord.Acceptance}
+				} else if err != nil {
+					return err
+				}
+				if negotiation.Acceptance.Acceptance.TakerPublicKey != identityPublic {
+					return errors.New("relay routed a match to the wrong identity")
+				}
+				if _, _, err := journal.Create(swapstate.RoleTaker, negotiation.Order, negotiation.Acceptance, *item.Match, now); err != nil {
+					return err
+				}
+				if err := journal.RemovePendingAcceptance(negotiation.Acceptance.ID); err != nil {
+					return err
+				}
+			case relay.MailboxMessage:
+				if item.Message == nil {
+					return errors.New("relay returned an empty message mailbox item")
+				}
+				if _, err := journal.SaveRelayMessage(*item.Message, now); err != nil {
+					return fmt.Errorf("invalid encrypted relay message: %w", err)
+				}
+			default:
+				return fmt.Errorf("relay returned unknown mailbox item %q", item.Kind)
+			}
+			if item.Cursor <= cursor {
+				return errors.New("relay mailbox cursor did not advance")
+			}
+			cursor = item.Cursor
+			if err := journal.SetRelayCursor(cursor); err != nil {
+				return err
+			}
+		}
+		if !page.HasMore {
+			return nil
+		}
+	}
+	return errors.New("relay mailbox exceeded ten pages in one synchronization")
+}
+
 func (s *Service) State(ctx context.Context) State {
 	s.mu.RLock()
 	state := State{Configured: s.Configured(), Unlocked: s.root != nil, Network: s.config.Network, RelayURL: s.config.RelayURL, Error: s.lastError}
 	client, bitcoinClient := s.client, s.bitcoinClient
 	s.mu.RUnlock()
+	if state.Unlocked {
+		if identity, _, cleanup, err := s.identities(); err == nil {
+			state.IdentityPublicKey = hex.EncodeToString(identity.Public().(ed25519.PublicKey))
+			cleanup()
+		}
+	}
 	queryCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	if client != nil {
@@ -460,6 +942,23 @@ func (s *Service) State(ctx context.Context) State {
 				state.BitcoinBalance = &balance
 			}
 		}
+	}
+	relayCtx, relayCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer relayCancel()
+	if err := s.syncRelay(relayCtx); err != nil {
+		state.RelayError = err.Error()
+	}
+	if status, err := s.relay.Status(relayCtx); err != nil {
+		state.RelayError = joinError(state.RelayError, err)
+	} else {
+		state.Relay = &status
+	}
+	if negotiations, err := s.Negotiations(); err == nil {
+		state.PendingTrades = len(negotiations.Pending)
+		state.IncomingTrades = len(negotiations.Incoming)
+		state.ActiveSwaps = len(negotiations.Swaps)
+	} else if state.Configured {
+		state.RelayError = joinError(state.RelayError, err)
 	}
 	return state
 }

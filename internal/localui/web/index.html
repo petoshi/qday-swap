@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="theme-color" content="#111216">
+  <meta name="theme-color" content="#030403">
   <meta name="description" content="QDAY Swap local wallet and atomic swap application.">
   <title>QDAY Swap</title>
   <link rel="icon" href="/favicon.svg">
@@ -11,27 +11,35 @@
 </head>
 <body>
   <header class="site-header">
-    <a class="brand" href="#market" aria-label="QDAY Swap">
-      <img src="/assets/logo.webp" alt="QDAY">
-      <i></i>
-      <strong>SWAP</strong>
-    </a>
-    <nav id="main-nav" aria-label="Main navigation">
-      <a href="#market" data-route="market">Market</a>
-      <a href="#create" data-route="create">Create offer</a>
-      <a href="#swaps" data-route="swaps">Active swaps</a>
-      <a href="#history" data-route="history">History</a>
-      <a href="#settings" data-route="settings">Settings</a>
-    </nav>
-    <div class="node-pill waiting" id="node-pill"><i></i><span>STARTING</span></div>
+    <div class="header-line">
+      <a class="brand" href="#market" aria-label="QDAY Swap"><strong>QDAY</strong><span>/</span><b>SWAP</b></a>
+      <div class="header-stats">
+        <span>QDAY <b id="header-qday">—</b></span>
+        <span>BITCOIN <b id="header-bitcoin">—</b></span>
+        <span>ACTIVE <b id="header-swaps">0</b></span>
+        <span>BTC/USD <b id="header-btc-usd">—</b></span>
+        <span>QDAY/USD <b id="header-qday-usd">N/A</b></span>
+      </div>
+      <div class="node-pill waiting" id="node-pill"><i></i><span>STARTING</span></div>
+    </div>
+    <div class="header-line header-tools">
+      <nav id="main-nav" aria-label="Main navigation">
+        <a href="#market" data-route="market">ORDERS</a>
+        <a href="#create" data-route="create">CREATE</a>
+        <a href="#swaps" data-route="swaps">SWAPS</a>
+        <a href="#history" data-route="history">HISTORY</a>
+        <a href="#settings" data-route="settings">SETTINGS</a>
+      </nav>
+      <a class="public-link" href="https://dex.pqday.com" target="_blank" rel="noreferrer">PUBLIC RELAY ↗</a>
+    </div>
   </header>
 
   <main id="app" aria-live="polite">
-    <section class="loading"><div></div><p>Opening local wallet…</p></section>
+    <section class="loading"><p><b>$</b> opening local wallet<span class="terminal-cursor">_</span></p></section>
   </main>
 
   <footer>
-    <div class="footer-brand"><img src="/assets/logo.webp" alt="QDAY"><span>HYBRID POST QUANTUM ATOMIC SWAPS</span></div>
+    <div class="footer-brand"><strong>QDAY / SWAP</strong><span>LOCAL HYBRID POST QUANTUM ATOMIC SWAPS</span></div>
     <div class="footer-links">
       <a href="https://dex.pqday.com" target="_blank" rel="noreferrer">Public market</a>
       <a href="https://explorer.pqday.com" target="_blank" rel="noreferrer">Explorer</a>

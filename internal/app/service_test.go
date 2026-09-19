@@ -3,6 +3,8 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,11 +15,33 @@ import (
 	"time"
 
 	"github.com/petoshi/qday-swap/internal/bitcoinwallet"
+	"github.com/petoshi/qday-swap/internal/order"
+	"github.com/petoshi/qday-swap/internal/relay"
+	"github.com/petoshi/qday-swap/internal/swapstate"
 	"github.com/petoshi/qday-swap/internal/walletd"
 	"github.com/petoshi/qday-swap/internal/walletroot"
 )
 
 const fakeToken = "0001020304050607080900010203040506070809000102030405060708090001"
+
+func testRelayURL(t *testing.T) string {
+	t.Helper()
+	store, err := relay.OpenStore(filepath.Join(t.TempDir(), "relay.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := relay.NewServer(store, relay.Config{
+		Network: "mainnet", PublicURL: "https://dex.pqday.com", Version: "test",
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer(server.Handler())
+	t.Cleanup(func() { httpServer.Close(); _ = store.Close() })
+	return httpServer.URL
+}
 
 type fakeWalletd struct {
 	dataDir string
@@ -76,6 +100,7 @@ func (f *fakeBitcoin) ReceiveAddress() (string, error) {
 }
 
 func TestSetupLockUnlockAndReceiveAddress(t *testing.T) {
+	relayURL := testRelayURL(t)
 	var mu sync.Mutex
 	unlocked := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -107,7 +132,7 @@ func TestSetupLockUnlockAndReceiveAddress(t *testing.T) {
 
 	ctx := context.Background()
 	dataDir := filepath.Join(t.TempDir(), "qday-swap")
-	service, err := New(ctx, Config{DataDir: dataDir, WalletdBinary: "unused", Network: "mainnet", RelayURL: "https://dex.pqday.com"})
+	service, err := New(ctx, Config{DataDir: dataDir, WalletdBinary: "unused", Network: "mainnet", RelayURL: relayURL})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,5 +180,90 @@ func TestSetupLockUnlockAndReceiveAddress(t *testing.T) {
 	}
 	if err := service.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestTwoApplicationsPublishAcceptAndMatchOffer(t *testing.T) {
+	relayURL := testRelayURL(t)
+	qdayServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+fakeToken {
+			http.Error(w, `{"error":"authentication required"}`, http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/wallet/unlock":
+			_, _ = w.Write([]byte(`{"unlocked":true}`))
+		case "/v1/wallet/lock":
+			_, _ = w.Write([]byte(`{"unlocked":false}`))
+		case "/v1/status":
+			_ = json.NewEncoder(w).Encode(walletd.Status{Network: "qday-mainnet", Height: 12_000, ScanHeight: 12_000, Synced: true, NetworkSynced: true, Connections: 4, Unlocked: true, UnitAtomic: order.QDAYLegacyUnit})
+		case "/v1/balance":
+			_ = json.NewEncoder(w).Encode(walletd.Balance{Height: 12_000, Synced: true, UnitAtomic: order.QDAYLegacyUnit, Spendable: walletd.Amount{Atomic: "5000000000000000000000000", QDAY: "5"}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer qdayServer.Close()
+
+	newApplication := func(name string) *Service {
+		service, err := New(context.Background(), Config{
+			DataDir: filepath.Join(t.TempDir(), name), WalletdBinary: "unused",
+			Network: "mainnet", RelayURL: relayURL,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		service.factory = func(path string) (qdayProcess, error) {
+			return &fakeWalletd{dataDir: path, server: qdayServer}, nil
+		}
+		bitcoin := &fakeBitcoin{}
+		service.bitcoinFactory = func(string) (bitcoinProcess, error) { return bitcoin, nil }
+		if _, err := service.Setup(context.Background(), "correct horse battery staple", ""); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = service.Close() })
+		return service
+	}
+
+	maker := newApplication("maker")
+	taker := newApplication("taker")
+	offer, err := maker.CreateOffer(context.Background(), CreateOfferRequest{
+		GiveAsset: "QDAY", GiveAmount: "1.25", ReceiveAmount: "0.0001", LifetimeMinutes: 60,
+	})
+	if err != nil {
+		t.Fatal(err)
+	} else if offer.Status != relay.StatusOpen {
+		t.Fatalf("offer status = %q", offer.Status)
+	}
+	pending, err := taker.AcceptOffer(context.Background(), offer.Signed.ID)
+	if err != nil {
+		t.Fatal(err)
+	} else if pending.Order.ID != offer.Signed.ID {
+		t.Fatalf("pending order = %q", pending.Order.ID)
+	}
+	maker.lastRelaySync = time.Time{}
+	state := maker.State(context.Background())
+	if state.RelayError != "" || state.IncomingTrades != 1 {
+		t.Fatalf("maker state = %#v", state)
+	}
+	negotiations, err := maker.Negotiations()
+	if err != nil || len(negotiations.Incoming) != 1 {
+		t.Fatalf("maker negotiations=%#v err=%v", negotiations, err)
+	}
+	matched, err := maker.MatchAcceptance(context.Background(), negotiations.Incoming[0].Acceptance.ID)
+	if err != nil {
+		t.Fatal(err)
+	} else if matched.Phase != swapstate.PhaseMatched || matched.Role != swapstate.RoleMaker {
+		t.Fatalf("maker swap = %#v", matched)
+	}
+	taker.lastRelaySync = time.Time{}
+	state = taker.State(context.Background())
+	if state.RelayError != "" || state.PendingTrades != 0 || state.ActiveSwaps != 1 {
+		t.Fatalf("taker state = %#v", state)
+	}
+	negotiations, err = taker.Negotiations()
+	if err != nil || len(negotiations.Swaps) != 1 || negotiations.Swaps[0].Role != swapstate.RoleTaker {
+		t.Fatalf("taker negotiations=%#v err=%v", negotiations, err)
 	}
 }

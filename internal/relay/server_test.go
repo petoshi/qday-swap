@@ -151,6 +151,16 @@ func TestWebRoutesAndSecurityHeaders(t *testing.T) {
 			t.Fatalf("route %s missing security headers", route)
 		}
 	}
+	for _, asset := range []string{"/app.js?v=4", "/styles.css?v=4"} {
+		response, err := server.Client().Get(server.URL + asset)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusOK || response.Header.Get("Cache-Control") != "no-cache" {
+			t.Fatalf("asset %s status=%d cache-control=%q", asset, response.StatusCode, response.Header.Get("Cache-Control"))
+		}
+	}
 	response, err := server.Client().Get(server.URL + "/api/nope")
 	if err != nil {
 		t.Fatal(err)
@@ -158,6 +168,44 @@ func TestWebRoutesAndSecurityHeaders(t *testing.T) {
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusNotFound || !strings.HasPrefix(response.Header.Get("Content-Type"), "application/json") {
 		t.Fatalf("unknown API status=%d content-type=%q", response.StatusCode, response.Header.Get("Content-Type"))
+	}
+}
+
+func TestBitcoinUSDPriceIsValidatedCachedAndSurvivesProviderFailure(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	requests := 0
+	provider := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		requests++
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(response, `{"data":{"amount":"81401.385","base":"BTC","currency":"USD"}}`)
+	}))
+	store := openTestStore(t)
+	relayServer, err := NewServer(store, Config{
+		Network: "mainnet", PublicURL: "https://dex.pqday.com", Version: "test",
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Now: func() time.Time { return now },
+		PriceURL: provider.URL, HTTPClient: provider.Client(), PriceTTL: 20 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(relayServer.Handler())
+	t.Cleanup(server.Close)
+
+	for range 2 {
+		response, decoded := requestJSON(t, server.Client(), http.MethodGet, server.URL+"/api/v1/price", nil)
+		if response.StatusCode != http.StatusOK || decoded["usd"] != "81401.385" || decoded["source"] != "Coinbase" {
+			t.Fatalf("price status=%d body=%#v", response.StatusCode, decoded)
+		}
+	}
+	if requests != 1 {
+		t.Fatalf("provider requests=%d, want 1", requests)
+	}
+
+	provider.Close()
+	now = now.Add(21 * time.Second)
+	response, decoded := requestJSON(t, server.Client(), http.MethodGet, server.URL+"/api/v1/price", nil)
+	if response.StatusCode != http.StatusOK || decoded["stale"] != true || decoded["usd"] != "81401.385" {
+		t.Fatalf("stale price status=%d body=%#v", response.StatusCode, decoded)
 	}
 }
 
@@ -188,6 +236,12 @@ func TestNegotiationAndEncryptedMailboxAPI(t *testing.T) {
 	response, decoded = requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/v1/orders/"+fixture.order.ID+"/match", fixture.match)
 	if response.StatusCode != http.StatusOK || decoded["status"] != string(StatusMatched) {
 		t.Fatalf("match status=%d body=%#v", response.StatusCode, decoded)
+	}
+	response, decoded = requestJSON(t, server.Client(), http.MethodGet, server.URL+"/api/v1/status", nil)
+	stats := decoded["stats"].(map[string]any)
+	lastTrade := stats["lastTrade"].(map[string]any)
+	if response.StatusCode != http.StatusOK || lastTrade["qdayAtomic"] == "" || lastTrade["btcAtomic"] == "" || lastTrade["matchedAt"] != float64(fixture.match.Match.CreatedAt) {
+		t.Fatalf("last trade status=%d body=%#v", response.StatusCode, decoded)
 	}
 	message, err := trade.EncryptMessage("mainnet", fixture.order.ID, fixture.acceptance.Acceptance.TradeID, 1,
 		fixture.makerPrivate, fixture.takerPrivate.Public().(ed25519.PublicKey), fixture.makerMessagePrivate,

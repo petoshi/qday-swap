@@ -2,12 +2,20 @@ const root = document.querySelector('#app');
 const relayPill = document.querySelector('#relay-pill');
 const relayPillBox = relayPill.parentElement;
 const toast = document.querySelector('#toast');
+const headerOpen = document.querySelector('#header-open');
+const headerDay = document.querySelector('#header-day');
+const headerTotal = document.querySelector('#header-total');
+const headerBitcoinUSD = document.querySelector('#header-btc-usd');
+const headerQDAYUSD = document.querySelector('#header-qday-usd');
 
 let routeVersion = 0;
 let refreshTimer;
 let toastTimer;
 let statusCache;
 let directionFilter = '';
+let viewFingerprint = '';
+let bitcoinUSD = 0;
+let lastTrade = null;
 
 const escapeHTML = value => String(value ?? '').replace(/[&<>'"]/g, character => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
@@ -109,6 +117,33 @@ function price(order) {
   return formatRatio(satoshis * BigInt(order.qdayUnitAtomic), qdayAtomic * 100000000n, 8);
 }
 
+function dollars(value, bitcoin = false) {
+  if (!Number.isFinite(value) || value <= 0) return '$—';
+  const maximumFractionDigits = bitcoin ? 0 : value >= 1 ? 4 : value >= .01 ? 6 : 8;
+  return new Intl.NumberFormat('en-US', {
+    style: 'currency', currency: 'USD', minimumFractionDigits: 0, maximumFractionDigits
+  }).format(value);
+}
+
+function refreshQDAYDollarPrice() {
+  if (!lastTrade) {
+    headerQDAYUSD.textContent = 'N/A';
+    headerQDAYUSD.title = 'No matched trades yet';
+    return;
+  }
+  if (!bitcoinUSD) {
+    headerQDAYUSD.textContent = '—';
+    return;
+  }
+  const btcPerQDAY = formatRatio(
+    BigInt(lastTrade.btcAtomic) * BigInt(lastTrade.qdayUnitAtomic),
+    BigInt(lastTrade.qdayAtomic) * 100000000n,
+    12
+  );
+  headerQDAYUSD.textContent = dollars(Number(btcPerQDAY) * bitcoinUSD);
+  headerQDAYUSD.title = `Last matched trade · ${new Date(lastTrade.matchedAt * 1000).toLocaleString()}`;
+}
+
 function side(order) {
   return order.give.asset === 'QDAY' ? {className: 'sell', label: 'SELL QDAY'} : {className: 'buy', label: 'BUY QDAY'};
 }
@@ -177,6 +212,11 @@ async function loadStatus() {
     statusCache = await api('/api/v1/status');
     relayPill.textContent = `${statusCache.network.toUpperCase()} LIVE`;
     relayPillBox.classList.remove('connecting', 'offline');
+    headerOpen.textContent = commas(statusCache.stats.open);
+    headerDay.textContent = commas(statusCache.stats.created24h);
+    headerTotal.textContent = commas(statusCache.stats.total);
+    lastTrade = statusCache.stats.lastTrade || null;
+    refreshQDAYDollarPrice();
     return statusCache;
   } catch (error) {
     relayPill.textContent = 'RELAY OFFLINE';
@@ -186,45 +226,94 @@ async function loadStatus() {
   }
 }
 
-function hero(status) {
-  return `<section class="hero">
-    <div class="hero-copy"><span class="kicker">QDAY ↔ BITCOIN</span><h1>HYBRID POST QUANTUM ATOMIC SWAPS.</h1><p>QDAY protects its side with Ed25519 and SLH DSA. Bitcoin settles through a Native SegWit HTLC. One SHA 256 secret completes both sides.</p></div>
-    <div class="hero-proof"><span>SWAP PROTOCOL</span><div class="proof-line"><i></i>QDAY · ED25519 + SLH DSA</div><div class="proof-line"><i></i>BITCOIN · NATIVE SEGWIT P2WSH</div><div class="proof-line"><i></i>SHA 256 HASHLOCK + TIMED REFUNDS</div></div>
-  </section>
-  <section class="metrics">
-    ${metric('Open offers', commas(status.stats.open), 'available now')}
-    ${metric('Orders today', commas(status.stats.created24h), 'received in 24 hours')}
-    ${metric('All signed orders', commas(status.stats.total), 'public relay history')}
-    ${metric('Protocol', 'HYBRID PQ', 'QDAY ↔ Bitcoin')}
+async function loadPrice() {
+  try {
+    const result = await api('/api/v1/price');
+    const numeric = Number(result.usd);
+    if (!Number.isFinite(numeric) || numeric <= 0) throw new Error('invalid BTC/USD price');
+    bitcoinUSD = numeric;
+    headerBitcoinUSD.textContent = dollars(bitcoinUSD, true);
+    headerBitcoinUSD.title = `${result.source} · ${new Date(result.updatedAt).toLocaleTimeString()}${result.stale ? ' · stale' : ''}`;
+    refreshQDAYDollarPrice();
+    return result;
+  } catch (_) {
+    if (!bitcoinUSD) headerBitcoinUSD.textContent = '—';
+    return null;
+  }
+}
+
+async function refreshPriceLoop() {
+  await loadPrice();
+  setTimeout(refreshPriceLoop, 20000);
+}
+
+function marketHeader() {
+  return `<section class="terminal-head">
+    <div><span class="command">$ qday-swap orders --market QDAY/BTC</span>
+      <h1>QDAY / BTC ORDER BOOK</h1>
+    <p>Signed atomic swap offers. Keys and signing stay in the local app.</p>
+    </div>
+    <pre class="ascii-swap" aria-label="QDAY to Bitcoin atomic swap">+---------------------+       +---------------------+
+| QDAY                |       | BITCOIN             |
+| ED25519 + SLH-DSA   |&lt;-----&gt;| NATIVE SEGWIT HTLC |
++---------------------+ SHA256 +---------------------+</pre>
   </section>`;
 }
 
-async function renderMarket(token) {
+async function renderMarket(token, silent = false) {
   const params = new URLSearchParams(location.search);
   const page = Math.max(1, Number(params.get('page') || 1));
   const query = new URLSearchParams({status: 'open', page: String(page), limit: '20'});
   if (directionFilter) query.set('giveAsset', directionFilter);
   const [status, orders] = await Promise.all([loadStatus(), api(`/api/v1/orders?${query}`)]);
   if (token !== routeVersion) return;
-  root.innerHTML = `${hero(status)}
-    <section class="section-heading"><div><h2>OPEN ORDERS.</h2><p>Whole order fills for the first release. The local app verifies every term again.</p></div><span class="update">UPDATED ${escapeHTML(new Date().toLocaleTimeString())}</span></section>
-    <div class="toolbar"><strong>SHOW</strong>
+  const fingerprint = JSON.stringify({view: 'market', page, directionFilter, orders});
+  if (silent && document.querySelector('#market-orders')) {
+    if (fingerprint !== viewFingerprint) {
+      document.querySelector('#market-orders tbody').innerHTML = orderRows(orders.items);
+      document.querySelector('#market-pagination').innerHTML = pagination(orders.page, orders.totalPages, '/');
+      document.querySelectorAll('[data-filter]').forEach(button => button.classList.toggle('active', button.dataset.filter === directionFilter));
+      viewFingerprint = fingerprint;
+    }
+    const updated = document.querySelector('.toolbar .update');
+    if (updated) updated.textContent = `UPDATED ${new Date().toLocaleTimeString()}`;
+    return;
+  }
+  viewFingerprint = fingerprint;
+  root.innerHTML = `${marketHeader()}
+    <div class="toolbar"><strong>FILTER</strong>
       <button class="filter-button ${directionFilter === '' ? 'active' : ''}" data-filter="">ALL</button>
       <button class="filter-button ${directionFilter === 'BTC' ? 'active' : ''}" data-filter="BTC">BUY QDAY</button>
       <button class="filter-button ${directionFilter === 'QDAY' ? 'active' : ''}" data-filter="QDAY">SELL QDAY</button>
+      <span class="update">UPDATED ${escapeHTML(new Date().toLocaleTimeString())}</span>
     </div>
-    <section class="card">${orderTable(orders.items)}</section>
-    ${pagination(orders.page, orders.totalPages, '/')}`;
+    <section class="card" id="market-orders">${orderTable(orders.items)}</section>
+    <div id="market-pagination">${pagination(orders.page, orders.totalPages, '/')}</div>`;
 }
 
-async function renderActivity(token) {
+async function renderActivity(token, silent = false) {
   const params = new URLSearchParams(location.search);
   const page = Math.max(1, Number(params.get('page') || 1));
-  const orders = await api(`/api/v1/orders?status=all&page=${page}&limit=20`);
+  const [orders] = await Promise.all([
+    api(`/api/v1/orders?status=all&page=${page}&limit=20`),
+    loadStatus().catch(() => null)
+  ]);
   if (token !== routeVersion) return;
+  const fingerprint = JSON.stringify({view: 'activity', page, orders});
+  if (silent && document.querySelector('#activity-orders')) {
+    if (fingerprint !== viewFingerprint) {
+      document.querySelector('#activity-orders tbody').innerHTML = orderRows(orders.items, true);
+      document.querySelector('#activity-pagination').innerHTML = pagination(orders.page, orders.totalPages, '/activity');
+      const total = document.querySelector('#activity-total');
+      if (total) total.textContent = `${commas(orders.total)} orders`;
+      viewFingerprint = fingerprint;
+    }
+    return;
+  }
+  viewFingerprint = fingerprint;
   root.innerHTML = `<section class="page-header"><nav class="breadcrumbs"><a class="route-link" href="/">Order book</a><i>/</i><span>Activity</span></nav><h1>ORDER ACTIVITY.</h1><p>Open, cancelled and expired signed offers. Newest first.</p></section>
-    <section class="card"><div class="card-header"><h2>Relay history</h2><span class="card-meta">${commas(orders.total)} orders</span></div>${orderTable(orders.items, true)}</section>
-    ${pagination(orders.page, orders.totalPages, '/activity')}`;
+    <section class="card" id="activity-orders"><div class="card-header"><h2>Relay history</h2><span class="card-meta" id="activity-total">${commas(orders.total)} orders</span></div>${orderTable(orders.items, true)}</section>
+    <div id="activity-pagination">${pagination(orders.page, orders.totalPages, '/activity')}</div>`;
 }
 
 function hexBytes(value) {
@@ -317,7 +406,38 @@ async function renderOrder(token, id) {
 }
 
 function renderProtocol() {
-  root.innerHTML = `<section class="page-header"><nav class="breadcrumbs"><a class="route-link" href="/">Order book</a><i>/</i><span>Protocol</span></nav><h1>HYBRID POST QUANTUM ATOMIC SWAPS.</h1><p>QDAY and Bitcoin use different signature systems and share one SHA 256 hashlock.</p></section>
+  root.innerHTML = `<nav class="breadcrumbs protocol-breadcrumbs"><a class="route-link" href="/">Order book</a><i>/</i><span>Protocol</span></nav>
+    <section class="protocol-download">
+      <div class="download-intro"><span class="command">$ install qday-swap</span><h1>DOWNLOAD QDAY SWAP.</h1><p>This website shows the public order book. The swap itself runs in the QDAY Swap application on your computer. Download the app, open your local wallet, then create an offer or accept one from this order book.</p></div>
+      <div class="download-grid">
+        <a class="download-card" href="https://github.com/petoshi/qday-swap/releases/latest/download/QDAY-Swap-windows-amd64.zip">
+          <svg class="os-icon" viewBox="0 0 64 64" aria-hidden="true"><path d="M7 11l22-3v22H7V11zm26-4l24-3v26H33V7zM7 34h22v22L7 53V34zm26 0h24v26l-24-3V34z"/></svg>
+          <span><strong>WINDOWS</strong><small>X86 64 · ZIP</small></span><b>DOWNLOAD ↓</b>
+        </a>
+        <a class="download-card" href="https://github.com/petoshi/qday-swap/releases/latest/download/QDAY-Swap-linux-amd64.tar.gz">
+          <svg class="os-icon linux-icon" viewBox="0 0 64 64" aria-hidden="true"><ellipse cx="32" cy="38" rx="18" ry="20"/><circle cx="32" cy="19" r="12"/><circle class="cut" cx="27" cy="17" r="2"/><circle class="cut" cx="37" cy="17" r="2"/><path class="cut-line" d="M27 24h10M20 52l-8 7m32-7l8 7"/></svg>
+          <span><strong>LINUX</strong><small>X86 64 · TAR.GZ</small></span><b>DOWNLOAD ↓</b>
+        </a>
+        <a class="download-card" href="https://github.com/petoshi/qday-swap/releases/latest/download/QDAY-Swap-linux-arm64.tar.gz">
+          <svg class="os-icon linux-icon" viewBox="0 0 64 64" aria-hidden="true"><ellipse cx="32" cy="38" rx="18" ry="20"/><circle cx="32" cy="19" r="12"/><circle class="cut" cx="27" cy="17" r="2"/><circle class="cut" cx="37" cy="17" r="2"/><path class="cut-line" d="M27 24h10M20 52l-8 7m32-7l8 7"/></svg>
+          <span><strong>LINUX</strong><small>ARM64 · TAR.GZ</small></span><b>DOWNLOAD ↓</b>
+        </a>
+        <a class="download-card" href="https://github.com/petoshi/qday-swap/releases/latest/download/QDAY-Swap-macos-universal.zip">
+          <svg class="os-icon apple-icon" viewBox="0 0 64 64" aria-hidden="true"><path d="M39 13c3-4 3-8 3-10-4 0-8 3-10 6-2 2-3 6-3 9 4 0 7-2 10-5zM49 35c0-8 7-12 7-12-4-6-10-7-13-7-6-1-11 4-14 4s-7-4-12-4C8 16 0 24 0 36c0 7 3 15 6 20 3 4 6 8 11 8 4 0 6-3 12-3s7 3 12 3 8-4 11-8c3-4 4-9 5-11-1 0-8-3-8-10z" transform="translate(4 -1) scale(.88)"/></svg>
+          <span><strong>MACOS</strong><small>UNIVERSAL · ZIP</small></span><b>DOWNLOAD ↓</b>
+        </a>
+      </div>
+    </section>
+    <section class="quickstart">
+      <header><span class="command">$ qday-swap quickstart</span><h2>THE SWAP RUNS LOCALLY.</h2><p>The downloaded application opens its interface in your browser, but it runs on your own computer. Your recovery phrase, wallet keys and signatures stay inside that local application.</p></header>
+      <div class="quickstart-grid">
+        <article><b>01</b><h3>OPEN THE APP.</h3><p>Extract the complete archive and run QDAY Swap. Your browser opens the local interface. Create a new wallet or import your existing 24 word recovery phrase.</p></article>
+        <article><b>02</b><h3>LET IT SYNC.</h3><p>The app starts a validating QDAY node and a Bitcoin light client. The status bar shows both chains. You do not need to download the full Bitcoin blockchain.</p></article>
+        <article><b>03</b><h3>FUND YOUR WALLET.</h3><p>Open Settings, copy your QDAY or Native SegWit Bitcoin receive address, and send the asset you want to trade. Wait until the app confirms the balance.</p></article>
+        <article><b>04</b><h3>CREATE OR TAKE.</h3><p>Create a signed offer in the app, or open an offer from this website. Review the exact amounts and expiry locally before approving the swap.</p></article>
+      </div>
+    </section>
+    <section class="page-header protocol-header"><h1>HYBRID POST QUANTUM ATOMIC SWAPS.</h1><p>QDAY and Bitcoin use different signature systems and share one SHA 256 hashlock.</p></section>
     <section class="protocol-grid">
       <article class="protocol-step"><b>01</b><h2>SIGN AN OFFER.</h2><p>The local application signs exact QDAY and Bitcoin atomic amounts, direction, expiry and network. The relay cannot edit a byte without breaking the signature.</p></article>
       <article class="protocol-step"><b>02</b><h2>LOCK ON BOTH CHAINS.</h2><p>Two local applications agree on the immutable terms and create independent hashlocked contracts. Private keys never reach this server.</p></article>
@@ -330,20 +450,23 @@ function markNavigation(route) {
   document.querySelectorAll('[data-nav]').forEach(link => link.classList.toggle('active', link.dataset.nav === route));
 }
 
-async function route() {
+async function route(silent = false) {
   clearTimeout(refreshTimer);
   const token = ++routeVersion;
   const pathname = location.pathname.replace(/\/+$/, '') || '/';
-  root.innerHTML = '<section class="loading-page"><div class="loader"></div><p>Loading signed orders…</p></section>';
+  if (!silent) {
+    viewFingerprint = '';
+    root.innerHTML = '<section class="loading-page"><p><b>$</b> loading signed orders<span class="terminal-cursor">_</span></p></section>';
+  }
   try {
     if (pathname === '/') {
       markNavigation('market');
-      await renderMarket(token);
-      refreshTimer = setTimeout(() => { if (location.pathname === '/') route(); }, 10000);
+      await renderMarket(token, silent);
+      refreshTimer = setTimeout(() => { if (location.pathname === '/') route(true); }, 20000);
     } else if (pathname === '/activity') {
       markNavigation('activity');
-      await renderActivity(token);
-      refreshTimer = setTimeout(() => { if (location.pathname === '/activity') route(); }, 15000);
+      await renderActivity(token, silent);
+      refreshTimer = setTimeout(() => { if (location.pathname === '/activity') route(true); }, 20000);
     } else if (pathname === '/protocol') {
       markNavigation('protocol');
       renderProtocol();
@@ -381,7 +504,7 @@ document.addEventListener('click', event => {
   if (filter) {
     directionFilter = filter.dataset.filter;
     history.replaceState({}, '', '/');
-    route();
+    route(true);
     return;
   }
   const copy = event.target.closest('[data-copy]');
@@ -396,5 +519,6 @@ document.addEventListener('keydown', event => {
   }
 });
 
-window.addEventListener('popstate', route);
+window.addEventListener('popstate', () => route());
+refreshPriceLoop();
 route();

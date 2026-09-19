@@ -4,37 +4,47 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="theme-color" content="#111216">
-  <meta name="description" content="Hybrid post quantum atomic swaps between QDAY and Bitcoin.">
+  <meta name="description" content="QDAY and Bitcoin atomic swap order relay.">
   <title>QDAY DEX</title>
   <link rel="icon" href="/favicon.svg">
-  <link rel="stylesheet" href="/styles.css?v=1">
+  <link rel="stylesheet" href="/styles.css?v=5">
 </head>
 <body>
   <header class="site-header">
-    <a class="brand route-link" href="/" aria-label="QDAY DEX home">
-      <img src="/assets/logo.webp" alt="QDAY">
-      <span></span>
-      <strong>DEX</strong>
-    </a>
-    <nav class="main-nav" aria-label="Main navigation">
-      <a class="route-link" data-nav="market" href="/">Order book</a>
-      <a class="route-link" data-nav="activity" href="/activity">Activity</a>
-      <a class="route-link" data-nav="protocol" href="/protocol">Protocol</a>
-    </nav>
-    <nav class="external-nav" aria-label="Project links">
-      <a href="https://explorer.pqday.com" target="_blank" rel="noreferrer">Explorer ↗</a>
-      <a href="https://pqday.com" target="_blank" rel="noreferrer">Website ↗</a>
-      <a href="https://github.com/petoshi/qday" target="_blank" rel="noreferrer">Code ↗</a>
-    </nav>
-    <div class="live-pill connecting"><i></i><span id="relay-pill">CONNECTING</span></div>
+    <div class="header-line">
+      <a class="brand route-link" href="/" aria-label="QDAY DEX home"><strong>QDAY</strong><span>/</span><b>DEX</b></a>
+      <div class="header-stats" aria-label="Relay statistics">
+        <span>OPEN <b id="header-open">—</b></span>
+        <span>24H <b id="header-day">—</b></span>
+        <span>TOTAL <b id="header-total">—</b></span>
+        <span>BTC/USD <b id="header-btc-usd">—</b></span>
+        <span>QDAY/USD <b id="header-qday-usd">N/A</b></span>
+      </div>
+      <div class="live-pill connecting"><i></i><span id="relay-pill">CONNECTING</span></div>
+    </div>
+    <div class="header-line header-tools">
+      <nav class="main-nav" aria-label="Main navigation">
+        <a class="route-link" data-nav="market" href="/">ORDERS</a>
+        <a class="route-link" data-nav="activity" href="/activity">ACTIVITY</a>
+        <a class="route-link" data-nav="protocol" href="/protocol">PROTOCOL</a>
+        <a href="https://explorer.pqday.com" target="_blank" rel="noreferrer">EXPLORER ↗</a>
+      </nav>
+      <nav class="downloads" aria-label="Download QDAY Swap">
+        <span>DOWNLOAD</span>
+        <a href="https://github.com/petoshi/qday-swap/releases/latest/download/QDAY-Swap-windows-amd64.zip">WINDOWS X64 ↓</a>
+        <a href="https://github.com/petoshi/qday-swap/releases/latest/download/QDAY-Swap-linux-amd64.tar.gz">LINUX X64 ↓</a>
+        <a href="https://github.com/petoshi/qday-swap/releases/latest/download/QDAY-Swap-linux-arm64.tar.gz">LINUX ARM64 ↓</a>
+        <a href="https://github.com/petoshi/qday-swap/releases/latest/download/QDAY-Swap-macos-universal.zip">MACOS ↓</a>
+      </nav>
+    </div>
   </header>
 
   <main id="app" aria-live="polite">
-    <section class="loading-page"><div class="loader"></div><p>Loading signed orders…</p></section>
+    <section class="loading-page"><p><b>$</b> connecting to relay<span class="terminal-cursor">_</span></p></section>
   </main>
 
   <footer>
-    <div class="footer-brand"><img src="/assets/logo.webp" alt="QDAY"><span>QDAY ↔ BTC ATOMIC SWAPS</span></div>
+    <div class="footer-brand"><strong>QDAY / DEX</strong><span>QDAY ↔ BTC ATOMIC SWAPS</span></div>
     <div class="footer-links">
       <a href="https://pqday.com" target="_blank" rel="noreferrer">Website</a>
       <a href="https://explorer.pqday.com" target="_blank" rel="noreferrer">Explorer</a>
@@ -44,6 +54,6 @@
   </footer>
 
   <div id="toast" class="toast" role="status"></div>
-  <script src="/app.js?v=1" defer></script>
+  <script src="/app.js?v=5" defer></script>
 </body>
 </html>

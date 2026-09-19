@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"github.com/petoshi/qday-swap/internal/app"
+	"github.com/petoshi/qday-swap/internal/relay"
+	"github.com/petoshi/qday-swap/internal/swapstate"
 	"github.com/petoshi/qday-swap/internal/walletd"
 )
 
@@ -26,6 +28,27 @@ func (fakeApplication) QDAYReceiveAddress(context.Context) (walletd.Address, err
 	return walletd.Address{Address: "qday1ptest"}, nil
 }
 func (fakeApplication) BitcoinReceiveAddress() (string, error) { return "bc1qtest", nil }
+func (fakeApplication) Orders(context.Context, string, int) (relay.ResultPage, error) {
+	return relay.ResultPage{Items: []relay.Record{}, Page: 1, PageSize: 20}, nil
+}
+func (fakeApplication) MarketPrice(context.Context) (relay.MarketPrice, error) {
+	return relay.MarketPrice{Pair: "BTC-USD", USD: "81401.385", Source: "test"}, nil
+}
+func (fakeApplication) CreateOffer(context.Context, app.CreateOfferRequest) (relay.Record, error) {
+	return relay.Record{}, nil
+}
+func (fakeApplication) CancelOffer(context.Context, string) (relay.Record, error) {
+	return relay.Record{}, nil
+}
+func (fakeApplication) AcceptOffer(context.Context, string) (swapstate.Negotiation, error) {
+	return swapstate.Negotiation{}, nil
+}
+func (fakeApplication) MatchAcceptance(context.Context, string) (swapstate.Swap, error) {
+	return swapstate.Swap{}, nil
+}
+func (fakeApplication) Negotiations() (app.Negotiations, error) {
+	return app.Negotiations{Pending: []swapstate.Negotiation{}, Incoming: []swapstate.Negotiation{}, Swaps: []swapstate.Swap{}}, nil
+}
 
 func TestBootstrapSessionHostAndOriginProtection(t *testing.T) {
 	const host = "127.0.0.1:42424"
