@@ -1,0 +1,29 @@
+# Private configuration and credentials
+/.env
+/.env.*
+/.private/
+*.key
+*.pem
+
+# Runtime state
+/data/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.log
+*.pid
+
+# Generated output
+/build/
+/dist/
+/coverage/
+coverage.*
+
+# Editors and operating systems
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*~
+*.swp

@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#111216">
+  <meta name="description" content="Hybrid post quantum atomic swaps between QDAY and Bitcoin.">
+  <title>QDAY DEX</title>
+  <link rel="icon" href="/favicon.svg">
+  <link rel="stylesheet" href="/styles.css?v=1">
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand route-link" href="/" aria-label="QDAY DEX home">
+      <img src="/assets/logo.webp" alt="QDAY">
+      <span></span>
+      <strong>DEX</strong>
+    </a>
+    <nav class="main-nav" aria-label="Main navigation">
+      <a class="route-link" data-nav="market" href="/">Order book</a>
+      <a class="route-link" data-nav="activity" href="/activity">Activity</a>
+      <a class="route-link" data-nav="protocol" href="/protocol">Protocol</a>
+    </nav>
+    <nav class="external-nav" aria-label="Project links">
+      <a href="https://explorer.pqday.com" target="_blank" rel="noreferrer">Explorer ↗</a>
+      <a href="https://pqday.com" target="_blank" rel="noreferrer">Website ↗</a>
+      <a href="https://github.com/petoshi/qday" target="_blank" rel="noreferrer">Code ↗</a>
+    </nav>
+    <div class="live-pill connecting"><i></i><span id="relay-pill">CONNECTING</span></div>
+  </header>
+
+  <main id="app" aria-live="polite">
+    <section class="loading-page"><div class="loader"></div><p>Loading signed orders…</p></section>
+  </main>
+
+  <footer>
+    <div class="footer-brand"><img src="/assets/logo.webp" alt="QDAY"><span>QDAY ↔ BTC ATOMIC SWAPS</span></div>
+    <div class="footer-links">
+      <a href="https://pqday.com" target="_blank" rel="noreferrer">Website</a>
+      <a href="https://explorer.pqday.com" target="_blank" rel="noreferrer">Explorer</a>
+      <a href="https://github.com/petoshi/qday" target="_blank" rel="noreferrer">QDAY source</a>
+      <a href="https://x.com/_petoshi" target="_blank" rel="noreferrer">petoshi</a>
+    </div>
+  </footer>
+
+  <div id="toast" class="toast" role="status"></div>
+  <script src="/app.js?v=1" defer></script>
+</body>
+</html>
