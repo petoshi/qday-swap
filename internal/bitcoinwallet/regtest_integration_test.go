@@ -26,6 +26,10 @@ import (
 const (
 	regtestRPCUser = "qday-swap-neutrino"
 	regtestRPCPass = "qday-swap-neutrino-test-password"
+	// Neutrino processes compact filters and wallet notifications
+	// asynchronously. Busy CI runners can need more than 20 seconds after a
+	// block is mined even though the node accepted it immediately.
+	regtestWalletSyncTimeout = 60 * time.Second
 )
 
 type regtestNode struct {
@@ -61,7 +65,14 @@ func startRegtestNode(t *testing.T) *regtestNode {
 	}
 	node := &regtestNode{
 		t: t, rpcURL: fmt.Sprintf("http://127.0.0.1:%d", rpcPort),
-		p2p: fmt.Sprintf("127.0.0.1:%d", p2pPort), http: &http.Client{Timeout: 10 * time.Second},
+		p2p: fmt.Sprintf("127.0.0.1:%d", p2pPort), http: &http.Client{
+			// Bitcoin Core may close an idle HTTP/1.1 connection while the
+			// Neutrino wallet processes a block. A fresh connection per regtest
+			// RPC keeps a stale keep-alive from surfacing as an EOF on the next
+			// state-changing request.
+			Transport: &http.Transport{DisableKeepAlives: true},
+			Timeout:   10 * time.Second,
+		},
 		logFile: logFile,
 	}
 	node.cmd = exec.Command(binary,
@@ -274,7 +285,7 @@ func TestNeutrinoSwapFundingClaimRestartAndReorg(t *testing.T) {
 	}
 	confirmationAddress := node.miningAddress()
 	node.mine(1, confirmationAddress)
-	waitFor(t, 20*time.Second, "funding confirmation", func() bool {
+	waitFor(t, regtestWalletSyncTimeout, "funding confirmation", func() bool {
 		transaction, lookupErr := client.Transaction(funding.TxID)
 		return lookupErr == nil && transaction.Confirmations >= 1
 	})
@@ -291,12 +302,12 @@ func TestNeutrinoSwapFundingClaimRestartAndReorg(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, 10*time.Second, "claim observation", func() bool {
+	waitFor(t, regtestWalletSyncTimeout, "claim observation", func() bool {
 		spend, findErr := client.FindSpend(funding)
 		return findErr == nil && spend.ID == claim.ID
 	})
 	claimBlock := node.mine(1, confirmationAddress)[0]
-	waitFor(t, 20*time.Second, "claim confirmation", func() bool {
+	waitFor(t, regtestWalletSyncTimeout, "claim confirmation", func() bool {
 		spend, findErr := client.FindSpend(funding)
 		if findErr != nil || spend.Confirmations < 1 {
 			return false
@@ -312,12 +323,12 @@ func TestNeutrinoSwapFundingClaimRestartAndReorg(t *testing.T) {
 	// competing chain and btcwallet rolls the transaction back to unmined.
 	node.mineEmpty(confirmationAddress)
 	node.mineEmpty(confirmationAddress)
-	waitFor(t, 20*time.Second, "reorganized claim in mempool", func() bool {
+	waitFor(t, regtestWalletSyncTimeout, "reorganized claim in mempool", func() bool {
 		spend, findErr := client.FindSpend(funding)
 		return findErr == nil && spend.Confirmations == 0
 	})
 	node.mine(1, confirmationAddress)
-	waitFor(t, 20*time.Second, "reconfirmed claim", func() bool {
+	waitFor(t, regtestWalletSyncTimeout, "reconfirmed claim", func() bool {
 		spend, findErr := client.FindSpend(funding)
 		return findErr == nil && spend.Confirmations >= 1
 	})
