@@ -25,11 +25,13 @@ import (
 )
 
 type engineQDAYChain struct {
-	mu       sync.Mutex
-	height   uint64
-	outputs  map[string]*walletd.SwapOutput
-	prepared map[string]enginePreparedQDAY
-	claims   map[string]enginePreparedQDAYClaim
+	mu                              sync.Mutex
+	height                          uint64
+	outputs                         map[string]*walletd.SwapOutput
+	prepared                        map[string]enginePreparedQDAY
+	claims                          map[string]enginePreparedQDAYClaim
+	rejectConfirmedClaimRebroadcast bool
+	claimBroadcasts                 int
 }
 
 type enginePreparedQDAY struct {
@@ -205,6 +207,10 @@ func (q *engineQDAY) BroadcastTransactionPackage(ctx context.Context, value wall
 		if output == nil || output.ID != claim.outputID || claim.secret == "" {
 			return walletd.BroadcastPackageResult{}, errors.New("test QDAY claim template is incomplete")
 		}
+		if output.Status == "claimed" && q.chain.rejectConfirmedClaimRebroadcast {
+			return walletd.BroadcastPackageResult{}, errors.New("transaction package must contain 1..4 transactions")
+		}
+		q.chain.claimBroadcasts++
 		height := q.chain.height
 		output.Status, output.RevealedSecret, output.SpendTransaction, output.SpendHeight = "claimed", claim.secret, value.TransactionIDs[0], &height
 		return walletd.BroadcastPackageResult{Package: value}, nil
@@ -649,6 +655,33 @@ func TestEngineCompletesWhenParticipantsReturnSequentially(t *testing.T) {
 				t.Fatalf("maker journal changed while its application was offline: %s", makerRecord.Phase)
 			}
 		})
+	}
+}
+
+func TestEngineDoesNotRebroadcastObservedProxyClaim(t *testing.T) {
+	trade := negotiateEngineTrade(t, "BTC", "0.0001", "1")
+	trade.qdayChain.rejectConfirmedClaimRebroadcast = true
+
+	// The maker publishes both deposits and leaves a portable QDAY claim
+	// template. The returning taker claims Bitcoin and broadcasts that QDAY claim.
+	trade.maker.driveSwaps(context.Background())
+	trade.taker.lastRelaySync = time.Time{}
+	if err := trade.taker.syncRelay(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	trade.taker.driveSwaps(context.Background())
+
+	record, err := trade.taker.journal.Swap(trade.swapID)
+	if err != nil {
+		t.Fatal(err)
+	} else if record.Phase != swapstate.PhaseComplete || record.LastError != "" {
+		t.Fatalf("returning taker did not complete: %s (%s)", record.Phase, record.LastError)
+	}
+	trade.qdayChain.mu.Lock()
+	broadcasts := trade.qdayChain.claimBroadcasts
+	trade.qdayChain.mu.Unlock()
+	if broadcasts != 1 {
+		t.Fatalf("QDAY proxy claim broadcasts = %d, want 1", broadcasts)
 	}
 }
 

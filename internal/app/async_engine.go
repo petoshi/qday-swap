@@ -414,7 +414,7 @@ func (s *Service) driveAsyncSwap(ctx context.Context, wallets engineWallets, jou
 				if err := ensureLocalClaim(ctx, wallets, journal, record, agreement, swapprotocol.PartyTaker); err != nil {
 					return err
 				}
-				if err := broadcastProxyMakerClaim(ctx, wallets, journal, record); err != nil {
+				if err := broadcastProxyMakerClaim(ctx, wallets, journal, record, agreement); err != nil {
 					return err
 				}
 			}
@@ -468,7 +468,7 @@ func (s *Service) driveAsyncSwap(ctx context.Context, wallets engineWallets, jou
 				if err := ensureLocalClaim(ctx, wallets, journal, record, agreement, swapprotocol.PartyMaker); err != nil {
 					return err
 				}
-			} else if err := broadcastProxyMakerClaim(ctx, wallets, journal, record); err != nil {
+			} else if err := broadcastProxyMakerClaim(ctx, wallets, journal, record, agreement); err != nil {
 				return err
 			}
 			found, confirmed, _, err := observeClaimForRecord(ctx, wallets, record, agreement, swapprotocol.PartyMaker)
@@ -729,9 +729,22 @@ func acceptMakerClaimTemplate(ctx context.Context, wallets engineWallets, journa
 	return err
 }
 
-func broadcastProxyMakerClaim(ctx context.Context, wallets engineWallets, journal *swapstate.Journal, record swapstate.Swap) error {
+func broadcastProxyMakerClaim(ctx context.Context, wallets engineWallets, journal *swapstate.Journal, record swapstate.Swap, agreement swapprotocol.Agreement) error {
 	action, err := journal.Action(record.ID + ":maker-claim-proxy")
 	if err != nil {
+		return err
+	}
+	// A process can stop after the completed claim reached the network but before
+	// the journal advanced. Once the spend is observable, broadcasting its old
+	// portable QDAY package again is both unnecessary and invalid after the
+	// transaction confirms because proof updating removes confirmed transactions.
+	found, _, _, err := observeClaimForRecord(ctx, wallets, record, agreement, swapprotocol.PartyMaker)
+	if err != nil {
+		return err
+	} else if found {
+		if action.Status == swapstate.ActionPrepared {
+			_, err = journal.MarkBroadcast(action.ID, time.Now().UTC())
+		}
 		return err
 	}
 	if action.Chain == "BTC" {
