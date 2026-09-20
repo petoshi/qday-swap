@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/chaincfg/v2"
+	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet"
 	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/petoshi/qday-swap/internal/walletroot"
@@ -80,13 +81,66 @@ func TestFullHistoryInitializePersistsRecoveryOrigin(t *testing.T) {
 		if !verified {
 			t.Fatal("full-history recovery origin is not verified")
 		}
-		if stamp.Height != 0 || stamp.Hash != *chaincfg.MainNetParams.GenesisHash {
-			t.Fatalf("recovery origin = %d %v, want mainnet genesis", stamp.Height, stamp.Hash)
+		if stamp.Height != mainnetNativeSegWitOrigin.Height ||
+			stamp.Hash != mainnetNativeSegWitOrigin.Hash ||
+			!stamp.Timestamp.Equal(mainnetNativeSegWitOrigin.Timestamp) {
+
+			t.Fatalf("recovery origin = %v, want %v", stamp, mainnetNativeSegWitOrigin)
 		}
 		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if err := loader.UnloadWallet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMigrateLegacyFullHistoryToNativeSegWitOrigin(t *testing.T) {
+	root, err := walletroot.ParsePhrase(testPhrase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := filepath.Join(t.TempDir(), "bitcoin")
+	manager, err := NewManager(Config{DataDir: directory, Network: "mainnet"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Initialize(context.Background(), root, "correct horse battery staple", time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	loader := wallet.NewLoader(&chaincfg.MainNetParams, filepath.Join(directory, "wallet"), false, wallet.DefaultDBTimeout, recoveryWindow)
+	loaded, err := loader.OpenExistingWallet([]byte(wallet.InsecurePubPassphrase), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	genesis := waddrmgr.BlockStamp{
+		Height:    0,
+		Hash:      *chaincfg.MainNetParams.GenesisHash,
+		Timestamp: chaincfg.MainNetParams.GenesisBlock.Header.Timestamp,
+	}
+	err = walletdb.Update(loaded.Database(), func(tx walletdb.ReadWriteTx) error {
+		namespace := tx.ReadWriteBucket([]byte("waddrmgr"))
+		if err := waddrmgr.DeleteBirthdayBlock(namespace); err != nil {
+			return err
+		}
+		if err := loaded.Manager.SetBirthday(namespace, genesis.Timestamp); err != nil {
+			return err
+		}
+		if err := loaded.Manager.SetSyncedTo(namespace, &genesis); err != nil {
+			return err
+		}
+		return loaded.Manager.SetBirthdayBlock(namespace, genesis, true)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.migrateNativeSegWitRecovery(loaded); err != nil {
+		t.Fatal(err)
+	}
+	if got := loaded.SyncedTo(); got.Height != mainnetNativeSegWitOrigin.Height || got.Hash != mainnetNativeSegWitOrigin.Hash {
+		t.Fatalf("synced to = %v, want %v", got, mainnetNativeSegWitOrigin)
 	}
 	if err := loader.UnloadWallet(); err != nil {
 		t.Fatal(err)

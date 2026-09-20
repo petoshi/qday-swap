@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/chaincfg/v2"
+	"github.com/btcsuite/btcd/chainhash/v2"
+	"github.com/btcsuite/btclog"
 	"github.com/btcsuite/btcwallet/chain"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet"
@@ -31,6 +33,12 @@ const (
 	peerLagLimit   = int32(144)
 	peerCheckEvery = 5 * time.Second
 )
+
+var mainnetNativeSegWitOrigin = waddrmgr.BlockStamp{
+	Height:    481_823,
+	Hash:      mustHash("000000000000000000cbeff0b533f8e1189cf09dfbebf57a8ebe349362811b80"),
+	Timestamp: time.Unix(1_503_539_571, 0).UTC(),
+}
 
 type Config struct {
 	DataDir      string
@@ -168,12 +176,15 @@ func (m *Manager) Initialize(_ context.Context, root walletroot.Root, password s
 		return errors.New("Bitcoin wallet password must contain at least 12 bytes")
 	}
 	fullHistory := birthday.IsZero()
+	origin := m.recoveryOrigin()
 	if birthday.IsZero() {
-		birthday = m.params.GenesisBlock.Header.Timestamp
+		birthday = origin.Timestamp
 	}
 	// btcwallet stores a 48-hour safety margin. Clamp imports so that margin
-	// lands on genesis instead of before the network existed.
-	minimumBirthday := m.params.GenesisBlock.Header.Timestamp.Add(48 * time.Hour)
+	// lands on the first relevant block instead of before it. This wallet only
+	// derives BIP84 Native SegWit addresses, so mainnet history before SegWit
+	// activation cannot contain a standard payment to one of its addresses.
+	minimumBirthday := origin.Timestamp.Add(48 * time.Hour)
 	if birthday.Before(minimumBirthday) {
 		fullHistory = true
 		birthday = minimumBirthday
@@ -200,23 +211,18 @@ func (m *Manager) Initialize(_ context.Context, root walletroot.Root, password s
 	if fullHistory {
 		// btcwallet retries a failed initial recovery with the birthday block
 		// value captured before the first attempt. If it was nil, every
-		// transient compact-filter error resets recovery to genesis. Persist a
-		// verified genesis stamp before synchronization so retries continue
+		// transient compact-filter error resets recovery to its initial point.
+		// Persist a verified origin before synchronization so retries continue
 		// from the last committed height instead.
-		genesis := waddrmgr.BlockStamp{
-			Hash:      *m.params.GenesisHash,
-			Height:    0,
-			Timestamp: m.params.GenesisBlock.Header.Timestamp,
-		}
 		if err := walletdb.Update(loaded.Database(), func(tx walletdb.ReadWriteTx) error {
 			namespace := tx.ReadWriteBucket([]byte("waddrmgr"))
 			if namespace == nil {
 				return errors.New("Bitcoin address manager namespace is missing")
 			}
-			if err := loaded.Manager.SetBirthdayBlock(namespace, genesis, true); err != nil {
+			if err := loaded.Manager.SetSyncedTo(namespace, &origin); err != nil {
 				return err
 			}
-			return loaded.Manager.SetSyncedTo(namespace, &genesis)
+			return loaded.Manager.SetBirthdayBlock(namespace, origin, true)
 		}); err != nil {
 			_ = loader.UnloadWallet()
 			return fmt.Errorf("set Bitcoin recovery origin: %w", err)
@@ -237,6 +243,7 @@ func (m *Manager) Start(ctx context.Context) (*Client, error) {
 	if err := os.MkdirAll(m.config.DataDir, 0700); err != nil {
 		return nil, err
 	}
+	configureDiagnosticLogging()
 	lightDir := filepath.Join(m.config.DataDir, "neutrino")
 	if err := os.MkdirAll(lightDir, 0700); err != nil {
 		return nil, err
@@ -272,6 +279,14 @@ func (m *Manager) Start(ctx context.Context) (*Client, error) {
 		_ = lightDB.Close()
 		return nil, fmt.Errorf("open Bitcoin wallet: %w", err)
 	}
+	if err := m.migrateNativeSegWitRecovery(loaded); err != nil {
+		_ = loader.UnloadWallet()
+		lightClient.Stop()
+		lightClient.WaitForShutdown()
+		_ = service.Stop()
+		_ = lightDB.Close()
+		return nil, err
+	}
 	loaded.SynchronizeRPC(lightClient)
 	m.loader, m.wallet, m.lightDB = loader, loaded, lightDB
 	m.lightClient, m.service = lightClient, service
@@ -285,6 +300,62 @@ func (m *Manager) Start(ctx context.Context) (*Client, error) {
 	return &Client{wallet: loaded, lightClient: lightClient, service: service, network: m.config.Network}, nil
 }
 
+func (m *Manager) recoveryOrigin() waddrmgr.BlockStamp {
+	if m.config.Network == "mainnet" {
+		return mainnetNativeSegWitOrigin
+	}
+	return waddrmgr.BlockStamp{
+		Hash:      *m.params.GenesisHash,
+		Height:    0,
+		Timestamp: m.params.GenesisBlock.Header.Timestamp,
+	}
+}
+
+func (m *Manager) migrateNativeSegWitRecovery(loaded *wallet.Wallet) error {
+	if m.config.Network != "mainnet" ||
+		loaded.Manager.Birthday().After(mainnetNativeSegWitOrigin.Timestamp) ||
+		loaded.SyncedTo().Height >= mainnetNativeSegWitOrigin.Height {
+
+		return nil
+	}
+	origin := mainnetNativeSegWitOrigin
+	if err := walletdb.Update(loaded.Database(), func(tx walletdb.ReadWriteTx) error {
+		namespace := tx.ReadWriteBucket([]byte("waddrmgr"))
+		if namespace == nil {
+			return errors.New("Bitcoin address manager namespace is missing")
+		}
+		if err := waddrmgr.DeleteBirthdayBlock(namespace); err != nil {
+			return err
+		}
+		if err := loaded.Manager.SetBirthday(namespace, origin.Timestamp); err != nil {
+			return err
+		}
+		if err := loaded.Manager.SetSyncedTo(namespace, &origin); err != nil {
+			return err
+		}
+		return loaded.Manager.SetBirthdayBlock(namespace, origin, true)
+	}); err != nil {
+		return fmt.Errorf("advance Bitcoin Native SegWit recovery origin: %w", err)
+	}
+	return nil
+}
+
+func configureDiagnosticLogging() {
+	if os.Getenv("QDAY_SWAP_BITCOIN_DEBUG") == "" {
+		return
+	}
+	backend := btclog.NewBackend(os.Stderr)
+	neutrinoLogger := backend.Logger("NTRN")
+	neutrinoLogger.SetLevel(btclog.LevelDebug)
+	neutrino.UseLogger(neutrinoLogger)
+	chainLogger := backend.Logger("CHIO")
+	chainLogger.SetLevel(btclog.LevelInfo)
+	chain.UseLogger(chainLogger)
+	walletLogger := backend.Logger("BTWL")
+	walletLogger.SetLevel(btclog.LevelInfo)
+	wallet.UseLogger(walletLogger)
+}
+
 func (m *Manager) Stop() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -295,19 +366,21 @@ func (m *Manager) Stop() error {
 	if m.wallet != nil && !m.wallet.Locked() {
 		m.wallet.Lock()
 	}
-	if m.loader != nil {
-		if err := m.loader.UnloadWallet(); err != nil {
-			result = err
-		}
-	}
 	if m.lightClient != nil {
 		m.lightClient.Stop()
-		m.lightClient.WaitForShutdown()
 	}
 	if m.service != nil {
 		if err := m.service.Stop(); result == nil {
 			result = err
 		}
+	}
+	if m.loader != nil {
+		if err := m.loader.UnloadWallet(); err != nil && result == nil {
+			result = err
+		}
+	}
+	if m.lightClient != nil {
+		m.lightClient.WaitForShutdown()
 	}
 	if m.peerDone != nil {
 		<-m.peerDone
@@ -346,6 +419,14 @@ func monitorBitcoinPeers(ctx context.Context, service *neutrino.ChainService) {
 			}
 		}
 	}
+}
+
+func mustHash(value string) chainhash.Hash {
+	hash, err := chainhash.NewHashFromStrStrict(value)
+	if err != nil {
+		panic(err)
+	}
+	return *hash
 }
 
 func laggingPeerCutoff(heights []int32) (int32, bool) {
