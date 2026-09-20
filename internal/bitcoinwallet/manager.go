@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -26,6 +27,9 @@ const (
 	recoveryWindow = 250
 	filterCache    = 32 << 20
 	blockCache     = 32 << 20
+	peerQuorum     = 3
+	peerLagLimit   = int32(144)
+	peerCheckEvery = 5 * time.Second
 )
 
 type Config struct {
@@ -143,6 +147,8 @@ type Manager struct {
 	lightDB     walletdb.DB
 	lightClient *chain.NeutrinoClient
 	service     *neutrino.ChainService
+	peerCancel  context.CancelFunc
+	peerDone    chan struct{}
 }
 
 func NewManager(config Config) (*Manager, error) {
@@ -269,6 +275,13 @@ func (m *Manager) Start(ctx context.Context) (*Client, error) {
 	loaded.SynchronizeRPC(lightClient)
 	m.loader, m.wallet, m.lightDB = loader, loaded, lightDB
 	m.lightClient, m.service = lightClient, service
+	peerContext, peerCancel := context.WithCancel(ctx)
+	peerDone := make(chan struct{})
+	m.peerCancel, m.peerDone = peerCancel, peerDone
+	go func() {
+		defer close(peerDone)
+		monitorBitcoinPeers(peerContext, service)
+	}()
 	return &Client{wallet: loaded, lightClient: lightClient, service: service, network: m.config.Network}, nil
 }
 
@@ -276,6 +289,9 @@ func (m *Manager) Stop() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var result error
+	if m.peerCancel != nil {
+		m.peerCancel()
+	}
 	if m.wallet != nil && !m.wallet.Locked() {
 		m.wallet.Lock()
 	}
@@ -293,13 +309,56 @@ func (m *Manager) Stop() error {
 			result = err
 		}
 	}
+	if m.peerDone != nil {
+		<-m.peerDone
+	}
 	if m.lightDB != nil {
 		if err := m.lightDB.Close(); result == nil {
 			result = err
 		}
 	}
 	m.loader, m.wallet, m.lightDB, m.lightClient, m.service = nil, nil, nil, nil, nil
+	m.peerCancel, m.peerDone = nil, nil
 	return result
+}
+
+func monitorBitcoinPeers(ctx context.Context, service *neutrino.ChainService) {
+	ticker := time.NewTicker(peerCheckEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		peers := service.Peers()
+		heights := make([]int32, 0, len(peers))
+		for _, peer := range peers {
+			heights = append(heights, peer.LastBlock())
+		}
+		cutoff, ok := laggingPeerCutoff(heights)
+		if !ok {
+			continue
+		}
+		for _, peer := range peers {
+			if peer.LastBlock() < cutoff {
+				_ = service.DisconnectNodeByAddr(peer.Addr())
+			}
+		}
+	}
+}
+
+func laggingPeerCutoff(heights []int32) (int32, bool) {
+	if len(heights) < peerQuorum {
+		return 0, false
+	}
+	ordered := append([]int32(nil), heights...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	reference := ordered[len(ordered)/2]
+	if reference <= peerLagLimit {
+		return 0, false
+	}
+	return reference - peerLagLimit, true
 }
 
 func openOrCreateDB(path string) (walletdb.DB, error) {

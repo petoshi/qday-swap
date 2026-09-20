@@ -93,6 +93,22 @@ func TestFullHistoryInitializePersistsRecoveryOrigin(t *testing.T) {
 	}
 }
 
+func TestLaggingPeerCutoffUsesQuorumMedian(t *testing.T) {
+	if _, ok := laggingPeerCutoff([]int32{961_639, 967_806}); ok {
+		t.Fatal("two peers established a pruning cutoff")
+	}
+	cutoff, ok := laggingPeerCutoff([]int32{961_639, 967_806, 967_806, 967_806, 967_807})
+	if !ok {
+		t.Fatal("peer quorum did not establish a pruning cutoff")
+	}
+	if want := int32(967_806 - peerLagLimit); cutoff != want {
+		t.Fatalf("cutoff = %d, want %d", cutoff, want)
+	}
+	if cutoff <= 961_639 {
+		t.Fatalf("cutoff %d retained the stale sync peer", cutoff)
+	}
+}
+
 func TestFormatBTCExact(t *testing.T) {
 	tests := map[int64]string{
 		0: "0", 1: "0.00000001", 100_000_000: "1", 123_456_789: "1.23456789",
