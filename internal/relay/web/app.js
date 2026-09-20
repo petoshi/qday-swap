@@ -126,24 +126,24 @@ function markNavigation(routeName) {
 
 function renderProtocol() {
   root.innerHTML = `<div class="protocol-page"><section class="protocol-download protocol-download-home">
-      <div class="download-intro"><span class="command">$ install qday-swap</span><h1>DOWNLOAD QDAY SWAP. FUCK KYC</h1><p>QDAY Swap is a local, noncustodial application for QDAY ↔ Bitcoin atomic swaps. Public binaries are in final testing. When downloads return, create a local wallet, save its recovery phrase, fund it, then create or accept offers inside the app. This site publishes the protocol and matched market activity. It never holds your keys or funds.</p></div>
+      <div class="download-intro"><span class="command">$ install qday-swap</span><h1>DOWNLOAD QDAY SWAP. FUCK KYC</h1><p>QDAY Swap is a noncustodial atomic swap protocol and desktop app for trading QDAY directly with assets on other blockchains. QDAY ↔ Bitcoin is the first market. More chains will be added to the same app and protocol. Create or accept an offer locally, and the swap settles directly on both native blockchains. No exchange account. No deposits. No custodian. This site explains the protocol and shows matched market activity.</p></div>
       <div class="download-grid">
-        <div class="download-card pending">
+        <a class="download-card" href="https://github.com/petoshi/qday-swap/releases/download/v1.0.0/QDAY-Swap-windows-amd64.zip">
           <svg class="os-icon" viewBox="0 0 64 64" aria-hidden="true"><path d="M7 11l22-3v22H7V11zm26-4l24-3v26H33V7zM7 34h22v22L7 53V34zm26 0h24v26l-24-3V34z"/></svg>
-          <span><strong>WINDOWS</strong><small>X86 64 · ZIP</small></span><b>TESTING</b>
-        </div>
-        <div class="download-card pending">
+          <span><strong>WINDOWS</strong><small>X86 64 · ZIP</small></span><b>DOWNLOAD ↓</b>
+        </a>
+        <a class="download-card" href="https://github.com/petoshi/qday-swap/releases/download/v1.0.0/QDAY-Swap-linux-amd64.tar.gz">
           <svg class="os-icon linux-icon" viewBox="0 0 64 64" aria-hidden="true"><path class="tux-body" d="M32 4c-8 0-13 7-13 17 0 4-1 8-4 13-4 6-5 13-2 17 2 3 6 3 10 1 3 5 15 5 18 0 4 2 8 2 10-1 3-4 2-11-2-17-3-5-4-9-4-13C45 11 40 4 32 4z"/><ellipse class="tux-belly" cx="32" cy="39" rx="12" ry="15"/><ellipse class="tux-eye" cx="27" cy="18" rx="4" ry="5"/><ellipse class="tux-eye" cx="37" cy="18" rx="4" ry="5"/><circle class="tux-pupil" cx="28" cy="19" r="1.5"/><circle class="tux-pupil" cx="36" cy="19" r="1.5"/><path class="tux-beak" d="M26 23l6-4 6 4-6 5z"/><path class="tux-foot" d="M23 49c-7 1-11 5-9 8 2 2 9 1 14-2zm18 0c7 1 11 5 9 8-2 2-9 1-14-2z"/></svg>
-          <span><strong>LINUX</strong><small>X86 64 · TAR.GZ</small></span><b>TESTING</b>
-        </div>
-        <div class="download-card pending">
+          <span><strong>LINUX</strong><small>X86 64 · TAR.GZ</small></span><b>DOWNLOAD ↓</b>
+        </a>
+        <a class="download-card" href="https://github.com/petoshi/qday-swap/releases/download/v1.0.0/QDAY-Swap-linux-arm64.tar.gz">
           <svg class="os-icon linux-icon" viewBox="0 0 64 64" aria-hidden="true"><path class="tux-body" d="M32 4c-8 0-13 7-13 17 0 4-1 8-4 13-4 6-5 13-2 17 2 3 6 3 10 1 3 5 15 5 18 0 4 2 8 2 10-1 3-4 2-11-2-17-3-5-4-9-4-13C45 11 40 4 32 4z"/><ellipse class="tux-belly" cx="32" cy="39" rx="12" ry="15"/><ellipse class="tux-eye" cx="27" cy="18" rx="4" ry="5"/><ellipse class="tux-eye" cx="37" cy="18" rx="4" ry="5"/><circle class="tux-pupil" cx="28" cy="19" r="1.5"/><circle class="tux-pupil" cx="36" cy="19" r="1.5"/><path class="tux-beak" d="M26 23l6-4 6 4-6 5z"/><path class="tux-foot" d="M23 49c-7 1-11 5-9 8 2 2 9 1 14-2zm18 0c7 1 11 5 9 8-2 2-9 1-14-2z"/></svg>
-          <span><strong>LINUX</strong><small>ARM64 · TAR.GZ</small></span><b>TESTING</b>
-        </div>
-        <div class="download-card pending">
+          <span><strong>LINUX</strong><small>ARM64 · TAR.GZ</small></span><b>DOWNLOAD ↓</b>
+        </a>
+        <a class="download-card" href="https://github.com/petoshi/qday-swap/releases/download/v1.0.0/QDAY-Swap-macos-universal.zip">
           <svg class="os-icon apple-icon" viewBox="0 0 64 64" aria-hidden="true"><path d="M39 13c3-4 3-8 3-10-4 0-8 3-10 6-2 2-3 6-3 9 4 0 7-2 10-5zM49 35c0-8 7-12 7-12-4-6-10-7-13-7-6-1-11 4-14 4s-7-4-12-4C8 16 0 24 0 36c0 7 3 15 6 20 3 4 6 8 11 8 4 0 6-3 12-3s7 3 12 3 8-4 11-8c3-4 4-9 5-11-1 0-8-3-8-10z" transform="translate(4 -1) scale(.88)"/></svg>
-          <span><strong>MACOS</strong><small>UNIVERSAL · ZIP</small></span><b>TESTING</b>
-        </div>
+          <span><strong>MACOS</strong><small>UNIVERSAL · ZIP</small></span><b>DOWNLOAD ↓</b>
+        </a>
       </div>
     </section>
     <section class="quickstart">
