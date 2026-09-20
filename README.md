@@ -2,13 +2,20 @@
 
 ## DOWNLOAD QDAY SWAP. FUCK KYC.
 
-The public binary build is temporarily offline while the next build is tested.
-The source remains public. Windows, Linux x86-64, Linux ARM64 and macOS packages
-will return together after the test build passes.
+QDAY Swap is a local, noncustodial application for direct atomic swaps between
+QDAY and other blockchains. QDAY/BTC is the first live market. More markets can
+use the same application and protocol.
+
+![QDAY Swap trading interface](docs/assets/qday-swap.png)
+
+| Platform | Download |
+| --- | --- |
+| Windows x64 | [QDAY Swap for Windows](https://github.com/petoshi/qday-swap/releases/download/v1.0.0/QDAY-Swap-windows-amd64.zip) |
+| Linux x64 | [QDAY Swap for Linux x64](https://github.com/petoshi/qday-swap/releases/download/v1.0.0/QDAY-Swap-linux-amd64.tar.gz) |
+| Linux ARM64 | [QDAY Swap for Linux ARM64](https://github.com/petoshi/qday-swap/releases/download/v1.0.0/QDAY-Swap-linux-arm64.tar.gz) |
+| macOS | [QDAY Swap for macOS](https://github.com/petoshi/qday-swap/releases/download/v1.0.0/QDAY-Swap-macos-universal.zip) |
 
 See [the installation guide](docs/INSTALL.md) for the exact command on each OS.
-
-`qday-swap` is a user-facing, non-custodial atomic swap application for QDAY.
 
 The first public market is QDAY/BTC. Litecoin remains the reference
 integration because the complete QDAY/LTC protocol has already been exercised
@@ -29,8 +36,8 @@ several signed acceptances while the maker is offline. On return, the maker app
 selects the first valid one atomically; the selected taker's exact pre-signed
 funding transaction can then be relayed without keeping both applications
 online. The first public order
-book runs at `dex.pqday.com`. It stores signed offers and cancellations and has
-a read-only web explorer. The first valid signed acceptance is matched
+book runs at `dex.pqday.com`. It stores signed offers and cancellations and
+publishes the protocol plus matched market activity. The first valid signed acceptance is matched
 atomically, then an end-to-end encrypted mailbox carries the trade protocol between
 the two installed applications. The relay never receives a wallet seed,
 signing key, plaintext contract message or general spend authority. Prepared
@@ -71,8 +78,8 @@ state. Users may optionally connect their own full node for any supported asset.
 The current source includes the local wallet application, QDAY/BTC state
 machine, durable recovery journal, embedded Bitcoin light client and public
 relay. Automated regtest coverage exercises funding, claims, refunds, restarts
-and chain reorganizations. Begin with low-value trades while independent
-mainnet drills continue.
+and chain reorganizations. Every completed swap remains independently
+verifiable on QDAY and Bitcoin.
 See [the product plan](docs/PRODUCT.md) and [chain adapter plan](docs/CHAINS.md).
 
 ## DEX relay development server
