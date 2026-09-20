@@ -194,6 +194,7 @@ function route() {
 function updateChrome() {
   nav.hidden = !state?.configured || !state?.unlocked;
   nav.querySelectorAll('a').forEach(link => link.classList.toggle('active', link.dataset.route === route()));
+  nodePill.hidden = !state?.configured || !state?.unlocked;
   nodePill.classList.remove('waiting', 'error');
   const label = nodePill.querySelector('span');
   headerQDAY.textContent = state?.qday ? commas(state.qday.height) : '—';
@@ -207,12 +208,18 @@ function updateChrome() {
   } else if (state.error) {
     nodePill.classList.add('error');
     label.textContent = 'NODE ERROR';
-  } else if (!state.qday?.synced) {
+  } else if (!state.qday?.networkSynced) {
     nodePill.classList.add('waiting');
-    label.textContent = state.qday ? `SYNC ${commas(state.qday.scanHeight)} / ${commas(state.qday.height)}` : 'STARTING';
-  } else if (!state.bitcoin?.headersSynced || !state.bitcoin?.walletSynced) {
+    label.textContent = state.qday ? `QDAY SYNC · BLOCK ${commas(state.qday.height)}` : 'QDAY STARTING';
+  } else if (state.unlocked && !state.qday.synced) {
     nodePill.classList.add('waiting');
-    label.textContent = state.bitcoin ? `BTC SYNC ${commas(state.bitcoin.walletHeight)} / ${commas(state.bitcoin.headerHeight)}` : 'BTC STARTING';
+    label.textContent = `QDAY WALLET ${commas(state.qday.scanHeight)} / ${commas(state.qday.height)}`;
+  } else if (!state.bitcoin?.headersSynced) {
+    nodePill.classList.add('waiting');
+    label.textContent = state.bitcoin ? `BITCOIN SYNC · HEADER ${commas(state.bitcoin.headerHeight)}` : 'BITCOIN STARTING';
+  } else if (state.unlocked && !state.bitcoin.walletSynced) {
+    nodePill.classList.add('waiting');
+    label.textContent = `BITCOIN WALLET ${commas(state.bitcoin.walletHeight)} / ${commas(state.bitcoin.headerHeight)}`;
   } else {
     label.textContent = `PEERS: ${state.qday.connections} QDAY · ${state.bitcoin.peers} BITCOIN`;
   }

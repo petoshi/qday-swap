@@ -38,6 +38,7 @@ button { color: inherit; }
 .header-stats b { color: var(--text); font-size: 10px; }
 .runtime-actions { display: flex; align-items: center; gap: 14px; margin-left: auto; }
 .node-pill { display: flex; align-items: center; gap: 8px; color: var(--green); font-size: 9px; letter-spacing: .06em; white-space: nowrap; }
+.node-pill[hidden] { display: none; }
 .node-pill i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; box-shadow: 0 0 9px currentColor; }
 .node-pill.waiting { color: var(--amber); }
 .node-pill.error { color: var(--red); }
