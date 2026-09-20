@@ -136,7 +136,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	if r.URL.Path == "/" || r.URL.Path == "/index.html" || strings.HasPrefix(r.URL.Path, "/assets/") || r.URL.Path == "/app.js" || r.URL.Path == "/styles.css" || r.URL.Path == "/favicon.svg" {
+	if r.URL.Path == "/" || r.URL.Path == "/index.html" || strings.HasPrefix(r.URL.Path, "/assets/") || r.URL.Path == "/app.js" || r.URL.Path == "/styles.css" || r.URL.Path == "/theme.css" || r.URL.Path == "/favicon.svg" {
 		s.static.ServeHTTP(w, r)
 		return
 	}

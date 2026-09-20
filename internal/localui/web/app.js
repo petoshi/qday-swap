@@ -652,20 +652,20 @@ function setupPriceChart() {
     const tickCount = Math.max(2, Math.round((maximumPrice - minimumPrice) / tickStep));
     for (let index = 0; index <= tickCount; index++) {
       const lineY = padding.top + plotHeight * index / tickCount;
-      context.strokeStyle = '#182019';
+      context.strokeStyle = '#273149';
       context.lineWidth = 1;
       context.beginPath(); context.moveTo(padding.left, lineY); context.lineTo(width - padding.right, lineY); context.stroke();
       const value = maximumPrice - (maximumPrice - minimumPrice) * index / tickCount;
-      context.fillStyle = '#657067';
+      context.fillStyle = '#7f8aa1';
       context.textAlign = 'left';
       context.fillText(priceLabel(value, tickStep), width - padding.right + 10, lineY);
     }
     const timeTickCount = width < 520 ? 3 : width < 850 ? 4 : 5;
     for (let index = 0; index <= timeTickCount; index++) {
       const lineX = padding.left + plotWidth * index / timeTickCount;
-      context.strokeStyle = '#101510';
+      context.strokeStyle = '#171e2e';
       context.beginPath(); context.moveTo(lineX, padding.top); context.lineTo(lineX, chartBottom); context.stroke();
-      context.fillStyle = '#59615a';
+      context.fillStyle = '#707b92';
       context.textAlign = index === 0 ? 'left' : index === timeTickCount ? 'right' : 'center';
       const time = minimumTime + (maximumTime - minimumTime) * index / timeTickCount;
       context.fillText(timeLabel(time, maximumTime - minimumTime), lineX, height - 12);
@@ -674,15 +674,15 @@ function setupPriceChart() {
     const barWidth = Math.max(2, Math.min(12, plotWidth / Math.max(points.length, 1) * .58));
     for (const point of points) {
       const barHeight = Math.max(1, point.volume / maximumVolume * volumeHeight);
-      context.fillStyle = point.side === 'sell' ? 'rgba(255,118,84,.28)' : 'rgba(125,255,155,.25)';
+      context.fillStyle = point.side === 'sell' ? 'rgba(255,138,101,.30)' : 'rgba(89,245,138,.25)';
       context.fillRect(x(point.time) - barWidth / 2, volumeTop + volumeHeight - barHeight, barWidth, barHeight);
     }
 
     const rising = latestPrice >= firstPrice;
-    const trendColor = rising ? '#7dff9b' : '#ff896d';
+    const trendColor = rising ? '#59f58a' : '#ff8a65';
     const gradient = context.createLinearGradient(0, padding.top, 0, chartBottom);
-    gradient.addColorStop(0, rising ? 'rgba(125,255,155,.24)' : 'rgba(255,137,109,.2)');
-    gradient.addColorStop(1, rising ? 'rgba(125,255,155,0)' : 'rgba(255,137,109,0)');
+    gradient.addColorStop(0, rising ? 'rgba(89,245,138,.25)' : 'rgba(255,138,101,.22)');
+    gradient.addColorStop(1, rising ? 'rgba(89,245,138,0)' : 'rgba(255,138,101,0)');
     context.beginPath();
     points.forEach((point, index) => index ? context.lineTo(x(point.time), y(point.price)) : context.moveTo(x(point.time), y(point.price)));
     context.lineTo(x(points.at(-1).time), chartBottom);
@@ -694,14 +694,14 @@ function setupPriceChart() {
 
     const latest = points.at(-1);
     const latestY = y(latest.price);
-    context.setLineDash([2, 4]); context.strokeStyle = rising ? 'rgba(125,255,155,.45)' : 'rgba(255,137,109,.45)'; context.lineWidth = 1;
+    context.setLineDash([2, 4]); context.strokeStyle = rising ? 'rgba(89,245,138,.48)' : 'rgba(255,138,101,.48)'; context.lineWidth = 1;
     context.beginPath(); context.moveTo(padding.left, latestY); context.lineTo(width - padding.right, latestY); context.stroke();
     context.setLineDash([]);
     const latestText = priceLabel(latest.price);
     context.font = 'bold 11px ui-monospace, SFMono-Regular, Menlo, monospace';
     const latestWidth = Math.min(padding.right - 8, context.measureText(latestText).width + 12);
     context.fillStyle = trendColor; context.fillRect(width - padding.right + 4, latestY - 10, latestWidth, 20);
-    context.fillStyle = '#021005'; context.textAlign = 'center'; context.fillText(latestText, width - padding.right + 4 + latestWidth / 2, latestY);
+    context.fillStyle = '#10281b'; context.textAlign = 'center'; context.fillText(latestText, width - padding.right + 4 + latestWidth / 2, latestY);
     context.font = '11px ui-monospace, SFMono-Regular, Menlo, monospace';
 
     if (points.length < 80) {
@@ -711,20 +711,20 @@ function setupPriceChart() {
     if (hover >= 0 && hover < points.length) {
       const point = points[hover];
       const pointX = x(point.time), pointY = y(point.price);
-      context.setLineDash([3, 4]); context.strokeStyle = '#536057'; context.lineWidth = 1;
+      context.setLineDash([3, 4]); context.strokeStyle = '#68758f'; context.lineWidth = 1;
       context.beginPath(); context.moveTo(pointX, padding.top); context.lineTo(pointX, chartBottom); context.stroke();
       context.beginPath(); context.moveTo(padding.left, pointY); context.lineTo(width - padding.right, pointY); context.stroke();
-      context.setLineDash([]); context.fillStyle = '#030403'; context.strokeStyle = trendColor;
+      context.setLineDash([]); context.fillStyle = '#0b0f19'; context.strokeStyle = trendColor;
       context.beginPath(); context.arc(pointX, pointY, 4, 0, Math.PI * 2); context.fill(); context.stroke();
       const hoverText = priceLabel(point.price);
       const hoverWidth = Math.min(padding.right - 8, context.measureText(hoverText).width + 12);
-      context.fillStyle = '#667068'; context.fillRect(width - padding.right + 4, pointY - 10, hoverWidth, 20);
-      context.fillStyle = '#f0f4f0'; context.textAlign = 'center'; context.fillText(hoverText, width - padding.right + 4 + hoverWidth / 2, pointY);
+      context.fillStyle = '#303b55'; context.fillRect(width - padding.right + 4, pointY - 10, hoverWidth, 20);
+      context.fillStyle = '#f4f7fb'; context.textAlign = 'center'; context.fillText(hoverText, width - padding.right + 4 + hoverWidth / 2, pointY);
       const hoverTime = timeLabel(point.time, maximumTime - minimumTime);
       const hoverTimeWidth = context.measureText(hoverTime).width + 12;
       const hoverTimeX = Math.max(padding.left, Math.min(width - padding.right - hoverTimeWidth, pointX - hoverTimeWidth / 2));
-      context.fillStyle = '#273029'; context.fillRect(hoverTimeX, height - padding.bottom + 2, hoverTimeWidth, 20);
-      context.fillStyle = '#dce2dc'; context.fillText(hoverTime, hoverTimeX + hoverTimeWidth / 2, height - padding.bottom + 12);
+      context.fillStyle = '#202941'; context.fillRect(hoverTimeX, height - padding.bottom + 2, hoverTimeWidth, 20);
+      context.fillStyle = '#e4e9f2'; context.fillText(hoverTime, hoverTimeX + hoverTimeWidth / 2, height - padding.bottom + 12);
     }
   }
 
