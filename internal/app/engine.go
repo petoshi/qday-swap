@@ -41,6 +41,17 @@ type qdaySwapClient interface {
 	RefundSwap(context.Context, string, walletd.SpendSwapRequest) (walletd.SwapAction, error)
 }
 
+type qdayAsyncSwapClient interface {
+	qdaySwapClient
+	PrepareSwapFunding(context.Context, string, walletd.FundSwapRequest) (walletd.SwapAction, error)
+	CancelPreparedSwapFunding(context.Context, string) error
+	ValidateTransactionPackage(context.Context, walletd.TransactionPackage) (walletd.TransactionPackage, error)
+	ValidateSwapFundingPackage(context.Context, string, walletd.ValidateSwapFundingRequest) (walletd.TransactionPackage, error)
+	BroadcastTransactionPackage(context.Context, walletd.TransactionPackage) (walletd.BroadcastPackageResult, error)
+	PrepareSwapClaimTemplate(context.Context, string, walletd.SpendSwapRequest) (walletd.SwapAction, error)
+	CompleteSwapClaimTemplate(context.Context, string, walletd.CompleteSwapClaimTemplateRequest) (walletd.TransactionPackage, error)
+}
+
 type bitcoinSwapClient interface {
 	Status() (bitcoinwallet.Status, error)
 	WatchContract(bitcoin.Contract) error
@@ -49,6 +60,12 @@ type bitcoinSwapClient interface {
 	Transaction(string) (bitcoinwallet.Transaction, error)
 	FindSpend(bitcoin.Funding) (bitcoinwallet.Transaction, error)
 	DestinationScript() ([]byte, error)
+}
+
+type bitcoinAsyncSwapClient interface {
+	bitcoinSwapClient
+	ReserveFunding(string) error
+	ReleaseFunding(string) error
 }
 
 type engineWallets struct {
@@ -124,6 +141,9 @@ func (s *Service) driveSwaps(ctx context.Context) {
 }
 
 func (s *Service) driveSwap(ctx context.Context, wallets engineWallets, journal *swapstate.Journal, record swapstate.Swap) error {
+	if record.Version == trade.AsyncProtocolVersion {
+		return s.driveAsyncSwap(ctx, wallets, journal, record)
+	}
 	if err := s.ensureLocalHello(ctx, wallets, journal, record); err != nil {
 		return err
 	}
@@ -278,6 +298,10 @@ func (s *Service) processPeerMessages(ctx context.Context, wallets engineWallets
 			}
 		case swapprotocol.MessageFunding:
 			if err := s.acceptFundingNotice(ctx, wallets, journal, record, *message.payload.Funding); err != nil {
+				return err
+			}
+		case swapprotocol.MessageClaimTemplate:
+			if err := acceptMakerClaimTemplate(ctx, wallets, journal, record, *message.payload.ClaimTemplate); err != nil {
 				return err
 			}
 		}
@@ -539,9 +563,9 @@ func decode32(encoded, name string) ([32]byte, error) {
 	return result, nil
 }
 
-// ApproveSwap is the only path from agreed terms to an on-chain payment. The
-// engine may negotiate and verify contracts while locked, but it never funds a
-// contract until the local user approves the exact immutable agreement.
+// ApproveSwap remains an idempotent recovery path for journals created by
+// versions which required a second browser confirmation. New swaps are
+// authorized by the maker's signed offer or the taker's signed acceptance.
 func (s *Service) ApproveSwap(id string) (swapstate.Swap, error) {
 	s.mu.RLock()
 	journal := s.journal
@@ -612,6 +636,19 @@ func (s *Service) driveExecution(ctx context.Context, wallets engineWallets, jou
 		agreement, err := agreementFromRecord(record)
 		if err != nil {
 			return err
+		}
+		// Publishing an exact signed offer and explicitly accepting one are the
+		// two user authorizations for an automatic swap. By this point both
+		// participant descriptors, amounts, refund heights and the immutable
+		// agreement have been validated. No second browser click is required.
+		if !record.Approved && !s.config.RequireSwapApproval {
+			switch record.Phase {
+			case swapstate.PhaseTermsAgreed, swapstate.PhaseMakerFunding, swapstate.PhaseMakerFunded, swapstate.PhaseTakerFunding, swapstate.PhaseTakerFunded:
+				record, err = journal.Approve(swapID, time.Now().UTC())
+				if err != nil {
+					return err
+				}
+			}
 		}
 		if record.Phase != swapstate.PhaseComplete && record.Phase != swapstate.PhaseRefunded && record.Phase != swapstate.PhaseExpired {
 			refunding, err := s.maybeStartRefund(ctx, wallets, journal, record, agreement)
@@ -900,7 +937,7 @@ func (s *Service) ensureLocalFunding(ctx context.Context, wallets engineWallets,
 	if existing, ok, err := fundingFromRecord(record, party); err != nil {
 		return err
 	} else if ok {
-		message := swapprotocol.Message{Version: swapprotocol.ProtocolVersion, Kind: swapprotocol.MessageFunding, TradeID: record.ID, Funding: &existing}
+		message := swapprotocol.Message{Version: asyncMessageVersion(record), Kind: swapprotocol.MessageFunding, TradeID: record.ID, Funding: &existing}
 		return s.sendProtocolMessage(ctx, wallets.root, journal, record, "funding:"+party, message)
 	}
 	if err := ensureFundingWindows(ctx, wallets, agreement); err != nil {
@@ -909,7 +946,7 @@ func (s *Service) ensureLocalFunding(ctx context.Context, wallets engineWallets,
 	asset := assetFundedBy(agreement, party)
 	var notice swapprotocol.FundingNotice
 	if asset == "QDAY" {
-		action, err := wallets.qday.FundSwap(ctx, record.ID, walletd.FundSwapRequest{
+		action, err := wallets.qday.FundSwap(ctx, localQDAYSwapID(record), walletd.FundSwapRequest{
 			AmountAtomic: agreement.QDAYAmountAtomic, ExpectedUnitAtomic: agreement.QDAYUnitAtomic,
 		})
 		if err != nil {
@@ -955,7 +992,7 @@ func (s *Service) ensureLocalFunding(ctx context.Context, wallets engineWallets,
 		return err
 	}
 	record, _ = journal.Swap(record.ID)
-	message := swapprotocol.Message{Version: swapprotocol.ProtocolVersion, Kind: swapprotocol.MessageFunding, TradeID: record.ID, Funding: &notice}
+	message := swapprotocol.Message{Version: asyncMessageVersion(record), Kind: swapprotocol.MessageFunding, TradeID: record.ID, Funding: &notice}
 	return s.sendProtocolMessage(ctx, wallets.root, journal, record, "funding:"+party, message)
 }
 
@@ -1011,13 +1048,13 @@ func ensureLocalClaim(ctx context.Context, wallets engineWallets, journal *swaps
 	}
 	asset := assetFundedBy(agreement, funder)
 	if asset == "QDAY" {
-		view, err := wallets.qday.Swap(ctx, record.ID)
+		view, err := wallets.qday.Swap(ctx, localQDAYSwapID(record))
 		if err != nil {
 			return err
 		}
 		for _, output := range view.Outputs {
 			if output.FundingTransaction == funding.TransactionID && output.Value.Atomic == agreement.QDAYAmountAtomic {
-				_, err := wallets.qday.ClaimSwap(ctx, record.ID, walletd.SpendSwapRequest{OutputID: output.ID, Secret: hex.EncodeToString(secret[:])})
+				_, err := wallets.qday.ClaimSwap(ctx, localQDAYSwapID(record), walletd.SpendSwapRequest{OutputID: output.ID, Secret: hex.EncodeToString(secret[:])})
 				return err
 			}
 		}
@@ -1038,7 +1075,7 @@ func ensureLocalClaim(ctx context.Context, wallets engineWallets, journal *swaps
 		if err != nil {
 			return err
 		}
-		key, err := wallets.root.BitcoinSwapKey(record.ID)
+		key, err := wallets.root.BitcoinSwapKey(localBitcoinSwapKeyID(record))
 		if err != nil {
 			return err
 		}
@@ -1095,7 +1132,7 @@ func observeClaim(ctx context.Context, wallets engineWallets, agreement swapprot
 		}
 		return true, spend.Confirmations > 0, hex.EncodeToString(revealed[:]), nil
 	}
-	view, err := wallets.qday.Swap(ctx, record.ID)
+	view, err := wallets.qday.Swap(ctx, localQDAYSwapID(record))
 	if err != nil {
 		return false, false, "", err
 	}
@@ -1120,9 +1157,46 @@ func (s *Service) maybeStartRefund(ctx context.Context, wallets engineWallets, j
 		return false, err
 	}
 	if !ok {
+		// A process can stop after its wallet accepted the exact transaction but
+		// before the funding notice reached the swap journal. Recover that narrow
+		// crash window before deciding that no funds moved.
+		recovered, found, recoverErr := recoverSubmittedLocalFunding(ctx, wallets, journal, record, agreement, party)
+		if recoverErr != nil {
+			return false, recoverErr
+		} else if found {
+			encoded, _ := json.Marshal(recovered)
+			record, err = journal.SetFunding(record.ID, party, string(encoded), time.Now().UTC())
+			if err != nil {
+				return false, err
+			}
+			notice, ok = recovered, true
+		}
+	}
+	if ok && record.Version == trade.AsyncProtocolVersion && party == swapprotocol.PartyTaker && !record.TakerFundingSubmitted {
+		// Version 2 stores the taker's signed funding bytes before they have been
+		// published. Do not confuse that durable template with on-chain funding.
+		// The maker may have relayed it while this application was offline, so
+		// observe both chain and mempool before restoring the local marker.
+		observed, observeErr := fundingObservedForRecord(ctx, wallets, record, agreement, notice)
+		if observeErr != nil {
+			return false, observeErr
+		}
+		if observed {
+			record, err = journal.SetTakerFundingSubmitted(record.ID, true, time.Now().UTC())
+			if err != nil {
+				return false, err
+			}
+		} else {
+			ok = false
+		}
+	}
+	if !ok {
 		if err := ensureFundingWindows(ctx, wallets, agreement); err != nil {
 			if !errors.Is(err, errFundingWindowClosed) {
 				return false, err
+			}
+			if releaseErr := releasePreparedLocalFunding(ctx, wallets, journal, record, agreement, party); releaseErr != nil {
+				return false, releaseErr
 			}
 			if _, advanceErr := journal.Advance(record.ID, record.Phase, swapstate.PhaseExpired, time.Now().UTC()); advanceErr != nil {
 				return false, advanceErr
@@ -1136,7 +1210,7 @@ func (s *Service) maybeStartRefund(ctx context.Context, wallets engineWallets, j
 		if err != nil || !peerFunded {
 			return false, err
 		}
-		refunded, err := refundConfirmed(ctx, wallets, agreement, peerFunding)
+		refunded, err := refundConfirmed(ctx, wallets, record, agreement, peerFunding)
 		if err != nil || !refunded {
 			return false, err
 		}
@@ -1178,6 +1252,100 @@ func (s *Service) maybeStartRefund(ctx context.Context, wallets engineWallets, j
 		return false, err
 	}
 	return true, nil
+}
+
+func recoverSubmittedLocalFunding(ctx context.Context, wallets engineWallets, journal *swapstate.Journal, record swapstate.Swap, agreement swapprotocol.Agreement, party string) (swapprotocol.FundingNotice, bool, error) {
+	asset := assetFundedBy(agreement, party)
+	if asset == "QDAY" {
+		view, err := wallets.qday.Swap(ctx, localQDAYSwapID(record))
+		if err != nil {
+			return swapprotocol.FundingNotice{}, false, err
+		}
+		for _, action := range view.Actions {
+			if action.Kind != "fund" || !action.Submitted {
+				continue
+			}
+			notice := swapprotocol.FundingNotice{Party: party, Asset: asset, TransactionID: action.TransactionID}
+			return notice, true, notice.Validate()
+		}
+		return swapprotocol.FundingNotice{}, false, nil
+	}
+	action, err := journal.Action(record.ID + ":" + party + "-funding")
+	if errors.Is(err, swapstate.ErrNotFound) {
+		return swapprotocol.FundingNotice{}, false, nil
+	} else if err != nil {
+		return swapprotocol.FundingNotice{}, false, err
+	}
+	submitted := action.Status != swapstate.ActionPrepared
+	if !submitted {
+		_, transactionErr := wallets.bitcoin.Transaction(action.TransactionID)
+		submitted = transactionErr == nil
+		if transactionErr != nil && !errors.Is(transactionErr, bitcoinwallet.ErrTransactionNotFound) {
+			return swapprotocol.FundingNotice{}, false, transactionErr
+		}
+	}
+	if !submitted {
+		return swapprotocol.FundingNotice{}, false, nil
+	}
+	notice := swapprotocol.FundingNotice{Party: party, Asset: asset, TransactionID: action.TransactionID, RawTransaction: action.RawTransaction}
+	return notice, true, notice.Validate()
+}
+
+func releasePreparedLocalFunding(ctx context.Context, wallets engineWallets, journal *swapstate.Journal, record swapstate.Swap, agreement swapprotocol.Agreement, party string) error {
+	asset := assetFundedBy(agreement, party)
+	if asset == "QDAY" {
+		qday, ok := wallets.qday.(qdayAsyncSwapClient)
+		if !ok {
+			// Legacy clients publish funding in the same operation and therefore
+			// have no separately prepared transaction to release.
+			return nil
+		}
+		if record.Version != trade.AsyncProtocolVersion || party != swapprotocol.PartyTaker {
+			view, err := qday.Swap(ctx, localQDAYSwapID(record))
+			if err != nil {
+				return err
+			}
+			prepared := false
+			for _, action := range view.Actions {
+				if action.Kind == "fund" {
+					if action.Submitted {
+						return errors.New("refusing to release submitted QDAY funding")
+					}
+					prepared = true
+				}
+			}
+			if !prepared {
+				return nil
+			}
+		}
+		if err := qday.CancelPreparedSwapFunding(ctx, localQDAYSwapID(record)); err != nil {
+			return fmt.Errorf("release prepared QDAY funding: %w", err)
+		}
+		return nil
+	}
+	bitcoin, ok := wallets.bitcoin.(bitcoinAsyncSwapClient)
+	if !ok {
+		return nil
+	}
+	if record.Version == trade.AsyncProtocolVersion && party == swapprotocol.PartyTaker {
+		prepared := record.Acceptance.Acceptance.Funding
+		if prepared.Asset == "BTC" && len(prepared.RawTransactions) == 1 {
+			if err := bitcoin.ReleaseFunding(prepared.RawTransactions[0]); err != nil {
+				return fmt.Errorf("release prepared Bitcoin taker funding: %w", err)
+			}
+		}
+		return nil
+	}
+	action, err := journal.Action(record.ID + ":" + party + "-funding")
+	if errors.Is(err, swapstate.ErrNotFound) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	if err := bitcoin.ReleaseFunding(action.RawTransaction); err != nil {
+		return fmt.Errorf("release prepared Bitcoin %s funding: %w", party, err)
+	}
+	return nil
 }
 
 func ensureFundingWindows(ctx context.Context, wallets engineWallets, agreement swapprotocol.Agreement) error {
@@ -1223,10 +1391,10 @@ func ensureLocalRefund(ctx context.Context, wallets engineWallets, journal *swap
 		if err != nil || !peerFunded {
 			return false, err
 		}
-		return refundConfirmed(ctx, wallets, agreement, peerFunding)
+		return refundConfirmed(ctx, wallets, record, agreement, peerFunding)
 	}
 	if funding.Asset == "QDAY" {
-		view, err := wallets.qday.Swap(ctx, record.ID)
+		view, err := wallets.qday.Swap(ctx, localQDAYSwapID(record))
 		if err != nil {
 			return false, err
 		}
@@ -1237,7 +1405,7 @@ func ensureLocalRefund(ctx context.Context, wallets engineWallets, journal *swap
 			if output.Status == "refunded" {
 				return true, nil
 			}
-			_, err := wallets.qday.RefundSwap(ctx, record.ID, walletd.SpendSwapRequest{OutputID: output.ID})
+			_, err := wallets.qday.RefundSwap(ctx, localQDAYSwapID(record), walletd.SpendSwapRequest{OutputID: output.ID})
 			return false, err
 		}
 		return false, errors.New("QDAY refund output is not visible")
@@ -1257,7 +1425,7 @@ func ensureLocalRefund(ctx context.Context, wallets engineWallets, journal *swap
 		if err != nil {
 			return false, err
 		}
-		key, err := wallets.root.BitcoinSwapKey(record.ID)
+		key, err := wallets.root.BitcoinSwapKey(localBitcoinSwapKeyID(record))
 		if err != nil {
 			return false, err
 		}
@@ -1313,12 +1481,12 @@ func refundStateConfirmed(ctx context.Context, wallets engineWallets, record swa
 			return false, err
 		}
 	}
-	return refundConfirmed(ctx, wallets, agreement, funding)
+	return refundConfirmed(ctx, wallets, record, agreement, funding)
 }
 
-func refundConfirmed(ctx context.Context, wallets engineWallets, agreement swapprotocol.Agreement, funding swapprotocol.FundingNotice) (bool, error) {
+func refundConfirmed(ctx context.Context, wallets engineWallets, record swapstate.Swap, agreement swapprotocol.Agreement, funding swapprotocol.FundingNotice) (bool, error) {
 	if funding.Asset == "QDAY" {
-		view, err := wallets.qday.Swap(ctx, agreement.TradeID)
+		view, err := wallets.qday.Swap(ctx, localQDAYSwapID(record))
 		if err != nil {
 			return false, err
 		}
@@ -1398,7 +1566,15 @@ func oppositeParty(party string) string {
 }
 
 func localSwapSecret(root walletroot.Root, record swapstate.Swap, party string) ([32]byte, error) {
-	if party != swapprotocol.PartyMaker || record.Role != swapstate.RoleMaker {
+	secretOwner := swapprotocol.PartyMaker
+	if record.Version == trade.AsyncProtocolVersion {
+		secretOwner = swapprotocol.PartyTaker
+	}
+	localParty := swapprotocol.PartyMaker
+	if record.Role == swapstate.RoleTaker {
+		localParty = swapprotocol.PartyTaker
+	}
+	if party != secretOwner || localParty != secretOwner {
 		if record.RevealedSecret == "" {
 			return [32]byte{}, errors.New("claim secret has not been revealed")
 		}

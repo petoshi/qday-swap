@@ -106,6 +106,37 @@ func TestContractClaimAndRefund(t *testing.T) {
 	}
 }
 
+func TestContractClaimTemplateCanOnlyBeCompletedByMatchingSecret(t *testing.T) {
+	contract, recipient, _, secret := testContract(t)
+	funding := testFunding(t, contract)
+	template, err := contract.BuildClaimTemplate(funding, []byte{txscript.OP_TRUE}, 2_000, recipient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	templateTx, err := DecodeTransaction(template)
+	if err != nil {
+		t.Fatal(err)
+	} else if len(templateTx.TxIn[0].Witness) != 4 || len(templateTx.TxIn[0].Witness[1]) != 0 {
+		t.Fatal("claim template unexpectedly contains a secret")
+	}
+	wrong := secret
+	wrong[0] ^= 1
+	if _, err := contract.CompleteClaimTemplate(template, funding, wrong); err == nil {
+		t.Fatal("claim template accepted the wrong secret")
+	}
+	completed, err := contract.CompleteClaimTemplate(template, funding, secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completedTx, err := DecodeTransaction(completed)
+	if err != nil {
+		t.Fatal(err)
+	} else if templateTx.TxID() != completedTx.TxID() {
+		t.Fatal("adding the witness secret changed the SegWit transaction ID")
+	}
+	executeSpend(t, contract, completed)
+}
+
 func TestContractRejectsChangedTerms(t *testing.T) {
 	contract, recipient, refund, secret := testContract(t)
 	funding := testFunding(t, contract)

@@ -115,7 +115,42 @@ func (c *Client) PrepareFunding(contract bitcoin.Contract) (bitcoin.Funding, err
 	if err != nil {
 		return bitcoin.Funding{}, fmt.Errorf("verify prepared Bitcoin funding: %w", err)
 	}
+	for _, input := range authored.Tx.TxIn {
+		c.wallet.LockOutpoint(input.PreviousOutPoint)
+	}
 	return funding, nil
+}
+
+// ReserveFunding restores the in-memory btcwallet coin locks for a prepared
+// transaction after an application restart. The durable swap journal remains
+// the source of truth; btcwallet locks prevent a second prepared transaction
+// from selecting the same inputs during this process lifetime.
+func (c *Client) ReserveFunding(raw string) error {
+	if err := c.requireSwapWallet(); err != nil {
+		return err
+	}
+	tx, err := bitcoin.DecodeTransaction(raw)
+	if err != nil {
+		return err
+	}
+	for _, input := range tx.TxIn {
+		c.wallet.LockOutpoint(input.PreviousOutPoint)
+	}
+	return nil
+}
+
+func (c *Client) ReleaseFunding(raw string) error {
+	if err := c.requireSwapWallet(); err != nil {
+		return err
+	}
+	tx, err := bitcoin.DecodeTransaction(raw)
+	if err != nil {
+		return err
+	}
+	for _, input := range tx.TxIn {
+		c.wallet.UnlockOutpoint(input.PreviousOutPoint)
+	}
+	return nil
 }
 
 // Broadcast publishes a previously journaled signed transaction. Replaying an
@@ -130,6 +165,9 @@ func (c *Client) Broadcast(raw string) (Transaction, error) {
 	}
 	hash := tx.TxHash()
 	if known, err := c.transaction(hash); err == nil {
+		for _, input := range tx.TxIn {
+			c.wallet.UnlockOutpoint(input.PreviousOutPoint)
+		}
 		return known, nil
 	} else if !errors.Is(err, ErrTransactionNotFound) {
 		return Transaction{}, err
@@ -141,6 +179,9 @@ func (c *Client) Broadcast(raw string) (Transaction, error) {
 			return known, nil
 		}
 		return Transaction{}, fmt.Errorf("broadcast Bitcoin transaction %s: %w", hash.String(), err)
+	}
+	for _, input := range tx.TxIn {
+		c.wallet.UnlockOutpoint(input.PreviousOutPoint)
 	}
 	return Transaction{ID: hash.String(), Raw: raw, Height: -1}, nil
 }

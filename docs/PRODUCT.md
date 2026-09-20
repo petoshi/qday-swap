@@ -15,9 +15,15 @@ The normal path is:
 1. Install QDAY Swap and save one 24-word recovery phrase.
 2. Send ordinary QDAY or the external asset to the deposit address shown by the
    application.
-3. Create or accept an offer.
-4. Review exactly what leaves each wallet and approve funding once.
-5. Watch both contracts settle automatically.
+3. Review and sign an offer, or review and accept an existing one.
+4. The application may be closed. Signed acceptances queue at the relay and the
+   maker app selects the first valid one when it returns.
+5. The taker's acceptance already contains its exact signed first-leg funding.
+   The maker can relay it, wait for confirmations, fund the second leg and leave
+   a signed claim template before going offline again.
+6. When the taker next opens the application, it can claim its side and complete
+   the maker claim. If progress stops, each funded side retains its unilateral
+   on-chain refund.
 
 There are no contract descriptors, public keys, secrets, API tokens or raw
 transactions in the normal interface. Coinbase and other custodial services
@@ -69,16 +75,19 @@ safe refund condition.
 
 Every trade has a QDAY side and one external-chain side.
 
-1. The initiator creates a random 32-byte secret and shares only its SHA-256
-   hash.
-2. The side with the longer refund window locks first.
-3. After the required confirmations, the second side locks with a shorter
-   refund window.
-4. The first claim reveals the secret on one chain.
-5. The other party verifies and extracts that secret, then claims the second
-   contract.
-6. If either party stops, each application waits for its verified timeout and
-   refunds automatically.
+1. The taker creates a random 32-byte secret and signs an acceptance containing
+   its hash, both contract keys, refund heights and the exact first-leg funding
+   transaction. The secret itself remains local.
+2. The taker leg has the longer refund window. Either selected participant may
+   relay that immutable transaction, so the taker does not need to remain online.
+3. After the required confirmations, the maker signs a claim template for the
+   first leg, sends it encrypted to the taker and funds the shorter second leg.
+4. The taker adds the committed secret to the maker template, claims the maker
+   leg and may relay both completed claims in one session.
+5. The first claim reveals the same secret on-chain. Either application can
+   verify it and replay any missing claim.
+6. If progress stops, each application waits for its verified chain height and
+   refunds its own funded contract automatically when next opened.
 
 Both clients derive and verify every contract from signed immutable trade
 terms. The relay cannot change an amount, address, key, hash or timeout.
@@ -122,8 +131,18 @@ several relays and installed applications.
 - Confirmation and timeout policy is defined per chain and per trade size.
 - The second contract expires first. The first leaves a separate safety window
   for observing the secret and claiming after a restart or reorganization.
-- Funding needs explicit approval. Claims and refunds are automatic.
-- An offer can be cancelled only before either funding transaction exists.
+- Publishing or accepting exact signed terms authorizes automatic funding once
+  the local application validates participant keys, amounts, exact funding bytes
+  and refund heights. Claims and refunds are automatic too. The parties may run
+  the application in separate sessions.
+- Open offers reserve their amount in local accounting, preventing another
+  offer or withdrawal from promising the same funds twice. They are not
+  described as on-chain locked before a match.
+- An offer can be cancelled only while the relay still reports it as open.
+- An acceptance alone does not reserve the public order. Several takers may
+  queue; the relay closes the indivisible order only when the maker signs one
+  match. The selected amount then belongs to that swap until claims or refunds
+  finish.
 - Every message is bound to protocol version, networks, assets, offer ID, trade
   ID and an immutable terms hash.
 - Mainnet beta starts with configurable low value limits and removes them only

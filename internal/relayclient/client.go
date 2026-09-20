@@ -20,7 +20,7 @@ import (
 	"github.com/petoshi/qday-swap/internal/trade"
 )
 
-const maximumResponse = 2 << 20
+const maximumResponse = 6 << 20
 
 type Client struct {
 	baseURL string
@@ -82,12 +82,23 @@ func (c *Client) Trades(ctx context.Context, limit int, since int64) (relay.Trad
 }
 
 func (c *Client) Orders(ctx context.Context, status relay.Status, giveAsset string, page, limit int) (relay.ResultPage, error) {
+	return c.orders(ctx, status, giveAsset, "", page, limit)
+}
+
+func (c *Client) OrdersByMaker(ctx context.Context, status relay.Status, makerPublicKey string, page, limit int) (relay.ResultPage, error) {
+	return c.orders(ctx, status, "", makerPublicKey, page, limit)
+}
+
+func (c *Client) orders(ctx context.Context, status relay.Status, giveAsset, makerPublicKey string, page, limit int) (relay.ResultPage, error) {
 	values := url.Values{}
 	if status != "" {
 		values.Set("status", string(status))
 	}
 	if giveAsset != "" {
 		values.Set("giveAsset", giveAsset)
+	}
+	if makerPublicKey != "" {
+		values.Set("maker", makerPublicKey)
 	}
 	values.Set("market", order.MarketQDAYBTC)
 	values.Set("page", strconv.Itoa(page))

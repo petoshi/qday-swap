@@ -215,20 +215,57 @@ type SpendSwapRequest struct {
 }
 
 type SwapAction struct {
-	ActionID      string    `json:"actionID"`
-	Kind          string    `json:"kind"`
-	OutputID      string    `json:"outputID,omitempty"`
-	TransactionID string    `json:"transactionID"`
-	Destination   string    `json:"destination"`
-	Amount        Amount    `json:"amount"`
-	Fee           Amount    `json:"fee"`
-	Basis         string    `json:"basis"`
-	Status        string    `json:"status"`
-	Confirmations uint64    `json:"confirmations"`
-	BlockHeight   *uint64   `json:"blockHeight,omitempty"`
-	BlockID       string    `json:"blockID,omitempty"`
-	CreatedAt     time.Time `json:"createdAt"`
-	LastError     string    `json:"lastError,omitempty"`
+	ActionID       string    `json:"actionID"`
+	Kind           string    `json:"kind"`
+	OutputID       string    `json:"outputID,omitempty"`
+	TransactionID  string    `json:"transactionID"`
+	Destination    string    `json:"destination"`
+	Amount         Amount    `json:"amount"`
+	Fee            Amount    `json:"fee"`
+	Basis          string    `json:"basis"`
+	Status         string    `json:"status"`
+	Confirmations  uint64    `json:"confirmations"`
+	BlockHeight    *uint64   `json:"blockHeight,omitempty"`
+	BlockID        string    `json:"blockID,omitempty"`
+	CreatedAt      time.Time `json:"createdAt"`
+	LastError      string    `json:"lastError,omitempty"`
+	RawTransaction string    `json:"rawTransaction"`
+	Submitted      bool      `json:"submitted"`
+	BasisHeight    uint64    `json:"basisHeight"`
+	BasisID        string    `json:"basisID"`
+}
+
+type TransactionPackage struct {
+	BasisHeight    uint64   `json:"basisHeight"`
+	BasisID        string   `json:"basisID"`
+	Transactions   []string `json:"transactions"`
+	TransactionIDs []string `json:"transactionIDs"`
+}
+
+type BroadcastPackageResult struct {
+	Package TransactionPackage `json:"package"`
+	Known   bool               `json:"known"`
+}
+
+type ValidateSwapFundingRequest struct {
+	Package            TransactionPackage `json:"package"`
+	TransactionID      string             `json:"transactionID"`
+	AmountAtomic       string             `json:"amountAtomic"`
+	ExpectedUnitAtomic string             `json:"expectedUnitAtomic"`
+	Contract           *SwapContractView  `json:"contract,omitempty"`
+}
+
+type SwapContractView struct {
+	Recipient    SwapKeys `json:"recipient"`
+	Refund       SwapKeys `json:"refund"`
+	SecretHash   string   `json:"secretHash"`
+	RefundHeight uint64   `json:"refundHeight"`
+}
+
+type CompleteSwapClaimTemplateRequest struct {
+	Package  TransactionPackage `json:"package"`
+	OutputID string             `json:"outputID"`
+	Secret   string             `json:"secret"`
 }
 
 type SwapOutput struct {
@@ -330,8 +367,47 @@ func (c *Client) FundSwap(ctx context.Context, swapID string, request FundSwapRe
 	return c.swapAction(ctx, swapID, "fund", request)
 }
 
+func (c *Client) PrepareSwapFunding(ctx context.Context, swapID string, request FundSwapRequest) (SwapAction, error) {
+	return c.swapAction(ctx, swapID, "prepare-funding", request)
+}
+
+func (c *Client) CancelPreparedSwapFunding(ctx context.Context, swapID string) error {
+	path := "/v1/swaps/" + url.PathEscape(swapID) + "/prepare-funding"
+	return c.request(ctx, http.MethodDelete, path, nil, nil, true)
+}
+
+func (c *Client) ValidateTransactionPackage(ctx context.Context, request TransactionPackage) (TransactionPackage, error) {
+	var value TransactionPackage
+	err := c.request(ctx, http.MethodPost, "/v1/transactions/validate", request, &value, true)
+	return value, err
+}
+
+func (c *Client) ValidateSwapFundingPackage(ctx context.Context, swapID string, request ValidateSwapFundingRequest) (TransactionPackage, error) {
+	var value TransactionPackage
+	path := "/v1/swaps/" + url.PathEscape(swapID) + "/validate-funding"
+	err := c.request(ctx, http.MethodPost, path, request, &value, true)
+	return value, err
+}
+
+func (c *Client) BroadcastTransactionPackage(ctx context.Context, request TransactionPackage) (BroadcastPackageResult, error) {
+	var value BroadcastPackageResult
+	err := c.request(ctx, http.MethodPost, "/v1/transactions/broadcast", request, &value, true)
+	return value, err
+}
+
 func (c *Client) ClaimSwap(ctx context.Context, swapID string, request SpendSwapRequest) (SwapAction, error) {
 	return c.swapAction(ctx, swapID, "claim", request)
+}
+
+func (c *Client) PrepareSwapClaimTemplate(ctx context.Context, swapID string, request SpendSwapRequest) (SwapAction, error) {
+	return c.swapAction(ctx, swapID, "prepare-claim", request)
+}
+
+func (c *Client) CompleteSwapClaimTemplate(ctx context.Context, swapID string, request CompleteSwapClaimTemplateRequest) (TransactionPackage, error) {
+	var value TransactionPackage
+	path := "/v1/swaps/" + url.PathEscape(swapID) + "/complete-claim"
+	err := c.request(ctx, http.MethodPost, path, request, &value, true)
+	return value, err
 }
 
 func (c *Client) RefundSwap(ctx context.Context, swapID string, request SpendSwapRequest) (SwapAction, error) {

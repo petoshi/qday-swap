@@ -57,6 +57,10 @@ func TestClientPublishesListsAndCancelsVerifiedOrder(t *testing.T) {
 	if err != nil || page.Total != 1 || page.Items[0].Signed.ID != signed.ID {
 		t.Fatalf("list page=%#v err=%v", page, err)
 	}
+	page, err = client.OrdersByMaker(context.Background(), relay.StatusOpen, signed.Order.MakerPublicKey, 1, 100)
+	if err != nil || page.Total != 1 || page.Items[0].Signed.ID != signed.ID {
+		t.Fatalf("maker list page=%#v err=%v", page, err)
+	}
 	cancellation, err := order.NewCancellation(signed, private, now)
 	if err != nil {
 		t.Fatal(err)

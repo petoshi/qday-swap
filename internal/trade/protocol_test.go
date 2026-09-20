@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/petoshi/qday-swap/internal/order"
 	"golang.org/x/crypto/nacl/box"
 )
@@ -21,6 +24,74 @@ type protocolFixture struct {
 	takerMessagePublic         [32]byte
 	acceptance                 SignedAcceptance
 	match                      SignedMatch
+}
+
+func TestAsyncAcceptanceBindsPreparedFunding(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	makerPublic, makerPrivate, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, takerPrivate, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	makerBitcoin, err := btcec.NewPrivateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	takerBitcoin, err := btcec.NewPrivateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := order.NewAsyncPayload(
+		"mainnet", order.QDAYDefendUnit,
+		order.Amount{Asset: "QDAY", Atomic: "2500000000000000000"},
+		order.Amount{Asset: "BTC", Atomic: "150000"},
+		24*time.Hour, makerPublic, [32]byte{1}, strings.Repeat("1", 64),
+		order.QDAYKeys{Classical: strings.Repeat("2", 64), Reserve: strings.Repeat("3", 64), Address: "qday1maker"},
+		hex.EncodeToString(makerBitcoin.PubKey().SerializeCompressed()), 12_000, 900_000, now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signedOrder, err := order.Sign(payload, makerPrivate, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tradeID, err := NewTradeID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	acceptance, err := NewAsyncAcceptance(
+		signedOrder, tradeID,
+		order.QDAYKeys{Classical: strings.Repeat("4", 64), Reserve: strings.Repeat("5", 64), Address: "qday1taker"},
+		hex.EncodeToString(takerBitcoin.PubKey().SerializeCompressed()), 12_005, 900_001,
+		strings.Repeat("6", 64), 14_885, 900_289,
+		FundingPackage{Asset: "BTC", TransactionID: strings.Repeat("7", 64), RawTransactions: []string{hex.EncodeToString([]byte{1, 2, 3})}},
+		takerPrivate, [32]byte{8}, now.Add(time.Minute),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := acceptance.Verify(signedOrder, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	match, err := NewMatch(signedOrder, acceptance, makerPrivate, now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	} else if match.Match.Version != AsyncProtocolVersion {
+		t.Fatalf("match protocol version = %d", match.Match.Version)
+	} else if err := match.Verify(signedOrder, acceptance, now.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	tampered := acceptance
+	tampered.Acceptance.Funding.RawTransactions = append([]string(nil), acceptance.Acceptance.Funding.RawTransactions...)
+	tampered.Acceptance.Funding.RawTransactions[0] = base64.RawStdEncoding.EncodeToString([]byte("changed"))
+	if err := tampered.Verify(signedOrder, now.Add(time.Minute)); err == nil {
+		t.Fatal("tampered prepared funding verified")
+	}
 }
 
 func newProtocolFixture(t *testing.T, now time.Time) protocolFixture {
@@ -104,7 +175,13 @@ func TestEncryptedMessageRoundTripAndTampering(t *testing.T) {
 	}
 
 	tampered := message
-	tampered.Message.Ciphertext = message.Message.Ciphertext[:len(message.Message.Ciphertext)-1] + "A"
+	tamperedCiphertext := []byte(message.Message.Ciphertext)
+	if tamperedCiphertext[0] == 'A' {
+		tamperedCiphertext[0] = 'B'
+	} else {
+		tamperedCiphertext[0] = 'A'
+	}
+	tampered.Message.Ciphertext = string(tamperedCiphertext)
 	if _, err := tampered.Decrypt(takerPublic, fixture.takerMessagePrivate, fixture.makerMessagePublic, now); err == nil {
 		t.Fatal("tampered ciphertext decrypted")
 	}

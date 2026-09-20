@@ -32,6 +32,8 @@ let selectedOrderID = '';
 let chartRange = 'ALL';
 let destroyChart = () => {};
 let applicationStopped = false;
+const seenSwapPhases = new Map();
+const queuedSwapUpdates = [];
 
 const escapeHTML = value => String(value ?? '').replace(/[&<>'"]/g, character => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
@@ -56,12 +58,13 @@ function showToast(message) {
   toastTimer = setTimeout(() => toast.classList.remove('show'), 1800);
 }
 
-function closeModal() {
+function closeModal(showQueuedSwap = true) {
   clearTimeout(withdrawalQuoteTimer);
   withdrawalQuoteSequence += 1;
   pendingWithdrawalQuote = null;
   modal.textContent = '';
   modalBackdrop.classList.add('hidden');
+  if (showQueuedSwap) setTimeout(showNextSwapUpdate, 0);
 }
 
 function openModal(content) {
@@ -70,9 +73,57 @@ function openModal(content) {
   modal.querySelector('button, input')?.focus();
 }
 
+function queueSwapUpdates(swaps) {
+  for (const swap of swaps || []) {
+    const previous = seenSwapPhases.get(swap.id);
+    seenSwapPhases.set(swap.id, swap.phase);
+    if (previous === swap.phase) continue;
+    if (previous === undefined && ['complete', 'refunded', 'expired'].includes(swap.phase)) continue;
+    if (!queuedSwapUpdates.some(item => item.id === swap.id && item.phase === swap.phase)) queuedSwapUpdates.push(swap);
+  }
+  showNextSwapUpdate();
+}
+
+function showNextSwapUpdate() {
+  if (!state?.unlocked || !modalBackdrop.classList.contains('hidden') || !queuedSwapUpdates.length) return;
+  const swap = queuedSwapUpdates.shift();
+  const view = swapView(swap);
+  openModal(`<div class="modal-head"><span class="eyebrow">SWAP PROGRESS</span><h2>${escapeHTML(swapStatus(swap))}.</h2></div><div class="modal-body">
+    <div class="final-quote">
+      <div><span>YOU SEND</span><strong>${escapeHTML(view.send)}</strong></div>
+      <div><span>YOU RECEIVE</span><strong>${escapeHTML(view.receive)}</strong></div>
+    </div>
+    <p>${escapeHTML(swapStatusNote(swap))}</p>
+    ${swap.lastError ? `<p class="form-error dark">${escapeHTML(swap.lastError)}</p>` : ''}
+    <div class="modal-actions"><button class="secondary" id="close-modal">OK</button><button class="primary" data-open-swap-progress="${escapeHTML(swap.id)}">OPEN SWAP</button></div>
+  </div>`);
+}
+
 function commas(value) {
   const [whole, fraction] = String(value ?? '0').split('.');
   return `${whole.replace(/\B(?=(\d{3})+(?!\d))/g, ',')}${fraction ? `.${fraction}` : ''}`;
+}
+
+function assetFunds(asset) {
+  if (asset === 'QDAY') {
+    const fallback = state?.balance?.spendable || {qday: '0', atomic: '0'};
+    return state?.funds?.qday || {
+      total: fallback.qday || '0', totalAtomic: fallback.atomic || '0',
+      reserved: '0', reservedAtomic: '0', available: fallback.qday || '0', availableAtomic: fallback.atomic || '0'
+    };
+  }
+  const fallback = state?.bitcoinBalance?.confirmed || {btc: '0', satoshis: '0'};
+  return state?.funds?.bitcoin || {
+    total: fallback.btc || '0', totalAtomic: fallback.satoshis || '0',
+    reserved: '0', reservedAtomic: '0', available: fallback.btc || '0', availableAtomic: fallback.satoshis || '0'
+  };
+}
+
+function reservationSummary(asset) {
+  const funds = assetFunds(asset);
+  return BigInt(funds.reservedAtomic || '0') > 0n
+    ? `${commas(funds.reserved)} reserved · ${commas(funds.total)} total`
+    : `${commas(funds.total)} total`;
 }
 
 function decimalsFromUnit(unit) {
@@ -135,6 +186,44 @@ function compareOrderPrice(left, right) {
 function cleanDecimal(value, places = 12) {
   if (!Number.isFinite(value) || value <= 0) return '';
   return value.toFixed(places).replace(/0+$/, '').replace(/\.$/, '');
+}
+
+function lifetimeLabel(minutes) {
+  if (minutes < 60) return `${minutes} minutes`;
+  if (minutes === 60) return '1 hour';
+  if (minutes % 1440 === 0) {
+    const days = minutes / 1440;
+    return `${days} ${days === 1 ? 'day' : 'days'}`;
+  }
+  const hours = minutes / 60;
+  return `${hours} ${hours === 1 ? 'hour' : 'hours'}`;
+}
+
+function localDateTimeValue(date) {
+  const shifted = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
+  return shifted.toISOString().slice(0, 16);
+}
+
+function syncExpiryField(form) {
+  const field = form?.elements.expiresAt;
+  if (!field) return;
+  const custom = form.elements.lifetimeMinutes.value === 'custom';
+  field.hidden = !custom;
+  field.required = custom;
+  field.min = localDateTimeValue(new Date(Date.now() + 60000));
+  field.max = localDateTimeValue(new Date(Date.now() + 30 * 24 * 60 * 60000));
+  if (custom && !field.value) field.value = localDateTimeValue(new Date(Date.now() + 24 * 60 * 60000));
+}
+
+function offerLifetime(form) {
+  const selected = form.elements.lifetimeMinutes.value;
+  if (selected !== 'custom') return Number(selected);
+  const expires = new Date(form.elements.expiresAt.value).getTime();
+  if (!Number.isFinite(expires)) throw new Error('Choose when the offer expires');
+  const minutes = Math.ceil((expires - Date.now()) / 60000);
+  if (minutes < 1) throw new Error('Offer expiry must be at least one minute from now');
+  if (minutes > 30 * 24 * 60) throw new Error('Offer expiry cannot be more than 30 days from now');
+  return minutes;
 }
 
 function signedDecimal(value, places = 2) {
@@ -228,7 +317,10 @@ function updateChrome() {
     nodePill.classList.add('waiting');
     label.textContent = `BITCOIN WALLET ${commas(state.bitcoin.walletHeight)} / ${commas(state.bitcoin.headerHeight)}`;
   } else {
-    label.textContent = `PEERS: ${state.qday.connections} QDAY · ${state.bitcoin.peers} BITCOIN`;
+    const openOrders = state.funds?.openOrders || 0;
+    label.textContent = openOrders
+      ? `ONLINE · ${openOrders} ${openOrders === 1 ? 'ORDER' : 'ORDERS'} ACTIVE · PEERS: ${state.qday.connections} QDAY · ${state.bitcoin.peers} BITCOIN`
+      : `PEERS: ${state.qday.connections} QDAY · ${state.bitcoin.peers} BITCOIN`;
   }
 }
 
@@ -332,7 +424,8 @@ function tradeTicket() {
   const amounts = terms ? marketAmounts(terms) : null;
   const quantity = amounts ? formatUnitsExact(amounts.qday.atomic, terms.qdayUnitAtomic) : '';
   const selectedPrice = terms ? orderPrice(terms).replaceAll(',', '') : '';
-  const balance = buying ? `${state.bitcoinBalance?.confirmed?.btc ?? '0'} BTC` : `${state.balance?.spendable?.qday ?? '0'} QDAY`;
+  const available = assetFunds(buying ? 'BTC' : 'QDAY');
+  const balance = `${available.available} ${buying ? 'BTC' : 'QDAY'}`;
   return `<article class="market-panel ticket-panel">
     <div class="ticket-tabs" role="tablist"><button type="button" data-ticket-side="buy" class="${buying ? 'active' : ''}">BUY QDAY</button><button type="button" data-ticket-side="sell" class="${buying ? '' : 'active'}">SELL QDAY</button></div>
     <form id="create-offer-form" data-side="${offerSide}"${terms ? ` data-selected-order="${escapeHTML(selected.signed.id)}"` : ''}>
@@ -341,11 +434,11 @@ function tradeTicket() {
       <label class="field light"><span>Limit price for 1 QDAY</span><div class="price-input"><input name="price" inputmode="decimal" autocomplete="off" maxlength="64" value="${escapeHTML(selectedPrice)}" placeholder="${offerPriceCurrency === 'USD' ? '1.00' : '0.00001'}" required ${terms ? 'readonly' : ''}><div class="currency-switch" aria-label="Price currency"><button type="button" data-price-currency="USD" class="${offerPriceCurrency === 'USD' ? 'active' : ''}" ${terms ? 'disabled' : ''}>USD</button><button type="button" data-price-currency="BTC" class="${offerPriceCurrency === 'BTC' ? 'active' : ''}" ${terms ? 'disabled' : ''}>BTC</button></div></div><small id="price-help">${offerPriceCurrency === 'USD' ? `Converted to BTC at review${bitcoinUSD ? ` using BTC/USD ${dollars(bitcoinUSD, true)}` : ''}.` : 'The selected signed offer is fixed in BTC.'}</small></label>
       <label class="field light"><span>Amount</span><div class="unit-input"><input name="quantity" inputmode="decimal" autocomplete="off" maxlength="64" value="${escapeHTML(quantity)}" placeholder="10" required ${terms ? 'readonly' : ''}><b>QDAY</b></div></label>
       <div class="ticket-total"><span>${buying ? 'YOU PAY' : 'YOU RECEIVE'}</span><strong id="summary-btc">— BTC</strong><small id="summary-usd">Enter price and amount</small></div>
-      <input type="hidden" name="lifetimeMinutes" value="1440">
+      <label class="field light ticket-expiry"><span>Offer expires</span><select name="lifetimeMinutes"><option value="60">1 hour</option><option value="360">6 hours</option><option value="1440" selected>24 hours</option><option value="4320">3 days</option><option value="10080">7 days</option><option value="custom">Choose date and time</option></select><input name="expiresAt" type="datetime-local" hidden><small>Cancel any time before another trader matches it.</small></label>
       <span id="summary-qday" hidden></span><span id="summary-price" hidden></span><span id="summary-price-btc" hidden></span>
       <p class="balance-warning" id="balance-warning" hidden></p><p class="form-error dark" id="form-error" hidden></p>
       <button class="primary ticket-submit ${buying ? 'buy' : 'sell'}" type="submit">${terms ? `REVIEW ${buying ? 'BUY' : 'SELL'}` : `PLACE ${buying ? 'BUY' : 'SELL'} ORDER`}</button>
-      <p class="ticket-note">${terms ? 'The selected signed offer is fixed. Review it before any contract is created.' : 'Your signed offer moves no funds. You approve the atomic swap after another trader accepts.'}</p>
+      <p class="ticket-note">${terms ? 'The selected signed offer is fixed. Accepting prepares your exact first-leg transaction so the swap can continue across separate app sessions.' : 'Publishing reserves this amount locally. Buyers may queue acceptances while you are offline; the first valid one is selected when you return.'}</p>
     </form>
   </article>`;
 }
@@ -598,9 +691,11 @@ function setupPriceChart() {
 }
 
 function renderMarket() {
-  const balance = state.balance?.spendable?.qday ?? '0';
+  const qdayFunds = assetFunds('QDAY');
+  const bitcoinFunds = assetFunds('BTC');
+  const balance = qdayFunds.available;
   const pending = state.balance?.pendingIn?.qday ?? '0';
-  const bitcoin = state.bitcoinBalance?.confirmed?.btc ?? '0';
+  const bitcoin = bitcoinFunds.available;
   const bitcoinPending = state.bitcoinBalance?.pending?.btc ?? '0';
   const bitcoinImmature = state.bitcoinBalance?.immature?.btc ?? '0';
   const bitcoinBalanceNote = Number(bitcoinImmature) > 0
@@ -613,8 +708,8 @@ function renderMarket() {
       <div><span>LAST MATCH</span><strong>${lastTrade ? escapeHTML(cleanDecimal(marketPriceNumber(lastTrade), 12)) : 'N/A'}</strong></div>
       <div><span>QDAY / USD</span><strong>${lastTrade && bitcoinUSD ? escapeHTML(dollars(marketPriceNumber(lastTrade) * bitcoinUSD)) : 'N/A'}</strong></div>
       <div><span>OPEN OFFERS</span><strong>${escapeHTML(state.relay?.stats?.open ?? orders.total ?? '0')}</strong></div>
-      <div><span>QDAY BALANCE</span><strong>${escapeHTML(commas(balance))}</strong><small>${escapeHTML(commas(pending))} pending</small></div>
-      <div><span>BTC BALANCE</span><strong>${escapeHTML(commas(bitcoin))}</strong><small>${escapeHTML(bitcoinBalanceNote)}</small></div>
+      <div><span>QDAY AVAILABLE</span><strong>${escapeHTML(commas(balance))}</strong><small>${escapeHTML(reservationSummary('QDAY'))}${Number(pending) ? ` · ${escapeHTML(commas(pending))} pending` : ''}</small></div>
+      <div><span>BTC AVAILABLE</span><strong>${escapeHTML(commas(bitcoin))}</strong><small>${escapeHTML(reservationSummary('BTC'))}${bitcoinBalanceNote !== '0 pending' ? ` · ${escapeHTML(bitcoinBalanceNote)}` : ''}</small></div>
     </section>
     <section class="exchange-grid">
       <article class="market-panel chart-panel"><header class="panel-head"><div><span>PRICE</span><strong>QDAY / BTC</strong></div><div class="chart-controls"><span class="chart-scale">AUTO SCALE</span><div class="chart-ranges"><button data-chart-range="24H" class="${chartRange === '24H' ? 'active' : ''}">24H</button><button data-chart-range="7D" class="${chartRange === '7D' ? 'active' : ''}">7D</button><button data-chart-range="ALL" class="${chartRange === 'ALL' ? 'active' : ''}">ALL</button></div></div></header><div class="chart-summary"><div><span>LAST</span><strong id="chart-last">N/A</strong></div><div><span>CHANGE</span><strong id="chart-change">N/A</strong></div><div><span>HIGH</span><strong id="chart-high">N/A</strong></div><div><span>LOW</span><strong id="chart-low">N/A</strong></div><div><span>VOLUME</span><strong id="chart-volume">N/A</strong></div></div><div class="chart-wrap"><canvas id="price-chart" aria-label="Matched QDAY Bitcoin price history"></canvas><div class="chart-empty" id="chart-empty" hidden>NO MATCHED TRADES YET</div><div class="chart-tooltip" id="chart-tooltip" hidden></div></div></article>
@@ -625,6 +720,7 @@ function renderMarket() {
     <section class="card my-orders"><div class="card-head"><h2>MY OPEN ORDERS</h2><span>${orders.items.filter(record => record.signed.order.makerPublicKey === state.identityPublicKey).length}</span></div>${orderList(orders.items.filter(record => record.signed.order.makerPublicKey === state.identityPublicKey))}</section>`;
   updateOfferPreview();
   setupPriceChart();
+  syncExpiryField(document.querySelector('#create-offer-form'));
 }
 
 function orderList(records) {
@@ -666,7 +762,8 @@ function renderCreate() {
   const requestedSide = new URLSearchParams(rawParameters).get('side');
   if (requestedSide === 'buy' || requestedSide === 'sell') offerSide = requestedSide;
   const buying = offerSide === 'buy';
-  const balance = buying ? `${state.bitcoinBalance?.confirmed?.btc ?? '0'} BTC` : `${state.balance?.spendable?.qday ?? '0'} QDAY`;
+  const available = assetFunds(buying ? 'BTC' : 'QDAY');
+  const balance = `${available.available} ${buying ? 'BTC' : 'QDAY'}`;
   root.innerHTML = `<section class="page-head trade-page-head"><div><span class="eyebrow">QDAY / BTC</span><h1>BUY OR SELL QDAY.</h1><p>Take an open offer now, or publish your own price and wait for another trader.</p></div></section>
     <section class="side-picker" aria-label="Choose trade direction">
       <button type="button" data-offer-side="buy" class="${buying ? 'active' : ''}"><b>BUY QDAY</b><span>Spend BTC and receive QDAY</span></button>
@@ -679,8 +776,8 @@ function renderCreate() {
         <div class="offer-fields simple-offer-fields">
           <label class="field light"><span>QDAY amount</span><input name="quantity" inputmode="decimal" autocomplete="off" maxlength="64" placeholder="10" required><small>${buying ? 'How many QDAY you want to buy.' : 'How many QDAY you want to sell.'}</small></label>
           <label class="field light price-field"><span>Price for 1 QDAY</span><div class="price-input"><input name="price" inputmode="decimal" autocomplete="off" maxlength="64" placeholder="${offerPriceCurrency === 'USD' ? '1.00' : '0.00001'}" required><div class="currency-switch" aria-label="Price currency"><button type="button" data-price-currency="USD" class="${offerPriceCurrency === 'USD' ? 'active' : ''}">USD</button><button type="button" data-price-currency="BTC" class="${offerPriceCurrency === 'BTC' ? 'active' : ''}">BTC</button></div></div><small id="price-help">${offerPriceCurrency === 'USD' ? `Converted to BTC when you review${bitcoinUSD ? ` at ${dollars(bitcoinUSD, true)} per BTC` : ''}.` : 'The signed offer uses this BTC price directly.'}</small></label>
-          <label class="field light"><span>Offer expires</span><select name="lifetimeMinutes"><option value="60">1 hour</option><option value="360">6 hours</option><option value="1440">24 hours</option><option value="10080">7 days</option></select><small>Unfilled offers can also be cancelled at any time.</small></label>
-          <div class="available-balance"><span>AVAILABLE TO SPEND</span><strong>${escapeHTML(balance)}</strong><small>${buying ? 'Confirmed Bitcoin balance' : 'Spendable QDAY balance'}</small></div>
+          <label class="field light"><span>Offer expires</span><select name="lifetimeMinutes"><option value="60">1 hour</option><option value="360">6 hours</option><option value="1440" selected>24 hours</option><option value="4320">3 days</option><option value="10080">7 days</option><option value="custom">Choose date and time</option></select><input name="expiresAt" type="datetime-local" hidden><small>Cancel any time before another trader matches it.</small></label>
+          <div class="available-balance"><span>AVAILABLE TO SPEND</span><strong>${escapeHTML(balance)}</strong><small>${escapeHTML(reservationSummary(buying ? 'BTC' : 'QDAY'))}</small></div>
         </div>
         <div class="offer-summary" id="offer-summary">
           <div><span id="summary-qday-label">${buying ? 'YOU BUY' : 'YOU SELL'}</span><strong id="summary-qday">— QDAY</strong></div>
@@ -688,11 +785,12 @@ function renderCreate() {
           <div><span>LIMIT PRICE</span><strong id="summary-price">—</strong><small id="summary-price-btc">Final offer is fixed in BTC</small></div>
         </div>
         <p class="balance-warning" id="balance-warning" hidden></p>
-        <div class="review-note"><strong>Nothing moves yet.</strong><span>Reviewing creates the exact BTC amount. Publishing signs the offer locally. Funds move only after another trader accepts and you approve the swap.</span></div>
+        <div class="review-note"><strong>Nothing moves on-chain yet.</strong><span>Publishing reserves the complete offered amount locally. Buyers may queue acceptances while you are offline; reopening QDAY Swap selects the first valid one and continues automatically.</span></div>
         <p class="form-error dark" id="form-error" hidden></p><button class="primary review-offer" type="submit">REVIEW ${buying ? 'BUY' : 'SELL'} OFFER</button>
       </form>
     </section>`;
   updateOfferPreview();
+  syncExpiryField(document.querySelector('#create-offer-form'));
 }
 
 function updateOfferPreview() {
@@ -749,14 +847,15 @@ function updateOfferPreview() {
     balanceWarning.hidden = false;
     balanceWarning.textContent = 'Bitcoin contract total must be at least 0.0001 BTC.';
   }
-  const available = Number(buying ? state.bitcoinBalance?.confirmed?.btc ?? 0 : state.balance?.spendable?.qday ?? 0);
+  const availableFunds = assetFunds(buying ? 'BTC' : 'QDAY');
+  const available = Number(availableFunds.available || 0);
   const required = buying ? totalBTC : effectiveQuantity;
   if (!Number.isFinite(available) || available < required) {
     button.disabled = true;
     balanceWarning.hidden = false;
     balanceWarning.textContent = buying
-      ? `Not enough confirmed BTC. This offer needs ${cleanDecimal(totalBTC, 8)} BTC; your confirmed balance is ${state.bitcoinBalance?.confirmed?.btc ?? '0'} BTC.`
-      : `Not enough spendable QDAY. This offer needs ${cleanDecimal(effectiveQuantity, 8)} QDAY; your spendable balance is ${state.balance?.spendable?.qday ?? '0'} QDAY.`;
+      ? `Not enough available BTC. This offer needs ${cleanDecimal(totalBTC, 8)} BTC; ${availableFunds.available} BTC remains after open order reservations.`
+      : `Not enough available QDAY. This offer needs ${cleanDecimal(effectiveQuantity, 8)} QDAY; ${availableFunds.available} QDAY remains after open order reservations.`;
   }
   qdayOutput.textContent = `${commas(cleanDecimal(effectiveQuantity, 8))} QDAY`;
   btcOutput.textContent = `${cleanDecimal(totalBTC, 8) || '< 0.00000001'} BTC`;
@@ -776,9 +875,9 @@ function offerReview(quote, lifetimeMinutes) {
       <div><span>${buying ? 'YOU RECEIVE' : 'YOU SEND'}</span><strong>${escapeHTML(quote.quantity)} QDAY</strong></div>
       <div><span>${buying ? 'CONTRACT AMOUNT YOU FUND' : 'BITCOIN CONTRACT AMOUNT'}</span><strong>${escapeHTML(quote.btcAmount)} BTC</strong><small>≈ ${escapeHTML(reference)} · ${buying ? 'your wallet also pays the funding fee' : 'the claim fee is deducted when you receive it'}</small></div>
       <div><span>YOUR INPUT</span><strong>${escapeHTML(entered)}</strong><small>Exact signed rate: ${escapeHTML(quote.btcPerQDAY)} BTC per QDAY</small></div>
-      <div><span>EXPIRES</span><strong>${escapeHTML(String(lifetimeMinutes < 60 ? `${lifetimeMinutes} minutes` : lifetimeMinutes === 60 ? '1 hour' : lifetimeMinutes === 1440 ? '24 hours' : lifetimeMinutes === 10080 ? '7 days' : `${lifetimeMinutes / 60} hours`))}</strong><small>You can cancel while it remains open.</small></div>
+      <div><span>EXPIRES</span><strong>${escapeHTML(new Date(Date.now() + lifetimeMinutes * 60000).toLocaleString())}</strong><small>${escapeHTML(lifetimeLabel(lifetimeMinutes))} · cancel any time before match.</small></div>
     </div>
-    <p>This publishes a signed offer. It does not send funds. If another trader accepts, the app shows the exact contract before funding.</p>
+    <p>This publishes one indivisible signed offer and reserves the complete offered amount locally. Acceptances can queue while you are offline; the first valid one is selected when you next open QDAY Swap.</p>
     <div class="modal-actions"><button class="secondary" id="close-modal">BACK</button><button class="primary" id="publish-offer">SIGN AND PUBLISH</button></div>
   </div>`);
 }
@@ -797,7 +896,7 @@ function acceptanceReview(record) {
       <div><span>PRICE</span><strong>${escapeHTML(priceBTC)} BTC per QDAY</strong><small>${bitcoinUSD ? `≈ ${escapeHTML(dollars(Number(priceBTC) * bitcoinUSD))} per QDAY` : 'USD reference unavailable'}</small></div>
       <div><span>OFFER EXPIRES</span><strong>${escapeHTML(new Date(terms.expiresAt * 1000).toLocaleString())}</strong><small>Amounts are fixed by the maker signature.</small></div>
     </div>
-    <p>Accepting reserves this offer for negotiation. No funds move until the local app shows and you approve the exact contracts.</p>
+    <p>Accepting signs and reserves the exact first-leg funding transaction. It does not block the order by itself: other buyers may also queue, and the maker's app selects the first valid acceptance. After selection, either app can relay your prepared funding and both sides may finish in later sessions.</p>
     <div class="modal-actions"><button class="secondary" id="close-modal">BACK</button><button class="primary" id="confirm-accept-order" data-order-id="${escapeHTML(record.signed.id)}">${buying ? 'ACCEPT AND BUY' : 'ACCEPT AND SELL'}</button></div>
   </div>`);
 }
@@ -824,11 +923,10 @@ function swapTable(swaps) {
   if (!swaps.length) return `<section class="card"><div class="empty"><strong>NOTHING HERE YET.</strong><p>Matched swaps will appear here before either wallet broadcasts a contract.</p></div></section>`;
   return `<section class="card"><div class="card-head"><h2>Swaps</h2><span>${swaps.length}</span></div><div class="swap-list">${swaps.map(swap => {
     const view = swapView(swap);
-    const canApprove = !swap.approved && swap.agreementJSON && ['terms_agreed', 'maker_funding', 'maker_funded'].includes(swap.phase);
     return `<article class="swap-row ${swap.lastError ? 'has-error' : ''}">
       <div class="swap-main"><span class="side ${view.side}">${view.label}</span><strong>${escapeHTML(view.receive)}</strong><small>You send ${escapeHTML(view.send)}</small></div>
       <div class="swap-progress"><b>${escapeHTML(swapStatus(swap))}</b><small>${escapeHTML(swapStatusNote(swap))}</small>${swap.lastError ? `<em>${escapeHTML(swap.lastError)}</em>` : ''}</div>
-      <div class="swap-actions">${canApprove ? `<button class="primary" data-review-swap="${escapeHTML(swap.id)}">REVIEW AND START</button>` : ''}<button class="secondary" data-view-swap="${escapeHTML(swap.id)}">DETAILS</button></div>
+      <div class="swap-actions"><button class="secondary" data-view-swap="${escapeHTML(swap.id)}">DETAILS</button></div>
     </article>`;
   }).join('')}</div></section>`;
 }
@@ -846,19 +944,25 @@ function swapView(swap) {
 }
 
 function swapStatus(swap) {
-  if (swap.phase === 'terms_agreed' && !swap.approved) return 'Ready for your approval';
   const localMaker = swap.role === 'maker';
   return ({
     matched: 'Preparing secure swap',
     terms_proposed: 'Verifying exact terms',
     terms_agreed: 'Waiting for the other trader',
     maker_funding: localMaker ? 'Sending your deposit' : 'Waiting for maker deposit',
-    maker_funded: localMaker ? 'Your deposit is secured' : (swap.approved ? 'Preparing your deposit' : 'Deposit received. Your approval needed'),
+    maker_funded: localMaker ? 'Your deposit is secured' : 'Preparing your deposit',
     taker_funding: localMaker ? 'Waiting for taker deposit' : 'Sending your deposit',
     taker_funded: 'Both deposits secured',
     maker_claiming: localMaker ? 'Claiming your coins' : 'Other trader is claiming',
     maker_claimed: localMaker ? 'Waiting for final claim' : 'Your coins are ready to claim',
     taker_claiming: localMaker ? 'Other trader is claiming' : 'Claiming your coins',
+    async_taker_funding: localMaker ? 'Securing taker deposit' : 'Publishing your prepared deposit',
+    async_taker_funded: 'Taker deposit secured',
+    async_maker_funding: localMaker ? 'Sending your deposit' : 'Waiting for maker deposit',
+    async_maker_funded: 'Both deposits secured',
+    async_taker_claiming: localMaker ? 'Waiting for taker claim' : 'Completing both claims',
+    async_taker_claimed: 'Secret revealed on-chain',
+    async_maker_claiming: localMaker ? 'Claiming your coins' : 'Completing maker claim',
     complete: 'Swap complete',
     waiting_for_refund: 'Refund window reached',
     refunding: 'Returning your deposit',
@@ -868,11 +972,10 @@ function swapStatus(swap) {
 }
 
 function swapStatusNote(swap) {
-  if (swap.phase === 'terms_agreed' && !swap.approved) return 'Check the exact amounts once, then the app handles the rest.';
-  if (swap.phase === 'maker_funded' && swap.role === 'taker' && !swap.approved) return 'The maker deposit is confirmed. Start when you are ready.';
   if (swap.phase === 'complete') return 'Both claims are confirmed.';
   if (swap.phase === 'refunded') return 'Your funded contract was returned to your wallet.';
   if (swap.phase === 'expired') return 'No local funds moved. The refund window became too short to start safely.';
+  if (swap.phase.startsWith('async_')) return 'Signed transactions and progress survive closing and reopening QDAY Swap.';
   return 'The app continues automatically and survives restarts.';
 }
 
@@ -880,7 +983,7 @@ function parseAgreement(swap) {
   try { return JSON.parse(swap.agreementJSON || ''); } catch (_) { return null; }
 }
 
-function swapDetailsModal(swap, approval = false) {
+function swapDetailsModal(swap) {
   const terms = swap.order.order;
   const view = swapView(swap);
   const agreement = parseAgreement(swap);
@@ -888,16 +991,16 @@ function swapDetailsModal(swap, approval = false) {
   const refund = agreement
     ? `<div><span>SAFETY REFUNDS</span><strong>QDAY block ${commas(agreement.qdayRefundHeight)}<br>Bitcoin block ${commas(agreement.bitcoinRefundHeight)}</strong><small>If the other trader disappears, your funded contract returns after its chain deadline.</small></div>`
     : `<div><span>SAFETY REFUNDS</span><strong>Preparing…</strong><small>Both absolute refund heights are verified before funding.</small></div>`;
-  openModal(`<div class="modal-head"><span class="eyebrow">${approval ? 'FINAL CHECK' : 'ATOMIC SWAP'}</span><h2>${approval ? 'START THIS SWAP?' : escapeHTML(swapStatus(swap))}</h2></div><div class="modal-body">
+  openModal(`<div class="modal-head"><span class="eyebrow">ATOMIC SWAP</span><h2>${escapeHTML(swapStatus(swap))}</h2></div><div class="modal-body">
     <div class="final-quote swap-review-grid">
       <div><span>YOU SEND</span><strong>${escapeHTML(view.send)}</strong><small>Plus that chain's normal network fee</small></div>
       <div><span>YOU RECEIVE</span><strong>${escapeHTML(view.receive)}</strong><small>Claim fee is deducted by the receiving chain</small></div>
       <div><span>FIXED RATE</span><strong>${escapeHTML(price)} BTC / QDAY</strong><small>The signed amounts cannot change.</small></div>
       ${refund}
     </div>
-    <div class="swap-safety"><b>NONCUSTODIAL.</b><span>Your app signs locally. Neither the relay nor the other trader can take both deposits. Keep QDAY Swap running; if you close it, reopening resumes from the local journal.</span></div>
+    <div class="swap-safety"><b>NONCUSTODIAL.</b><span>Your app signs locally. Neither the relay nor the other trader can take both deposits. You may close QDAY Swap; exact prepared transactions, claim templates and progress remain in the local journal and resume when either side returns.</span></div>
     ${swap.lastError ? `<p class="form-error dark">${escapeHTML(swap.lastError)}</p>` : ''}
-    <div class="modal-actions"><button class="secondary" id="close-modal">CLOSE</button>${approval ? `<button class="primary" id="approve-swap" data-swap-id="${escapeHTML(swap.id)}">START SWAP</button>` : ''}</div>
+    <div class="modal-actions"><button class="primary" id="close-modal">CLOSE</button></div>
   </div>`);
 }
 
@@ -906,10 +1009,12 @@ function renderEmpty(title, copy, action = '') {
 }
 
 function renderWallets() {
-  const qdayBalance = state.balance?.spendable?.qday ?? '0';
+  const qdayFunds = assetFunds('QDAY');
+  const bitcoinFunds = assetFunds('BTC');
+  const qdayBalance = qdayFunds.total;
   const qdayPending = state.balance?.pendingIn?.qday ?? '0';
   const qdayImmature = state.balance?.immature?.qday ?? '0';
-  const bitcoinBalance = state.bitcoinBalance?.confirmed?.btc ?? '0';
+  const bitcoinBalance = bitcoinFunds.total;
   const bitcoinPending = state.bitcoinBalance?.pending?.btc ?? '0';
   const bitcoinImmature = state.bitcoinBalance?.immature?.btc ?? '0';
   const qdayReady = Boolean(state.qday?.synced && state.qday?.networkSynced && state.balance);
@@ -924,14 +1029,14 @@ function renderWallets() {
       </div>
     </section>
     <section class="wallet-section asset-wallet">
-      <header><div><span class="eyebrow">02 / QDAY</span><h2>QDAY WALLET.</h2></div><div class="wallet-balance"><span>SPENDABLE BALANCE</span><strong>${escapeHTML(commas(qdayBalance))} QDAY</strong><small>${escapeHTML(commas(qdayPending))} pending · ${escapeHTML(commas(qdayImmature))} immature</small></div></header>
+      <header><div><span class="eyebrow">02 / QDAY</span><h2>QDAY WALLET.</h2></div><div class="wallet-balance"><span>TOTAL BALANCE</span><strong>${escapeHTML(commas(qdayBalance))} QDAY</strong><small>${escapeHTML(commas(qdayFunds.available))} available · ${escapeHTML(commas(qdayFunds.reserved))} reserved by orders · ${escapeHTML(commas(qdayPending))} pending · ${escapeHTML(commas(qdayImmature))} immature</small></div></header>
       <div class="wallet-actions">
         <article><h3>RECEIVE.</h3><p>Show the QDAY address controlled by this local recovery phrase.</p><button class="secondary" id="receive-qday" ${qdayReady ? '' : 'disabled'}>SHOW ADDRESS</button></article>
         <article><h3>WITHDRAW.</h3><p>Send any part of the spendable balance. The network fee is calculated before approval.</p><button class="primary" data-withdraw="QDAY" ${qdayReady ? '' : 'disabled'}>WITHDRAW QDAY</button></article>
       </div>
     </section>
     <section class="wallet-section asset-wallet">
-      <header><div><span class="eyebrow">03 / BITCOIN</span><h2>BITCOIN WALLET.</h2></div><div class="wallet-balance"><span>CONFIRMED BALANCE</span><strong>${escapeHTML(commas(bitcoinBalance))} BTC</strong><small>${escapeHTML(commas(bitcoinPending))} pending · ${escapeHTML(commas(bitcoinImmature))} immature</small></div></header>
+      <header><div><span class="eyebrow">03 / BITCOIN</span><h2>BITCOIN WALLET.</h2></div><div class="wallet-balance"><span>TOTAL CONFIRMED</span><strong>${escapeHTML(commas(bitcoinBalance))} BTC</strong><small>${escapeHTML(commas(bitcoinFunds.available))} available · ${escapeHTML(commas(bitcoinFunds.reserved))} reserved by orders · ${escapeHTML(commas(bitcoinPending))} pending · ${escapeHTML(commas(bitcoinImmature))} immature</small></div></header>
       <div class="wallet-actions">
         <article><h3>RECEIVE.</h3><p>Show the Native SegWit Bitcoin address controlled by this local recovery phrase.</p><button class="secondary" id="receive-bitcoin" ${bitcoinReady ? '' : 'disabled'}>SHOW ADDRESS</button></article>
         <article><h3>WITHDRAW.</h3><p>Send any part of the confirmed balance. The exact Bitcoin fee is built from your UTXOs.</p><button class="primary" data-withdraw="BTC" ${bitcoinReady ? '' : 'disabled'}>WITHDRAW BITCOIN</button></article>
@@ -947,12 +1052,12 @@ function currentFingerprint() {
   const current = route();
   if (!state.configured) return 'setup';
   if (!state.unlocked) return 'locked';
-  if (current === 'create') return 'create';
-  if (current === 'wallets') return JSON.stringify({current, error: state.error, qday: state.qday, bitcoin: state.bitcoin, balance: state.balance, bitcoinBalance: state.bitcoinBalance});
+  if (current === 'create') return JSON.stringify({current, funds: state.funds, side: offerSide});
+  if (current === 'wallets') return JSON.stringify({current, error: state.error, qday: state.qday, bitcoin: state.bitcoin, balance: state.balance, bitcoinBalance: state.bitcoinBalance, funds: state.funds});
   if (current === 'swaps' || current === 'history') return JSON.stringify({current, negotiations, relayError: state.relayError});
   return JSON.stringify({
     current: 'market', orders, marketTrades, offerSide, selectedOrderID,
-    balance: state.balance, bitcoinBalance: state.bitcoinBalance,
+    balance: state.balance, bitcoinBalance: state.bitcoinBalance, funds: state.funds,
     relayStats: state.relay?.stats, error: state.error,
     relayError: state.relayError, marketError
   });
@@ -992,7 +1097,10 @@ async function refreshState() {
       ]);
       if (orderResult.status === 'fulfilled') orders = orderResult.value;
       else marketError = orderResult.reason.message;
-      if (negotiationResult.status === 'fulfilled') negotiations = negotiationResult.value;
+      if (negotiationResult.status === 'fulfilled') {
+        negotiations = negotiationResult.value;
+        queueSwapUpdates(negotiations.swaps);
+      }
       else marketError = marketError || negotiationResult.reason.message;
       if (tradeResult.status === 'fulfilled') marketTrades = tradeResult.value;
       else marketError = marketError || tradeResult.reason.message;
@@ -1074,15 +1182,17 @@ function inputAtomic(value, unit) {
 
 function walletAvailable(asset) {
   if (asset === 'QDAY') {
+    const funds = assetFunds('QDAY');
     return {
-      display: state.balance?.spendable?.qday ?? '0',
-      atomic: state.balance?.spendable?.atomic ?? '0',
+      display: funds.available,
+      atomic: funds.availableAtomic,
       unit: state.qday?.unitAtomic || state.balance?.unitAtomic || ''
     };
   }
+  const funds = assetFunds('BTC');
   return {
-    display: state.bitcoinBalance?.confirmed?.btc ?? '0',
-    atomic: state.bitcoinBalance?.confirmed?.satoshis ?? '0',
+    display: funds.available,
+    atomic: funds.availableAtomic,
     unit: '100000000'
   };
 }
@@ -1201,6 +1311,8 @@ function withdrawalSent(result) {
 document.addEventListener('click', async event => {
   if (event.target.closest('#exit-app')) {
     if (applicationStopped || exitButton.disabled) return;
+    const openOrders = state?.funds?.openOrders || 0;
+    if (openOrders && !confirm(`QDAY Swap has ${openOrders} open ${openOrders === 1 ? 'order' : 'orders'}. Exiting makes them unavailable until you run and unlock QDAY Swap again. Exit anyway?`)) return;
     exitButton.disabled = true;
     exitButton.querySelector('span').textContent = 'STOPPING…';
     try {
@@ -1322,6 +1434,8 @@ document.addEventListener('click', async event => {
     return;
   }
   if (event.target.closest('#lock-wallet')) {
+    const openOrders = state?.funds?.openOrders || 0;
+    if (openOrders && !confirm(`Locking pauses ${openOrders} open ${openOrders === 1 ? 'order' : 'orders'} until you unlock QDAY Swap again. Lock anyway?`)) return;
     try { state = await post('/api/v1/lock'); renderFingerprint = ''; render(); } catch (error) { showToast(error.message); }
     return;
   }
@@ -1388,30 +1502,21 @@ document.addEventListener('click', async event => {
     match.disabled = true;
     try { await post(`/api/v1/acceptances/${match.dataset.matchAcceptance}/match`); renderFingerprint = ''; await refreshState(); } catch (error) { showToast(error.message); match.disabled = false; }
   }
-  const reviewSwap = event.target.closest('[data-review-swap]');
-  if (reviewSwap) {
-    const swap = negotiations.swaps.find(item => item.id === reviewSwap.dataset.reviewSwap);
-    if (!swap) { showToast('Swap is no longer available'); return; }
-    swapDetailsModal(swap, true);
-    return;
-  }
   const viewSwap = event.target.closest('[data-view-swap]');
   if (viewSwap) {
     const swap = negotiations.swaps.find(item => item.id === viewSwap.dataset.viewSwap);
     if (!swap) { showToast('Swap is no longer available'); return; }
-    swapDetailsModal(swap, false);
+    swapDetailsModal(swap);
     return;
   }
-  const approveSwap = event.target.closest('#approve-swap');
-  if (approveSwap) {
-    approveSwap.disabled = true;
-    approveSwap.textContent = 'STARTING…';
-    try {
-      await post(`/api/v1/swaps/${approveSwap.dataset.swapId}/approve`);
-      closeModal(); renderFingerprint = ''; await refreshState(); showToast('Swap started');
-    } catch (error) {
-      showToast(error.message); approveSwap.disabled = false; approveSwap.textContent = 'TRY AGAIN';
-    }
+  const progressSwap = event.target.closest('[data-open-swap-progress]');
+  if (progressSwap) {
+    closeModal(false);
+    location.hash = 'swaps';
+    renderFingerprint = '';
+    render();
+    const swap = negotiations.swaps.find(item => item.id === progressSwap.dataset.openSwapProgress);
+    if (swap) setTimeout(() => swapDetailsModal(swap), 0);
     return;
   }
 });
@@ -1419,6 +1524,12 @@ document.addEventListener('click', async event => {
 document.addEventListener('input', event => {
   if (event.target.closest('#withdrawal-form')) scheduleWithdrawalQuote();
   if (event.target.closest('#create-offer-form')) updateOfferPreview();
+});
+
+document.addEventListener('change', event => {
+  if (event.target.name === 'lifetimeMinutes' && event.target.closest('#create-offer-form')) {
+    syncExpiryField(event.target.closest('#create-offer-form'));
+  }
 });
 
 document.addEventListener('submit', async event => {
@@ -1528,7 +1639,7 @@ document.addEventListener('submit', async event => {
     button.disabled = true; button.textContent = 'CALCULATING EXACT AMOUNTS…';
     errorBox.hidden = true;
     try {
-      const lifetimeMinutes = Number(form.elements.lifetimeMinutes.value);
+      const lifetimeMinutes = offerLifetime(form);
       const quote = await post('/api/v1/offers/quote', {
         side: form.dataset.side,
         quantity: form.elements.quantity.value.trim(),

@@ -5,7 +5,7 @@ service is an order relay and explorer, not an exchange wallet. Makers sign
 offers locally. The relay verifies those signatures, stores the records and
 serves them to takers. It has no key capable of moving QDAY or Bitcoin.
 
-## Signed order v1
+## Signed order v2
 
 An order binds all economic terms needed to identify an offer:
 
@@ -16,7 +16,10 @@ An order binds all economic terms needed to identify an offer:
 - exact give and receive amounts as unsigned atomic integers;
 - the QDAY consensus unit used to interpret its atomic amount;
 - creation and expiration Unix timestamps;
-- a random 16-byte nonce.
+- a random 16-byte nonce;
+- a unique maker session ID;
+- the maker's QDAY hybrid contract keys and Bitcoin swap public key;
+- the QDAY and Bitcoin heights observed when the order was signed.
 
 The ID is SHA-256 over the canonical binary encoding of those fields. The
 maker signs that 32-byte ID with Ed25519. JSON is only a transport encoding and
@@ -51,7 +54,7 @@ POST /api/v1/mailbox/poll
 ```json
 {
   "order": {
-    "version": 1,
+    "version": 2,
     "network": "mainnet",
     "market": "QDAY-BTC",
     "qdayUnitAtomic": "1000000000000000000000000",
@@ -61,7 +64,12 @@ POST /api/v1/mailbox/poll
     "receive": {"asset": "BTC", "atomic": "150000"},
     "createdAt": 1800000000,
     "expiresAt": 1800003600,
-    "nonce": "..."
+    "nonce": "...",
+    "sessionID": "...",
+    "makerQDAY": {"classical": "...", "reserve": "...", "address": "qday1..."},
+    "makerBitcoinPublicKey": "...",
+    "makerQDAYHeight": 12000,
+    "makerBitcoinHeight": 900000
   },
   "id": "...",
   "signature": "..."
@@ -79,16 +87,20 @@ match proves that two identities committed to fixed terms; it is not a claim
 that both chain settlements have completed.
 
 The first server keeps at most 100 simultaneously open offers for one maker
-identity. HTTP request bodies are capped at 64 KiB. Public deployment also
+identity. HTTP request bodies are capped at 6 MiB because a version 2
+acceptance may carry a post-quantum signed QDAY funding transaction. Public deployment also
 applies connection and write limits at the reverse proxy while keeping read-only
 order pages available.
 
 ## Trade negotiation
 
 A taker selects an order by signing an acceptance containing a random 32-byte
-trade ID, its Ed25519 identity and its X25519 message key. The acceptance lasts
-at most 15 minutes and cannot outlive the order. It does not close the public
-offer by itself. The maker application signs the first valid acceptance it
+trade ID, its Ed25519 identity, X25519 message key, per-chain contract keys,
+unique hashlock, absolute refund heights and its exact signed first-leg funding
+package. The acceptance can remain valid until the signed order deadline and
+cannot outlive the order. It does not close the public offer by itself, so one
+offline taker cannot reserve the order against everyone else. Several
+acceptances may queue. The maker application signs the first valid acceptance it
 receives and leaves a manual retry only if relay delivery fails. The match
 binds the order ID, acceptance ID, trade ID and both identities. The store
 changes the order from `open` to `matched` atomically, so two concurrent takers
@@ -99,7 +111,9 @@ appears in the taker's mailbox. A mailbox poll contains a fresh timestamp,
 random nonce and cursor and is signed by the recipient identity. The relay
 cannot read another identity's mailbox by inventing a request.
 
-After a match, either peer may submit strictly ordered encrypted messages. Each
+After a match, either peer may submit strictly ordered encrypted messages. The
+maker uses this mailbox for its funding notice and a claim template which is
+fully signed except for the taker's committed hash preimage. Each
 message binds the network, order, trade, sender, recipient, sequence, creation
 time and expiry. The body is encrypted end to end with X25519 and NaCl box and
 the complete envelope is signed with Ed25519. The relay can verify the sender
@@ -123,6 +137,10 @@ application.
 
 Contract construction, chain observation, signing, claim and refund stay in the
 installed application. Signed matches enter a durable local state machine;
-funding still requires explicit review and approval. Prepared transactions,
-encrypted envelopes and mailbox cursors survive restarts. The later discovery
+publishing an exact offer or accepting one is the user's funding authorization.
+The taker's exact first-leg funding is part of the signed acceptance. The maker
+may relay it, fund the second leg and leave an encrypted claim template; the
+taker may later complete both claims without the maker returning. Prepared
+transactions, encrypted envelopes and mailbox cursors survive restarts, and
+unilateral refund paths remain valid if neither side returns in time. The later discovery
 mesh can transport the same records without changing their canonical format.

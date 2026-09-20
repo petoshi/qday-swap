@@ -263,6 +263,54 @@ func TestSwapTermsApprovalAndSecretAreDurable(t *testing.T) {
 	}
 }
 
+func TestAsyncTakerFundingSubmissionIsDurableAndReorgAware(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	signedOrder, acceptance, match := matchedFixture(t, now)
+	path := filepath.Join(t.TempDir(), "swaps.db")
+	journal, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, _, err := journal.Create(RoleTaker, signedOrder, acceptance, match, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The fixture predates the asynchronous payload fields. Change only the
+	// protocol discriminator and phase to exercise the journal marker itself.
+	if _, err := journal.updateSwap(record.ID, func(current *Swap) error {
+		current.Version = trade.AsyncProtocolVersion
+		current.Phase = PhaseAsyncTakerFunding
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	marked, err := journal.SetTakerFundingSubmitted(record.ID, true, now.Add(time.Second))
+	if err != nil || !marked.TakerFundingSubmitted {
+		t.Fatalf("mark funding submitted: %#v, %v", marked, err)
+	}
+	if err := journal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	journal, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer journal.Close()
+	marked, err = journal.Swap(record.ID)
+	if err != nil || !marked.TakerFundingSubmitted {
+		t.Fatalf("submission marker did not survive restart: %#v, %v", marked, err)
+	}
+	if _, err := journal.Advance(record.ID, PhaseAsyncTakerFunding, PhaseAsyncTakerFunded, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	rewound, err := journal.RewindAfterReorg(record.ID, PhaseAsyncTakerFunded, PhaseAsyncTakerFunding, "funding disappeared", now.Add(3*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	} else if rewound.TakerFundingSubmitted {
+		t.Fatal("reorg did not restore the taker funding reservation")
+	}
+}
+
 func TestOutboundMessageEnvelopeIsAtomicAndImmutable(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 	signedOrder, acceptance, match := matchedFixture(t, now)

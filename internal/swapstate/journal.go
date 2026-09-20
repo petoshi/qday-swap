@@ -44,21 +44,32 @@ const (
 type Phase string
 
 const (
-	PhaseMatched          Phase = "matched"
-	PhaseTermsProposed    Phase = "terms_proposed"
-	PhaseTermsAgreed      Phase = "terms_agreed"
-	PhaseMakerFunding     Phase = "maker_funding"
-	PhaseMakerFunded      Phase = "maker_funded"
-	PhaseTakerFunding     Phase = "taker_funding"
-	PhaseTakerFunded      Phase = "taker_funded"
-	PhaseMakerClaiming    Phase = "maker_claiming"
-	PhaseMakerClaimed     Phase = "maker_claimed"
-	PhaseTakerClaiming    Phase = "taker_claiming"
-	PhaseComplete         Phase = "complete"
-	PhaseWaitingForRefund Phase = "waiting_for_refund"
-	PhaseRefunding        Phase = "refunding"
-	PhaseRefunded         Phase = "refunded"
-	PhaseExpired          Phase = "expired"
+	PhaseMatched       Phase = "matched"
+	PhaseTermsProposed Phase = "terms_proposed"
+	PhaseTermsAgreed   Phase = "terms_agreed"
+	PhaseMakerFunding  Phase = "maker_funding"
+	PhaseMakerFunded   Phase = "maker_funded"
+	PhaseTakerFunding  Phase = "taker_funding"
+	PhaseTakerFunded   Phase = "taker_funded"
+	PhaseMakerClaiming Phase = "maker_claiming"
+	PhaseMakerClaimed  Phase = "maker_claimed"
+	PhaseTakerClaiming Phase = "taker_claiming"
+	// Version 2 accepts a fully signed taker funding transaction with the
+	// acceptance. Its safe execution order is therefore the reverse of the
+	// original online protocol: taker funds, maker funds, taker reveals the
+	// secret, and maker claims the first leg.
+	PhaseAsyncTakerFunding  Phase = "async_taker_funding"
+	PhaseAsyncTakerFunded   Phase = "async_taker_funded"
+	PhaseAsyncMakerFunding  Phase = "async_maker_funding"
+	PhaseAsyncMakerFunded   Phase = "async_maker_funded"
+	PhaseAsyncTakerClaiming Phase = "async_taker_claiming"
+	PhaseAsyncTakerClaimed  Phase = "async_taker_claimed"
+	PhaseAsyncMakerClaiming Phase = "async_maker_claiming"
+	PhaseComplete           Phase = "complete"
+	PhaseWaitingForRefund   Phase = "waiting_for_refund"
+	PhaseRefunding          Phase = "refunding"
+	PhaseRefunded           Phase = "refunded"
+	PhaseExpired            Phase = "expired"
 )
 
 type Swap struct {
@@ -77,12 +88,18 @@ type Swap struct {
 	SentMessages   map[string]string      `json:"sentMessages,omitempty"`
 	MakerFunding   string                 `json:"makerFunding,omitempty"`
 	TakerFunding   string                 `json:"takerFunding,omitempty"`
-	Approved       bool                   `json:"approved"`
-	RevealedSecret string                 `json:"revealedSecret,omitempty"`
-	MailboxCursor  uint64                 `json:"mailboxCursor"`
-	LastError      string                 `json:"lastError,omitempty"`
-	CreatedAt      int64                  `json:"createdAt"`
-	UpdatedAt      int64                  `json:"updatedAt"`
+	// TakerFundingSubmitted distinguishes the portable transaction committed
+	// by an acceptance from one that has actually reached either chain. It is
+	// deliberately durable: after a crash the exact signed bytes are replayed
+	// before the local amount becomes available for another order.
+	TakerFundingSubmitted bool   `json:"takerFundingSubmitted,omitempty"`
+	MakerClaimTemplate    string `json:"makerClaimTemplate,omitempty"`
+	Approved              bool   `json:"approved"`
+	RevealedSecret        string `json:"revealedSecret,omitempty"`
+	MailboxCursor         uint64 `json:"mailboxCursor"`
+	LastError             string `json:"lastError,omitempty"`
+	CreatedAt             int64  `json:"createdAt"`
+	UpdatedAt             int64  `json:"updatedAt"`
 }
 
 type ActionStatus string
@@ -399,7 +416,7 @@ func (j *Journal) Create(role Role, signedOrder order.Signed, acceptance trade.S
 		return Swap{}, false, err
 	}
 	record := Swap{
-		Version: 1, ID: acceptance.Acceptance.TradeID, Role: role, Phase: PhaseMatched,
+		Version: acceptance.Acceptance.Version, ID: acceptance.Acceptance.TradeID, Role: role, Phase: PhaseMatched,
 		Order: signedOrder, Acceptance: acceptance, Match: match,
 		CreatedAt: now.Unix(), UpdatedAt: now.Unix(),
 	}
@@ -482,6 +499,12 @@ func (j *Journal) RewindAfterReorg(id string, expected, next Phase, reason strin
 			return ErrPhaseChanged
 		}
 		record.Phase = next
+		if next == PhaseAsyncTakerFunding {
+			// A funding transaction which disappeared from both the best chain and
+			// the observer's mempool must be reserved again until its exact signed
+			// bytes have been accepted for rebroadcast.
+			record.TakerFundingSubmitted = false
+		}
 		record.LastError = reason
 		record.UpdatedAt = now.Unix()
 		return nil
@@ -544,6 +567,31 @@ func (j *Journal) SetFunding(id, party, fundingJSON string, now time.Time) (Swap
 	})
 }
 
+func (j *Journal) SetTakerFundingSubmitted(id string, submitted bool, now time.Time) (Swap, error) {
+	return j.updateSwap(id, func(record *Swap) error {
+		if record.Version != trade.AsyncProtocolVersion {
+			return errors.New("taker funding submission applies only to asynchronous swaps")
+		}
+		record.TakerFundingSubmitted = submitted
+		record.UpdatedAt = now.Unix()
+		return nil
+	})
+}
+
+func (j *Journal) SetMakerClaimTemplate(id, templateJSON string, now time.Time) (Swap, error) {
+	if templateJSON == "" || !json.Valid([]byte(templateJSON)) {
+		return Swap{}, errors.New("maker claim template must be valid JSON")
+	}
+	return j.updateSwap(id, func(record *Swap) error {
+		if record.MakerClaimTemplate != "" && record.MakerClaimTemplate != templateJSON {
+			return errors.New("maker claim template is immutable")
+		}
+		record.MakerClaimTemplate = templateJSON
+		record.UpdatedAt = now.Unix()
+		return nil
+	})
+}
+
 func (j *Journal) SetAgreementDetails(id, secretHash, agreementHash, agreementJSON string, expected Phase, now time.Time) (Swap, error) {
 	if len(secretHash) != 64 || len(agreementHash) != 64 {
 		return Swap{}, errors.New("secret and agreement hashes must be 32-byte hexadecimal strings")
@@ -569,7 +617,9 @@ func (j *Journal) Approve(id string, now time.Time) (Swap, error) {
 	return j.updateSwap(id, func(record *Swap) error {
 		switch record.Phase {
 		case PhaseTermsAgreed, PhaseMakerFunding, PhaseMakerFunded, PhaseTakerFunding, PhaseTakerFunded,
-			PhaseMakerClaiming, PhaseMakerClaimed, PhaseTakerClaiming:
+			PhaseMakerClaiming, PhaseMakerClaimed, PhaseTakerClaiming,
+			PhaseAsyncTakerFunding, PhaseAsyncTakerFunded, PhaseAsyncMakerFunding, PhaseAsyncMakerFunded,
+			PhaseAsyncTakerClaiming, PhaseAsyncTakerClaimed, PhaseAsyncMakerClaiming:
 		default:
 			return errors.New("swap terms are not ready for funding approval")
 		}
@@ -779,18 +829,25 @@ func (j *Journal) updateAction(id string, update func(*Action) error) (Action, e
 
 func validAdvance(from, to Phase) bool {
 	allowed := map[Phase][]Phase{
-		PhaseMatched:          {PhaseTermsProposed, PhaseWaitingForRefund},
-		PhaseTermsProposed:    {PhaseTermsAgreed, PhaseWaitingForRefund, PhaseExpired},
-		PhaseTermsAgreed:      {PhaseMakerFunding, PhaseWaitingForRefund, PhaseExpired},
-		PhaseMakerFunding:     {PhaseMakerFunded, PhaseWaitingForRefund, PhaseExpired},
-		PhaseMakerFunded:      {PhaseTakerFunding, PhaseWaitingForRefund, PhaseExpired},
-		PhaseTakerFunding:     {PhaseTakerFunded, PhaseWaitingForRefund, PhaseExpired},
-		PhaseTakerFunded:      {PhaseMakerClaiming, PhaseWaitingForRefund},
-		PhaseMakerClaiming:    {PhaseMakerClaimed, PhaseWaitingForRefund},
-		PhaseMakerClaimed:     {PhaseTakerClaiming, PhaseWaitingForRefund},
-		PhaseTakerClaiming:    {PhaseComplete, PhaseWaitingForRefund},
-		PhaseWaitingForRefund: {PhaseRefunding},
-		PhaseRefunding:        {PhaseRefunded},
+		PhaseMatched:            {PhaseTermsProposed, PhaseAsyncTakerFunding, PhaseWaitingForRefund},
+		PhaseTermsProposed:      {PhaseTermsAgreed, PhaseWaitingForRefund, PhaseExpired},
+		PhaseTermsAgreed:        {PhaseMakerFunding, PhaseWaitingForRefund, PhaseExpired},
+		PhaseMakerFunding:       {PhaseMakerFunded, PhaseWaitingForRefund, PhaseExpired},
+		PhaseMakerFunded:        {PhaseTakerFunding, PhaseWaitingForRefund, PhaseExpired},
+		PhaseTakerFunding:       {PhaseTakerFunded, PhaseWaitingForRefund, PhaseExpired},
+		PhaseTakerFunded:        {PhaseMakerClaiming, PhaseWaitingForRefund},
+		PhaseMakerClaiming:      {PhaseMakerClaimed, PhaseWaitingForRefund},
+		PhaseMakerClaimed:       {PhaseTakerClaiming, PhaseWaitingForRefund},
+		PhaseTakerClaiming:      {PhaseComplete, PhaseWaitingForRefund},
+		PhaseAsyncTakerFunding:  {PhaseAsyncTakerFunded, PhaseWaitingForRefund, PhaseExpired},
+		PhaseAsyncTakerFunded:   {PhaseAsyncMakerFunding, PhaseWaitingForRefund},
+		PhaseAsyncMakerFunding:  {PhaseAsyncMakerFunded, PhaseWaitingForRefund},
+		PhaseAsyncMakerFunded:   {PhaseAsyncTakerClaiming, PhaseWaitingForRefund},
+		PhaseAsyncTakerClaiming: {PhaseAsyncTakerClaimed, PhaseWaitingForRefund},
+		PhaseAsyncTakerClaimed:  {PhaseAsyncMakerClaiming, PhaseWaitingForRefund},
+		PhaseAsyncMakerClaiming: {PhaseComplete, PhaseWaitingForRefund},
+		PhaseWaitingForRefund:   {PhaseRefunding},
+		PhaseRefunding:          {PhaseRefunded},
 	}
 	for _, candidate := range allowed[from] {
 		if candidate == to {
@@ -811,5 +868,16 @@ func validRewind(from, to Phase) bool {
 		(from == PhaseTakerClaiming && to == PhaseMakerClaiming) ||
 		(from == PhaseComplete && to == PhaseMakerClaiming) ||
 		(from == PhaseComplete && to == PhaseTakerClaiming) ||
+		(from == PhaseAsyncTakerFunded && to == PhaseAsyncTakerFunding) ||
+		(from == PhaseAsyncMakerFunding && to == PhaseAsyncTakerFunding) ||
+		(from == PhaseAsyncMakerFunded && to == PhaseAsyncTakerFunding) ||
+		(from == PhaseAsyncMakerFunded && to == PhaseAsyncMakerFunding) ||
+		(from == PhaseAsyncTakerClaiming && to == PhaseAsyncTakerFunding) ||
+		(from == PhaseAsyncTakerClaiming && to == PhaseAsyncMakerFunding) ||
+		(from == PhaseAsyncTakerClaimed && to == PhaseAsyncTakerClaiming) ||
+		(from == PhaseAsyncMakerClaiming && to == PhaseAsyncTakerClaiming) ||
+		(from == PhaseAsyncMakerClaiming && to == PhaseAsyncTakerFunding) ||
+		(from == PhaseComplete && to == PhaseAsyncTakerClaiming) ||
+		(from == PhaseComplete && to == PhaseAsyncMakerClaiming) ||
 		(from == PhaseRefunded && to == PhaseRefunding)
 }

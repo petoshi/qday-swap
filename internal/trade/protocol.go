@@ -15,38 +15,62 @@ import (
 	"strings"
 	"time"
 
+	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/petoshi/qday-swap/internal/order"
 	"golang.org/x/crypto/nacl/box"
 )
 
 const (
-	ProtocolVersion    = uint16(1)
-	MaxPlaintextSize   = 32 << 10
-	MaxMailboxPageSize = 100
+	ProtocolVersion      = uint16(1)
+	AsyncProtocolVersion = uint16(2)
+	MaxPlaintextSize     = 32 << 10
+	MaxMailboxPageSize   = 100
 
 	minimumAcceptanceLifetime = time.Minute
-	maximumAcceptanceLifetime = 15 * time.Minute
+	maximumAcceptanceLifetime = 30 * 24 * time.Hour
 	minimumMessageLifetime    = time.Minute
 	maximumMessageLifetime    = 30 * 24 * time.Hour
 	maximumClockSkew          = 5 * time.Minute
+	asyncShortQDAYWindow      = uint64(1_440)
+	asyncLongQDAYWindow       = uint64(2_880)
+	asyncShortBitcoinWindow   = uint32(144)
+	asyncLongBitcoinWindow    = uint32(288)
 )
 
 var (
-	acceptanceDomain = []byte("QDAY_SWAP_ACCEPTANCE_V1")
-	matchDomain      = []byte("QDAY_SWAP_MATCH_V1")
-	messageDomain    = []byte("QDAY_SWAP_MESSAGE_V1")
-	pollDomain       = []byte("QDAY_SWAP_MAILBOX_POLL_V1")
+	acceptanceDomain      = []byte("QDAY_SWAP_ACCEPTANCE_V1")
+	asyncAcceptanceDomain = []byte("QDAY_SWAP_ACCEPTANCE_V2")
+	matchDomain           = []byte("QDAY_SWAP_MATCH_V1")
+	asyncMatchDomain      = []byte("QDAY_SWAP_MATCH_V2")
+	messageDomain         = []byte("QDAY_SWAP_MESSAGE_V1")
+	pollDomain            = []byte("QDAY_SWAP_MAILBOX_POLL_V1")
 )
 
+type FundingPackage struct {
+	Asset           string   `json:"asset"`
+	TransactionID   string   `json:"transactionID"`
+	RawTransactions []string `json:"rawTransactions"`
+	BasisHeight     uint64   `json:"basisHeight,omitempty"`
+	BasisID         string   `json:"basisID,omitempty"`
+}
+
 type AcceptancePayload struct {
-	Version         uint16 `json:"version"`
-	Network         string `json:"network"`
-	OrderID         string `json:"orderID"`
-	TradeID         string `json:"tradeID"`
-	TakerPublicKey  string `json:"takerPublicKey"`
-	TakerMessageKey string `json:"takerMessageKey"`
-	CreatedAt       int64  `json:"createdAt"`
-	ExpiresAt       int64  `json:"expiresAt"`
+	Version          uint16         `json:"version"`
+	Network          string         `json:"network"`
+	OrderID          string         `json:"orderID"`
+	TradeID          string         `json:"tradeID"`
+	TakerPublicKey   string         `json:"takerPublicKey"`
+	TakerMessageKey  string         `json:"takerMessageKey"`
+	CreatedAt        int64          `json:"createdAt"`
+	ExpiresAt        int64          `json:"expiresAt"`
+	TakerQDAY        order.QDAYKeys `json:"takerQDAY,omitempty"`
+	TakerBitcoinKey  string         `json:"takerBitcoinPublicKey,omitempty"`
+	TakerQDAYHeight  uint64         `json:"takerQDAYHeight,omitempty"`
+	TakerBTCHeight   uint32         `json:"takerBitcoinHeight,omitempty"`
+	SecretHash       string         `json:"secretHash,omitempty"`
+	QDAYRefundHeight uint64         `json:"qdayRefundHeight,omitempty"`
+	BTCRefundHeight  uint32         `json:"bitcoinRefundHeight,omitempty"`
+	Funding          FundingPackage `json:"funding,omitempty"`
 }
 
 type SignedAcceptance struct {
@@ -94,6 +118,71 @@ func NewAcceptance(signedOrder order.Signed, lifetime time.Duration, privateKey 
 	}, nil
 }
 
+func NewTradeID() (string, error) {
+	tradeID := make([]byte, sha256.Size)
+	if _, err := rand.Read(tradeID); err != nil {
+		return "", fmt.Errorf("generate trade ID: %w", err)
+	}
+	return hex.EncodeToString(tradeID), nil
+}
+
+// AsyncRefundHeights anchors both unilateral refund paths after the public
+// order deadline. The taker funds first, so its leg receives the longer
+// window; the maker leg is claimed first with the taker's secret.
+func AsyncRefundHeights(terms order.Payload, acceptanceCreatedAt int64, takerQDAYHeight uint64, takerBitcoinHeight uint32) (uint64, uint32, error) {
+	if terms.Version != order.AsyncProtocolVersion {
+		return 0, 0, errors.New("asynchronous refund heights require a version 2 order")
+	}
+	remaining := terms.ExpiresAt - acceptanceCreatedAt
+	if remaining < 0 {
+		return 0, 0, errors.New("acceptance was created after order expiry")
+	}
+	qdayDelay := uint64((remaining + 59) / 60)
+	bitcoinDelay64 := uint64((remaining + 599) / 600)
+	qdayBase := max(terms.MakerQDAYHeight, takerQDAYHeight)
+	bitcoinBase := max(terms.MakerBTCHeight, takerBitcoinHeight)
+	qdayWindow, bitcoinWindow := asyncLongQDAYWindow, asyncShortBitcoinWindow
+	if terms.Give.Asset == "QDAY" {
+		qdayWindow, bitcoinWindow = asyncShortQDAYWindow, asyncLongBitcoinWindow
+	}
+	qdayRefund := qdayBase + qdayDelay + qdayWindow
+	bitcoinRefund64 := uint64(bitcoinBase) + bitcoinDelay64 + uint64(bitcoinWindow)
+	if qdayRefund < qdayBase || bitcoinRefund64 > uint64(^uint32(0)) {
+		return 0, 0, errors.New("asynchronous refund height overflows")
+	}
+	return qdayRefund, uint32(bitcoinRefund64), nil
+}
+
+func NewAsyncAcceptance(signedOrder order.Signed, tradeID string, qdayKeys order.QDAYKeys, bitcoinPublicKey string, qdayHeight uint64, bitcoinHeight uint32, secretHash string, qdayRefundHeight uint64, bitcoinRefundHeight uint32, funding FundingPackage, privateKey ed25519.PrivateKey, messageKey [32]byte, now time.Time) (SignedAcceptance, error) {
+	if signedOrder.Order.Version != order.AsyncProtocolVersion {
+		return SignedAcceptance{}, errors.New("asynchronous acceptance requires a version 2 order")
+	}
+	if err := signedOrder.Verify(now); err != nil {
+		return SignedAcceptance{}, fmt.Errorf("verify order: %w", err)
+	}
+	if len(privateKey) != ed25519.PrivateKeySize {
+		return SignedAcceptance{}, errors.New("invalid Ed25519 private key")
+	}
+	payload := AcceptancePayload{
+		Version: AsyncProtocolVersion, Network: signedOrder.Order.Network, OrderID: signedOrder.ID,
+		TradeID: tradeID, TakerPublicKey: hex.EncodeToString(privateKey.Public().(ed25519.PublicKey)),
+		TakerMessageKey: hex.EncodeToString(messageKey[:]), CreatedAt: now.Unix(), ExpiresAt: signedOrder.Order.ExpiresAt,
+		TakerQDAY: qdayKeys, TakerBitcoinKey: bitcoinPublicKey,
+		TakerQDAYHeight: qdayHeight, TakerBTCHeight: bitcoinHeight,
+		SecretHash: secretHash, QDAYRefundHeight: qdayRefundHeight, BTCRefundHeight: bitcoinRefundHeight,
+		Funding: funding,
+	}
+	if err := payload.validate(signedOrder, now); err != nil {
+		return SignedAcceptance{}, err
+	}
+	digest := sha256.Sum256(payload.signingBytes())
+	return SignedAcceptance{
+		Acceptance: payload,
+		ID:         hex.EncodeToString(digest[:]),
+		Signature:  hex.EncodeToString(ed25519.Sign(privateKey, digest[:])),
+	}, nil
+}
+
 func (a SignedAcceptance) Verify(signedOrder order.Signed, now time.Time) error {
 	if err := signedOrder.Verify(now); err != nil {
 		return fmt.Errorf("verify order: %w", err)
@@ -120,8 +209,13 @@ func (a SignedAcceptance) Verify(signedOrder order.Signed, now time.Time) error 
 }
 
 func (p AcceptancePayload) validate(signedOrder order.Signed, now time.Time) error {
-	if p.Version != ProtocolVersion {
+	if p.Version != ProtocolVersion && p.Version != AsyncProtocolVersion {
 		return fmt.Errorf("unsupported acceptance version %d", p.Version)
+	}
+	if p.Version == AsyncProtocolVersion && signedOrder.Order.Version != order.AsyncProtocolVersion {
+		return errors.New("asynchronous acceptance belongs to a legacy order")
+	} else if p.Version == ProtocolVersion && signedOrder.Order.Version != order.ProtocolVersion {
+		return errors.New("legacy acceptance belongs to an asynchronous order")
 	}
 	if p.Network != signedOrder.Order.Network || p.OrderID != signedOrder.ID {
 		return errors.New("acceptance does not belong to this order")
@@ -137,6 +231,21 @@ func (p AcceptancePayload) validate(signedOrder order.Signed, now time.Time) err
 	}
 	if _, err := DecodeMessageKey(p.TakerMessageKey); err != nil {
 		return fmt.Errorf("taker message key: %w", err)
+	}
+	if p.Version == AsyncProtocolVersion {
+		if err := validateQDAYKeys(p.TakerQDAY); err != nil {
+			return fmt.Errorf("taker QDAY keys: %w", err)
+		} else if err := validateBitcoinKey(p.TakerBitcoinKey); err != nil {
+			return fmt.Errorf("taker Bitcoin key: %w", err)
+		} else if _, err := decodeDigest(p.SecretHash, "secret hash"); err != nil {
+			return err
+		} else if p.TakerQDAYHeight == 0 || p.TakerBTCHeight == 0 || p.QDAYRefundHeight <= p.TakerQDAYHeight || p.BTCRefundHeight <= p.TakerBTCHeight {
+			return errors.New("asynchronous acceptance chain and refund heights are invalid")
+		} else if err := p.Funding.validate(signedOrder.Order.Receive.Asset); err != nil {
+			return err
+		}
+	} else if p.TakerQDAY != (order.QDAYKeys{}) || p.TakerBitcoinKey != "" || p.TakerQDAYHeight != 0 || p.TakerBTCHeight != 0 || p.SecretHash != "" || p.QDAYRefundHeight != 0 || p.BTCRefundHeight != 0 || p.Funding.Asset != "" || p.Funding.TransactionID != "" || len(p.Funding.RawTransactions) != 0 || p.Funding.BasisHeight != 0 || p.Funding.BasisID != "" {
+		return errors.New("version 1 acceptance contains asynchronous protocol fields")
 	}
 	created := time.Unix(p.CreatedAt, 0)
 	expires := time.Unix(p.ExpiresAt, 0)
@@ -157,7 +266,11 @@ func (p AcceptancePayload) validate(signedOrder order.Signed, now time.Time) err
 }
 
 func (p AcceptancePayload) signingBytes() []byte {
-	encoder := canonicalEncoder{bytes: append([]byte(nil), acceptanceDomain...)}
+	domain := acceptanceDomain
+	if p.Version == AsyncProtocolVersion {
+		domain = asyncAcceptanceDomain
+	}
+	encoder := canonicalEncoder{bytes: append([]byte(nil), domain...)}
 	encoder.uint16(p.Version)
 	encoder.text(p.Network)
 	encoder.text(p.OrderID)
@@ -166,7 +279,89 @@ func (p AcceptancePayload) signingBytes() []byte {
 	encoder.text(p.TakerMessageKey)
 	encoder.int64(p.CreatedAt)
 	encoder.int64(p.ExpiresAt)
+	if p.Version == AsyncProtocolVersion {
+		encoder.text(p.TakerQDAY.Classical)
+		encoder.text(p.TakerQDAY.Reserve)
+		encoder.text(p.TakerQDAY.Address)
+		encoder.text(p.TakerBitcoinKey)
+		encoder.uint64(p.TakerQDAYHeight)
+		encoder.uint32(p.TakerBTCHeight)
+		encoder.text(p.SecretHash)
+		encoder.uint64(p.QDAYRefundHeight)
+		encoder.uint32(p.BTCRefundHeight)
+		encoder.text(p.Funding.Asset)
+		encoder.text(p.Funding.TransactionID)
+		encoder.uint64(p.Funding.BasisHeight)
+		encoder.text(p.Funding.BasisID)
+		encoder.uint32(uint32(len(p.Funding.RawTransactions)))
+		for _, raw := range p.Funding.RawTransactions {
+			encoder.text(raw)
+		}
+	}
 	return encoder.bytes
+}
+
+func (p FundingPackage) validate(expectedAsset string) error {
+	if p.Asset != expectedAsset {
+		return errors.New("prepared funding asset does not match the taker's signed amount")
+	} else if _, err := decodeDigest(p.TransactionID, "funding transaction ID"); err != nil {
+		return err
+	} else if len(p.RawTransactions) == 0 || len(p.RawTransactions) > 2 {
+		return errors.New("prepared funding package must contain one or two transactions")
+	}
+	for _, raw := range p.RawTransactions {
+		if raw == "" || len(raw) > 2<<20 {
+			return errors.New("prepared funding transaction size is invalid")
+		}
+	}
+	if p.Asset == "QDAY" {
+		if p.BasisHeight == 0 {
+			return errors.New("QDAY funding basis height is missing")
+		} else if _, err := decodeDigest(p.BasisID, "QDAY funding basis ID"); err != nil {
+			return err
+		}
+		for _, raw := range p.RawTransactions {
+			decoded, err := base64.RawStdEncoding.DecodeString(raw)
+			if err != nil || base64.RawStdEncoding.EncodeToString(decoded) != raw {
+				return errors.New("QDAY funding transaction is not canonical base64 data")
+			}
+		}
+	} else if p.Asset == "BTC" {
+		if p.BasisHeight != 0 || p.BasisID != "" || len(p.RawTransactions) != 1 {
+			return errors.New("Bitcoin funding package contains QDAY basis data")
+		}
+		decoded, err := hex.DecodeString(p.RawTransactions[0])
+		if err != nil || len(decoded) == 0 || p.RawTransactions[0] != strings.ToLower(p.RawTransactions[0]) {
+			return errors.New("Bitcoin funding transaction is not lowercase hexadecimal data")
+		}
+	} else {
+		return errors.New("prepared funding asset must be QDAY or BTC")
+	}
+	return nil
+}
+
+func validateQDAYKeys(keys order.QDAYKeys) error {
+	for _, field := range []struct{ name, value string }{{"classical", keys.Classical}, {"reserve", keys.Reserve}} {
+		decoded, err := hex.DecodeString(field.value)
+		if err != nil || len(decoded) != 32 || field.value != strings.ToLower(field.value) {
+			return fmt.Errorf("%s key must be 32 lowercase hexadecimal bytes", field.name)
+		}
+	}
+	if strings.TrimSpace(keys.Address) == "" || len(keys.Address) > 128 {
+		return errors.New("address is invalid")
+	}
+	return nil
+}
+
+func validateBitcoinKey(value string) error {
+	decoded, err := hex.DecodeString(value)
+	if err != nil || len(decoded) != 33 || value != strings.ToLower(value) {
+		return errors.New("public key must be 33 lowercase hexadecimal bytes")
+	}
+	if _, err := btcec.ParsePubKey(decoded); err != nil {
+		return errors.New("public key must be valid compressed secp256k1 data")
+	}
+	return nil
 }
 
 type MatchPayload struct {
@@ -194,7 +389,7 @@ func NewMatch(signedOrder order.Signed, acceptance SignedAcceptance, privateKey 
 		return SignedMatch{}, errors.New("private key does not match order maker")
 	}
 	payload := MatchPayload{
-		Version:        ProtocolVersion,
+		Version:        acceptance.Acceptance.Version,
 		Network:        signedOrder.Order.Network,
 		OrderID:        signedOrder.ID,
 		TradeID:        acceptance.Acceptance.TradeID,
@@ -212,8 +407,10 @@ func (m SignedMatch) Verify(signedOrder order.Signed, acceptance SignedAcceptanc
 		return fmt.Errorf("verify acceptance: %w", err)
 	}
 	payload := m.Match
-	if payload.Version != ProtocolVersion {
+	if payload.Version != ProtocolVersion && payload.Version != AsyncProtocolVersion {
 		return fmt.Errorf("unsupported match version %d", payload.Version)
+	} else if payload.Version != acceptance.Acceptance.Version {
+		return errors.New("match protocol version differs from its acceptance")
 	}
 	if payload.Network != signedOrder.Order.Network || payload.OrderID != signedOrder.ID || payload.TradeID != acceptance.Acceptance.TradeID || payload.AcceptanceID != acceptance.ID {
 		return errors.New("match does not bind the selected order and acceptance")
@@ -247,7 +444,11 @@ func (m SignedMatch) Verify(signedOrder order.Signed, acceptance SignedAcceptanc
 }
 
 func (p MatchPayload) signingBytes() []byte {
-	encoder := canonicalEncoder{bytes: append([]byte(nil), matchDomain...)}
+	domain := matchDomain
+	if p.Version == AsyncProtocolVersion {
+		domain = asyncMatchDomain
+	}
+	encoder := canonicalEncoder{bytes: append([]byte(nil), domain...)}
 	encoder.uint16(p.Version)
 	encoder.text(p.Network)
 	encoder.text(p.OrderID)
@@ -554,6 +755,12 @@ type canonicalEncoder struct{ bytes []byte }
 func (e *canonicalEncoder) uint16(value uint16) {
 	var buffer [2]byte
 	binary.BigEndian.PutUint16(buffer[:], value)
+	e.bytes = append(e.bytes, buffer[:]...)
+}
+
+func (e *canonicalEncoder) uint32(value uint32) {
+	var buffer [4]byte
+	binary.BigEndian.PutUint32(buffer[:], value)
 	e.bytes = append(e.bytes, buffer[:]...)
 }
 

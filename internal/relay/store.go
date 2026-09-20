@@ -63,11 +63,12 @@ func (record Record) at(now time.Time) Record {
 }
 
 type Query struct {
-	Status    Status
-	Market    string
-	GiveAsset string
-	Page      int
-	Limit     int
+	Status         Status
+	Market         string
+	GiveAsset      string
+	MakerPublicKey string
+	Page           int
+	Limit          int
 }
 
 type ResultPage struct {
@@ -251,6 +252,9 @@ func (s *Store) List(query Query, now time.Time) (ResultPage, error) {
 				return nil
 			}
 			if query.GiveAsset != "" && record.Signed.Order.Give.Asset != query.GiveAsset {
+				return nil
+			}
+			if query.MakerPublicKey != "" && record.Signed.Order.MakerPublicKey != query.MakerPublicKey {
 				return nil
 			}
 			records = append(records, record)

@@ -192,6 +192,90 @@ func (c Contract) BuildClaim(funding Funding, destinationScript []byte, fee int6
 	return c.buildSpend(funding, destinationScript, fee, key, &secret)
 }
 
+// BuildClaimTemplate signs the claim branch while leaving the hash preimage
+// empty. SegWit signatures commit to the transaction and witness script, but
+// not to witness stack items, so the secret owner can safely complete and
+// relay these exact terms later without holding the recipient's private key.
+func (c Contract) BuildClaimTemplate(funding Funding, destinationScript []byte, fee int64, key *btcec.PrivateKey) (string, error) {
+	if funding.Amount != c.Amount {
+		return "", errors.New("funding amount does not match contract")
+	} else if funding.TxID != "" && funding.TxID != funding.Hash.String() {
+		return "", errors.New("funding transaction ID does not match its hash")
+	} else if len(destinationScript) == 0 {
+		return "", errors.New("spend destination script is empty")
+	} else if fee <= 0 || fee >= c.Amount {
+		return "", errors.New("spend fee must be positive and smaller than the contract amount")
+	} else if key == nil || !bytes.Equal(key.PubKey().SerializeCompressed(), c.RecipientPubKey[:]) {
+		return "", errors.New("spend key does not match the claim branch")
+	}
+	witnessScript, err := c.WitnessScript()
+	if err != nil {
+		return "", err
+	}
+	pkScript, err := c.PkScript()
+	if err != nil {
+		return "", err
+	}
+	tx := wire.NewMsgTx(2)
+	input := wire.NewTxIn(wire.NewOutPoint(&funding.Hash, funding.Vout), nil, nil)
+	input.Sequence = 0xfffffffe
+	tx.AddTxIn(input)
+	tx.AddTxOut(wire.NewTxOut(c.Amount-fee, bytes.Clone(destinationScript)))
+	fetcher := txscript.NewCannedPrevOutputFetcher(pkScript, c.Amount)
+	sigHashes := txscript.NewTxSigHashes(tx, fetcher)
+	sig, err := txscript.RawTxInWitnessSignature(tx, sigHashes, 0, c.Amount, witnessScript, txscript.SigHashAll, key)
+	if err != nil {
+		return "", fmt.Errorf("sign contract claim template: %w", err)
+	}
+	tx.TxIn[0].Witness = wire.TxWitness{sig, nil, []byte{1}, witnessScript}
+	return EncodeTransaction(tx)
+}
+
+// CompleteClaimTemplate verifies the exact contract outpoint and canonical
+// claim witness, inserts the matching secret, and executes the script before
+// returning broadcast-ready bytes.
+func (c Contract) CompleteClaimTemplate(raw string, funding Funding, secret [32]byte) (string, error) {
+	if sha256.Sum256(secret[:]) != c.SecretHash {
+		return "", errors.New("claim secret does not match the contract hash")
+	}
+	tx, err := DecodeTransaction(raw)
+	if err != nil {
+		return "", err
+	} else if len(tx.TxIn) != 1 || len(tx.TxOut) != 1 {
+		return "", errors.New("claim template must contain exactly one input and one output")
+	}
+	input := tx.TxIn[0]
+	if input.PreviousOutPoint.Hash != funding.Hash || input.PreviousOutPoint.Index != funding.Vout {
+		return "", errors.New("claim template spends another outpoint")
+	} else if tx.LockTime != 0 || input.Sequence == 0xffffffff {
+		return "", errors.New("claim template lock fields are invalid")
+	} else if tx.TxOut[0].Value <= 0 || tx.TxOut[0].Value >= c.Amount {
+		return "", errors.New("claim template output amount is invalid")
+	}
+	witnessScript, err := c.WitnessScript()
+	if err != nil {
+		return "", err
+	}
+	witness := input.Witness
+	if len(witness) != 4 || len(witness[0]) == 0 || len(witness[1]) != 0 || len(witness[2]) == 0 || !bytes.Equal(witness[3], witnessScript) {
+		return "", errors.New("claim template does not contain the canonical incomplete witness")
+	}
+	input.Witness[1] = bytes.Clone(secret[:])
+	pkScript, err := c.PkScript()
+	if err != nil {
+		return "", err
+	}
+	fetcher := txscript.NewCannedPrevOutputFetcher(pkScript, c.Amount)
+	sigHashes := txscript.NewTxSigHashes(tx, fetcher)
+	engine, err := txscript.NewEngine(pkScript, tx, 0, txscript.StandardVerifyFlags, nil, sigHashes, c.Amount, fetcher)
+	if err != nil {
+		return "", fmt.Errorf("verify completed claim template: %w", err)
+	} else if err := engine.Execute(); err != nil {
+		return "", fmt.Errorf("verify completed claim template: %w", err)
+	}
+	return EncodeTransaction(tx)
+}
+
 // BuildRefund creates a fully signed transaction that becomes valid at the
 // contract's absolute refund height.
 func (c Contract) BuildRefund(funding Funding, destinationScript []byte, fee int64, key *btcec.PrivateKey) (string, error) {

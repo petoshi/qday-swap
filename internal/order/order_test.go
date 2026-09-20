@@ -3,9 +3,12 @@ package order
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/hex"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/btcsuite/btcd/btcec/v2"
 )
 
 func signedTestOrder(t *testing.T, now time.Time) (Signed, ed25519.PrivateKey) {
@@ -24,6 +27,55 @@ func signedTestOrder(t *testing.T, now time.Time) (Signed, ed25519.PrivateKey) {
 		t.Fatal(err)
 	}
 	return signed, privateKey
+}
+
+func signedAsyncTestOrder(t *testing.T, now time.Time) (Signed, ed25519.PrivateKey) {
+	t.Helper()
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bitcoinKey, err := btcec.NewPrivateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := NewAsyncPayload(
+		"mainnet", QDAYDefendUnit,
+		Amount{Asset: "QDAY", Atomic: "2500000000000000000"},
+		Amount{Asset: "BTC", Atomic: "150000"},
+		time.Hour, publicKey, [32]byte{1}, strings.Repeat("2", 64),
+		QDAYKeys{Classical: strings.Repeat("3", 64), Reserve: strings.Repeat("4", 64), Address: "qday1maker"},
+		hex.EncodeToString(bitcoinKey.PubKey().SerializeCompressed()), 12_000, 900_000, now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signed, err := Sign(payload, privateKey, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return signed, privateKey
+}
+
+func TestAsyncOrderBindsSwapDescriptors(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	signed, _ := signedAsyncTestOrder(t, now)
+	if err := signed.Verify(now); err != nil {
+		t.Fatal(err)
+	}
+	for _, mutate := range []func(*Signed){
+		func(value *Signed) { value.Order.SessionID = strings.Repeat("5", 64) },
+		func(value *Signed) { value.Order.MakerQDAY.Address = "qday1changed" },
+		func(value *Signed) { value.Order.MakerBitcoinKey = "02" + strings.Repeat("0", 64) },
+		func(value *Signed) { value.Order.MakerQDAYHeight++ },
+		func(value *Signed) { value.Order.MakerBTCHeight++ },
+	} {
+		tampered := signed
+		mutate(&tampered)
+		if err := tampered.Verify(now); err == nil {
+			t.Fatal("tampered asynchronous order verified")
+		}
+	}
 }
 
 func TestSignedOrderRoundTripAndTampering(t *testing.T) {

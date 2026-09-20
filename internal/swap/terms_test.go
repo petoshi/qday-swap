@@ -3,12 +3,14 @@ package swap
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/hex"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/petoshi/qday-swap/internal/order"
+	"github.com/petoshi/qday-swap/internal/trade"
 )
 
 func testAgreement(t *testing.T, makerGives string) (order.Signed, Hello, Hello, Agreement) {
@@ -53,6 +55,77 @@ func testAgreement(t *testing.T, makerGives string) (order.Signed, Hello, Hello,
 	return signed, maker, taker, agreement
 }
 
+func TestAsyncAgreementUsesQueuedTakerPackageAndLongerTakerRefund(t *testing.T) {
+	for _, makerGives := range []string{"QDAY", "BTC"} {
+		now := time.Unix(1_800_000_000, 0)
+		makerPublic, makerPrivate, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, takerPrivate, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		makerBitcoin, _ := btcec.NewPrivateKey()
+		takerBitcoin, _ := btcec.NewPrivateKey()
+		give := order.Amount{Asset: "BTC", Atomic: "250000"}
+		receive := order.Amount{Asset: "QDAY", Atomic: order.QDAYDefendUnit}
+		if makerGives == "QDAY" {
+			give, receive = receive, give
+		}
+		payload, err := order.NewAsyncPayload(
+			"mainnet", order.QDAYDefendUnit, give, receive, 24*time.Hour,
+			makerPublic, [32]byte{1}, strings.Repeat("1", 64),
+			order.QDAYKeys{Classical: strings.Repeat("2", 64), Reserve: strings.Repeat("3", 64), Address: "qday1maker"},
+			hex.EncodeToString(makerBitcoin.PubKey().SerializeCompressed()), 10_000, 900_000, now,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		signed, err := order.Sign(payload, makerPrivate, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		createdAt := now.Add(time.Hour)
+		qdayRefund, bitcoinRefund, err := trade.AsyncRefundHeights(payload, createdAt.Unix(), 10_010, 900_002)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fundingAsset := signed.Order.Receive.Asset
+		funding := trade.FundingPackage{Asset: fundingAsset, TransactionID: strings.Repeat("7", 64)}
+		if fundingAsset == "BTC" {
+			funding.RawTransactions = []string{"010203"}
+		} else {
+			funding.RawTransactions = []string{"AQID"}
+			funding.BasisHeight = 10_010
+			funding.BasisID = strings.Repeat("8", 64)
+		}
+		acceptance, err := trade.NewAsyncAcceptance(
+			signed, strings.Repeat("4", 64),
+			order.QDAYKeys{Classical: strings.Repeat("5", 64), Reserve: strings.Repeat("6", 64), Address: "qday1taker"},
+			hex.EncodeToString(takerBitcoin.PubKey().SerializeCompressed()), 10_010, 900_002,
+			strings.Repeat("9", 64), qdayRefund, bitcoinRefund, funding,
+			takerPrivate, [32]byte{2}, createdAt,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		agreement, err := BuildAsyncAgreement(signed, acceptance)
+		if err != nil {
+			t.Fatal(err)
+		} else if err := agreement.ValidateAsync(signed, acceptance); err != nil {
+			t.Fatal(err)
+		}
+		remainingQDAY := agreement.QDAYRefundHeight - max(payload.MakerQDAYHeight, acceptance.Acceptance.TakerQDAYHeight)
+		remainingBitcoin := agreement.BitcoinRefundHeight - max(payload.MakerBTCHeight, acceptance.Acceptance.TakerBTCHeight)
+		if makerGives == "QDAY" && uint64(remainingBitcoin)*10 <= remainingQDAY {
+			t.Fatal("taker Bitcoin leg did not receive the longer refund window")
+		} else if makerGives == "BTC" && uint64(remainingBitcoin)*10 >= remainingQDAY {
+			t.Fatal("taker QDAY leg did not receive the longer refund window")
+		}
+	}
+}
+
 func TestAgreementBindsOrderParticipantsAndRefundWindows(t *testing.T) {
 	for _, asset := range []string{"QDAY", "BTC"} {
 		signed, maker, taker, agreement := testAgreement(t, asset)
@@ -95,5 +168,19 @@ func TestMessageRejectsMixedPayloads(t *testing.T) {
 	message.Agreement = &agreement
 	if err := message.ValidateBasic(); err == nil {
 		t.Fatal("mixed message payload was accepted")
+	}
+
+	template := ClaimTemplate{
+		Party: PartyMaker, Asset: "QDAY",
+		FundingTransactionID: strings.Repeat("77", 32), TransactionID: strings.Repeat("88", 32),
+		RawTransactions: []string{"AQID"}, BasisHeight: 120, BasisID: strings.Repeat("99", 32),
+	}
+	claimMessage := Message{Version: AsyncProtocolVersion, Kind: MessageClaimTemplate, TradeID: maker.TradeID, ClaimTemplate: &template}
+	if err := claimMessage.ValidateBasic(); err != nil {
+		t.Fatal(err)
+	}
+	claimMessage.Funding = &FundingNotice{Party: PartyMaker, Asset: "QDAY", TransactionID: strings.Repeat("aa", 32)}
+	if err := claimMessage.ValidateBasic(); err == nil {
+		t.Fatal("claim template mixed with a funding notice was accepted")
 	}
 }

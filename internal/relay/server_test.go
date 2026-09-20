@@ -79,6 +79,14 @@ func TestOrderAPIEndToEnd(t *testing.T) {
 	if response.StatusCode != http.StatusOK || decoded["total"] != float64(1) {
 		t.Fatalf("list status=%d body=%#v", response.StatusCode, decoded)
 	}
+	response, decoded = requestJSON(t, server.Client(), http.MethodGet, server.URL+"/api/v1/orders?status=open&maker="+signed.Order.MakerPublicKey+"&page=1&limit=100", nil)
+	if response.StatusCode != http.StatusOK || decoded["total"] != float64(1) {
+		t.Fatalf("maker list status=%d body=%#v", response.StatusCode, decoded)
+	}
+	response, _ = requestJSON(t, server.Client(), http.MethodGet, server.URL+"/api/v1/orders?maker=not-a-key", nil)
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid maker filter status=%d", response.StatusCode)
+	}
 	response, decoded = requestJSON(t, server.Client(), http.MethodGet, server.URL+"/api/v1/orders/"+signed.ID, nil)
 	if response.StatusCode != http.StatusOK || decoded["status"] != "open" {
 		t.Fatalf("detail status=%d body=%#v", response.StatusCode, decoded)

@@ -24,18 +24,26 @@ Adapter order:
 5. Litecoin and Bitcoin Cash
 
 The product has one local interface, one recovery phrase, signed public offers,
-exact integer accounting and automatic claim or refund. The first public order
+exact integer accounting and automatic claim or refund. Open orders may collect
+several signed acceptances while the maker is offline. On return, the maker app
+selects the first valid one atomically; the selected taker's exact pre-signed
+funding transaction can then be relayed without keeping both applications
+online. The first public order
 book runs at `dex.pqday.com`. It stores signed offers and cancellations and has
 a read-only web explorer. The first valid signed acceptance is matched
 atomically, then an end-to-end encrypted mailbox carries the trade protocol between
 the two installed applications. The relay never receives a wallet seed,
-signing key, plaintext contract message or spend authority. A peer-to-peer
+signing key, plaintext contract message or general spend authority. Prepared
+transactions and claim templates let the parties continue in separate sessions;
+every unfinished funded leg still has its unilateral on-chain refund. A peer-to-peer
 discovery mesh can replace this first relay when the market is large enough
 without changing the signed records.
 
 The local **Wallets** screen shows QDAY and Bitcoin balances, receive addresses
 and ordinary withdrawals. Partial sends and MAX both calculate the exact
-network fee before the user approves the final transaction. Recovery export
+network fee before the user approves the final transaction. Open orders are
+shown separately as locally reserved funds, so they cannot be offered or
+withdrawn twice. Recovery export
 requires the wallet password; recovery import atomically replaces both local
 wallets and is refused while a swap is active.
 

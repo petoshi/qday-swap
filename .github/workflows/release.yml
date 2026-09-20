@@ -9,7 +9,8 @@ permissions:
   contents: read
 
 env:
-  WALLETD_VERSION: v0.2.1
+  WALLETD_REF: v0.3.0
+  WALLETD_VERSION: 0.3.0
 
 jobs:
   linux:
@@ -27,7 +28,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: petoshi/qday-walletd
-          ref: ${{ env.WALLETD_VERSION }}
+          ref: ${{ env.WALLETD_REF }}
           path: walletd
           submodules: recursive
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
@@ -48,7 +49,7 @@ jobs:
           CGO_ENABLED=0 GOOS=linux GOARCH="$RELEASE_ARCH" go build -buildvcs=false -trimpath \
             -ldflags="-s -w -X main.version=${version}" -o "$package/qday-swap" ./cmd/qday-swap
           (cd walletd && CGO_ENABLED=1 go build -buildvcs=false -trimpath \
-            -ldflags="-s -w -X main.version=${WALLETD_VERSION#v}" -o "../$package/qday-walletd" .)
+            -ldflags="-s -w -X main.version=${WALLETD_VERSION}" -o "../$package/qday-walletd" .)
           cp README.md LICENSE docs/INSTALL.md "$package/"
           cp walletd/LICENSE "$package/WALLETD-LICENSE"
           cat > "$package/start-qday-swap.sh" <<'SCRIPT'
@@ -73,7 +74,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: petoshi/qday-walletd
-          ref: ${{ env.WALLETD_VERSION }}
+          ref: ${{ env.WALLETD_REF }}
           path: walletd
           submodules: recursive
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
@@ -110,7 +111,7 @@ jobs:
           go build -buildvcs=false -trimpath -ldflags "-s -w -X main.version=$version" -o "$package/qday-swap.exe" ./cmd/qday-swap
           $env:CGO_ENABLED = '1'
           Push-Location walletd
-          go build -buildvcs=false -trimpath -ldflags "-s -w -X main.version=0.2.1" -o "../$package/qday-walletd.exe" .
+          go build -buildvcs=false -trimpath -ldflags "-s -w -X main.version=$env:WALLETD_VERSION" -o "../$package/qday-walletd.exe" .
           Pop-Location
           Copy-Item README.md, LICENSE, docs/INSTALL.md -Destination $package
           Copy-Item walletd/LICENSE "$package/WALLETD-LICENSE"
@@ -150,7 +151,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: petoshi/qday-walletd
-          ref: ${{ env.WALLETD_VERSION }}
+          ref: ${{ env.WALLETD_REF }}
           path: walletd
           submodules: recursive
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
@@ -171,7 +172,7 @@ jobs:
               -ldflags="-s -w -X main.version=${version}" -o "build/${arch}/qday-swap" ./cmd/qday-swap
             (cd walletd && CGO_ENABLED=1 GOOS=darwin GOARCH="$arch" CC=clang \
               CGO_CFLAGS="-arch ${apple_arch}" CGO_LDFLAGS="-arch ${apple_arch}" \
-              go build -buildvcs=false -trimpath -ldflags="-s -w -X main.version=${WALLETD_VERSION#v}" \
+              go build -buildvcs=false -trimpath -ldflags="-s -w -X main.version=${WALLETD_VERSION}" \
               -o "../build/${arch}/qday-walletd" .)
           done
           app="QDAY-Swap-macos-universal/QDAY Swap.app"

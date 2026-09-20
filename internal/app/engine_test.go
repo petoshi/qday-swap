@@ -3,10 +3,12 @@ package app
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -23,9 +25,39 @@ import (
 )
 
 type engineQDAYChain struct {
-	mu      sync.Mutex
-	height  uint64
-	outputs map[string]*walletd.SwapOutput
+	mu       sync.Mutex
+	height   uint64
+	outputs  map[string]*walletd.SwapOutput
+	prepared map[string]enginePreparedQDAY
+	claims   map[string]enginePreparedQDAYClaim
+}
+
+type enginePreparedQDAY struct {
+	swapID   string
+	contract string
+	amount   string
+	txid     string
+	raw      string
+}
+
+type enginePreparedQDAYClaim struct {
+	contract string
+	outputID string
+	secret   string
+}
+
+func engineContractKey(request walletd.RegisterSwapRequest) string {
+	return fmt.Sprintf("%s:%d", request.SecretHash, request.RefundHeight)
+}
+
+func (q *engineQDAY) contractKey(swapID string) (string, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	request, ok := q.registered[swapID]
+	if !ok {
+		return "", errors.New("swap not registered")
+	}
+	return engineContractKey(request), nil
 }
 
 type engineQDAY struct {
@@ -85,31 +117,153 @@ func (q *engineQDAY) Swap(_ context.Context, swapID string) (walletd.Swap, error
 	view := walletd.Swap{SwapID: swapID, Role: registration.Role, SecretHash: registration.SecretHash, RefundHeight: registration.RefundHeight, Height: q.chain.height}
 	q.chain.mu.Lock()
 	defer q.chain.mu.Unlock()
-	if output := q.chain.outputs[swapID]; output != nil {
+	if output := q.chain.outputs[engineContractKey(registration)]; output != nil {
 		view.Outputs = []walletd.SwapOutput{*output}
 		view.Status = output.Status
 	}
 	return view, nil
 }
 func (q *engineQDAY) FundSwap(_ context.Context, swapID string, request walletd.FundSwapRequest) (walletd.SwapAction, error) {
+	prepared, err := q.PrepareSwapFunding(context.Background(), swapID, request)
+	if err != nil {
+		return walletd.SwapAction{}, err
+	}
+	_, err = q.BroadcastTransactionPackage(context.Background(), walletd.TransactionPackage{
+		BasisHeight: prepared.BasisHeight, BasisID: prepared.BasisID,
+		Transactions: []string{prepared.RawTransaction}, TransactionIDs: []string{prepared.TransactionID},
+	})
+	if err != nil {
+		return walletd.SwapAction{}, err
+	}
+	prepared.Status, prepared.Submitted, prepared.Confirmations = "confirmed", true, 3
+	return prepared, nil
+}
+func (q *engineQDAY) PrepareSwapFunding(_ context.Context, swapID string, request walletd.FundSwapRequest) (walletd.SwapAction, error) {
+	contract, err := q.contractKey(swapID)
+	if err != nil {
+		return walletd.SwapAction{}, err
+	}
 	q.chain.mu.Lock()
 	defer q.chain.mu.Unlock()
-	if existing := q.chain.outputs[swapID]; existing != nil {
+	if existing := q.chain.outputs[contract]; existing != nil {
 		return walletd.SwapAction{TransactionID: existing.FundingTransaction, Status: "confirmed", Confirmations: existing.Confirmations}, nil
 	}
 	digest := sha256.Sum256([]byte(fmt.Sprintf("qday-funding:%s:%d", swapID, q.marker)))
 	txid := hex.EncodeToString(digest[:])
-	height := q.chain.height
-	q.chain.outputs[swapID] = &walletd.SwapOutput{
-		ID: hex.EncodeToString(digest[:]), Value: walletd.Amount{Atomic: request.AmountAtomic},
-		FundingTransaction: txid, FundingHeight: &height, Confirmations: 3, Status: "funded",
+	raw := base64.RawStdEncoding.EncodeToString([]byte("qday-prepared:" + txid))
+	if q.chain.prepared == nil {
+		q.chain.prepared = make(map[string]enginePreparedQDAY)
 	}
-	return walletd.SwapAction{TransactionID: txid, Status: "confirmed", Confirmations: 3}, nil
+	q.chain.prepared[txid] = enginePreparedQDAY{swapID: swapID, contract: contract, amount: request.AmountAtomic, txid: txid, raw: raw}
+	return walletd.SwapAction{
+		TransactionID: txid, Status: "prepared", RawTransaction: raw,
+		BasisHeight: q.chain.height, BasisID: strings.Repeat("0", 64),
+	}, nil
 }
-func (q *engineQDAY) ClaimSwap(_ context.Context, swapID string, request walletd.SpendSwapRequest) (walletd.SwapAction, error) {
+func (q *engineQDAY) CancelPreparedSwapFunding(_ context.Context, swapID string) error {
 	q.chain.mu.Lock()
 	defer q.chain.mu.Unlock()
-	output := q.chain.outputs[swapID]
+	for id, prepared := range q.chain.prepared {
+		if prepared.swapID == swapID {
+			delete(q.chain.prepared, id)
+		}
+	}
+	return nil
+}
+func (q *engineQDAY) ValidateTransactionPackage(_ context.Context, value walletd.TransactionPackage) (walletd.TransactionPackage, error) {
+	q.chain.mu.Lock()
+	defer q.chain.mu.Unlock()
+	if len(value.TransactionIDs) != 1 {
+		return walletd.TransactionPackage{}, errors.New("test QDAY package is invalid")
+	}
+	if _, ok := q.chain.prepared[value.TransactionIDs[0]]; !ok {
+		return walletd.TransactionPackage{}, errors.New("unknown test QDAY package")
+	}
+	return value, nil
+}
+func (q *engineQDAY) ValidateSwapFundingPackage(ctx context.Context, _ string, request walletd.ValidateSwapFundingRequest) (walletd.TransactionPackage, error) {
+	value, err := q.ValidateTransactionPackage(ctx, request.Package)
+	if err != nil {
+		return walletd.TransactionPackage{}, err
+	}
+	q.chain.mu.Lock()
+	defer q.chain.mu.Unlock()
+	prepared, ok := q.chain.prepared[request.TransactionID]
+	if !ok || prepared.amount != request.AmountAtomic {
+		return walletd.TransactionPackage{}, errors.New("test QDAY package does not fund the requested contract amount")
+	}
+	return value, nil
+}
+func (q *engineQDAY) BroadcastTransactionPackage(ctx context.Context, value walletd.TransactionPackage) (walletd.BroadcastPackageResult, error) {
+	q.chain.mu.Lock()
+	defer q.chain.mu.Unlock()
+	if len(value.TransactionIDs) != 1 {
+		return walletd.BroadcastPackageResult{}, errors.New("test QDAY package is invalid")
+	}
+	if claim, ok := q.chain.claims[value.TransactionIDs[0]]; ok {
+		output := q.chain.outputs[claim.contract]
+		if output == nil || output.ID != claim.outputID || claim.secret == "" {
+			return walletd.BroadcastPackageResult{}, errors.New("test QDAY claim template is incomplete")
+		}
+		height := q.chain.height
+		output.Status, output.RevealedSecret, output.SpendTransaction, output.SpendHeight = "claimed", claim.secret, value.TransactionIDs[0], &height
+		return walletd.BroadcastPackageResult{Package: value}, nil
+	}
+	prepared, ok := q.chain.prepared[value.TransactionIDs[0]]
+	if !ok {
+		return walletd.BroadcastPackageResult{}, errors.New("unknown test QDAY package")
+	}
+	height := q.chain.height
+	q.chain.outputs[prepared.contract] = &walletd.SwapOutput{
+		ID: prepared.txid, Value: walletd.Amount{Atomic: prepared.amount},
+		FundingTransaction: prepared.txid, FundingHeight: &height, Confirmations: 3, Status: "funded",
+	}
+	return walletd.BroadcastPackageResult{Package: value}, nil
+}
+func (q *engineQDAY) PrepareSwapClaimTemplate(_ context.Context, swapID string, request walletd.SpendSwapRequest) (walletd.SwapAction, error) {
+	contract, err := q.contractKey(swapID)
+	if err != nil {
+		return walletd.SwapAction{}, err
+	}
+	q.chain.mu.Lock()
+	defer q.chain.mu.Unlock()
+	output := q.chain.outputs[contract]
+	if output == nil || output.ID != request.OutputID {
+		return walletd.SwapAction{}, errors.New("unknown QDAY swap output")
+	}
+	digest := sha256.Sum256([]byte("qday-claim-template:" + contract))
+	txid := hex.EncodeToString(digest[:])
+	if q.chain.claims == nil {
+		q.chain.claims = make(map[string]enginePreparedQDAYClaim)
+	}
+	q.chain.claims[txid] = enginePreparedQDAYClaim{contract: contract, outputID: request.OutputID}
+	raw := base64.RawStdEncoding.EncodeToString([]byte("qday-claim-template:" + txid))
+	return walletd.SwapAction{TransactionID: txid, RawTransaction: raw, BasisHeight: q.chain.height, BasisID: strings.Repeat("0", 64), Status: "prepared"}, nil
+}
+func (q *engineQDAY) CompleteSwapClaimTemplate(_ context.Context, _ string, request walletd.CompleteSwapClaimTemplateRequest) (walletd.TransactionPackage, error) {
+	q.chain.mu.Lock()
+	defer q.chain.mu.Unlock()
+	if len(request.Package.TransactionIDs) != 1 {
+		return walletd.TransactionPackage{}, errors.New("test QDAY claim package is invalid")
+	}
+	claim, ok := q.chain.claims[request.Package.TransactionIDs[0]]
+	if !ok || claim.outputID != request.OutputID {
+		return walletd.TransactionPackage{}, errors.New("unknown test QDAY claim template")
+	}
+	claim.secret = request.Secret
+	q.chain.claims[request.Package.TransactionIDs[0]] = claim
+	value := request.Package
+	value.Transactions = []string{base64.RawStdEncoding.EncodeToString([]byte("qday-claim:" + value.TransactionIDs[0] + ":" + request.Secret))}
+	return value, nil
+}
+func (q *engineQDAY) ClaimSwap(_ context.Context, swapID string, request walletd.SpendSwapRequest) (walletd.SwapAction, error) {
+	contract, err := q.contractKey(swapID)
+	if err != nil {
+		return walletd.SwapAction{}, err
+	}
+	q.chain.mu.Lock()
+	defer q.chain.mu.Unlock()
+	output := q.chain.outputs[contract]
 	if output == nil || output.ID != request.OutputID {
 		return walletd.SwapAction{}, errors.New("unknown QDAY swap output")
 	}
@@ -119,9 +273,13 @@ func (q *engineQDAY) ClaimSwap(_ context.Context, swapID string, request walletd
 	return walletd.SwapAction{TransactionID: output.SpendTransaction, Status: "confirmed", Confirmations: 1}, nil
 }
 func (q *engineQDAY) RefundSwap(_ context.Context, swapID string, request walletd.SpendSwapRequest) (walletd.SwapAction, error) {
+	contract, err := q.contractKey(swapID)
+	if err != nil {
+		return walletd.SwapAction{}, err
+	}
 	q.chain.mu.Lock()
 	defer q.chain.mu.Unlock()
-	output := q.chain.outputs[swapID]
+	output := q.chain.outputs[contract]
 	if output == nil || output.ID != request.OutputID {
 		return walletd.SwapAction{}, errors.New("unknown QDAY swap output")
 	}
@@ -231,6 +389,8 @@ func (b *engineBitcoin) FindSpend(funding bitcoin.Funding) (bitcoinwallet.Transa
 	return bitcoinwallet.Transaction{}, bitcoinwallet.ErrTransactionNotFound
 }
 func (b *engineBitcoin) DestinationScript() ([]byte, error) { return []byte{0x51}, nil }
+func (b *engineBitcoin) ReserveFunding(string) error        { return nil }
+func (b *engineBitcoin) ReleaseFunding(string) error        { return nil }
 
 func newEngineServiceAt(t *testing.T, relayURL string, root walletroot.Root, qday *engineQDAY, bitcoinClient *engineBitcoin, journalPath string) *Service {
 	t.Helper()
@@ -243,7 +403,7 @@ func newEngineServiceAt(t *testing.T, relayURL string, root walletroot.Root, qda
 		t.Fatal(err)
 	}
 	service := &Service{
-		config: Config{Network: "mainnet", BitcoinNetwork: "mainnet", RelayURL: relayURL},
+		config: Config{Network: "mainnet", BitcoinNetwork: "mainnet", RelayURL: relayURL, RequireSwapApproval: true},
 		ctx:    context.Background(), relay: relayAPI, client: qday,
 		bitcoinClient: bitcoinClient, journal: journal, root: &root,
 	}
@@ -290,7 +450,7 @@ func negotiateEngineTrade(t *testing.T, giveAsset, giveAmount, receiveAmount str
 	if err != nil {
 		t.Fatal(err)
 	}
-	qdayChain := &engineQDAYChain{height: 12_000, outputs: make(map[string]*walletd.SwapOutput)}
+	qdayChain := &engineQDAYChain{height: 12_000, outputs: make(map[string]*walletd.SwapOutput), prepared: make(map[string]enginePreparedQDAY)}
 	bitcoinChain := &engineBitcoinChain{height: 900_000, txs: make(map[string]bitcoinwallet.Transaction)}
 	makerQDAY, takerQDAY := &engineQDAY{marker: 1, unlocked: true, chain: qdayChain}, &engineQDAY{marker: 3, unlocked: true, chain: qdayChain}
 	makerBitcoin, takerBitcoin := &engineBitcoin{unlocked: true, marker: 1, chain: bitcoinChain}, &engineBitcoin{unlocked: true, marker: 3, chain: bitcoinChain}
@@ -321,27 +481,6 @@ func negotiateEngineTrade(t *testing.T, giveAsset, giveAmount, receiveAmount str
 		t.Fatal(err)
 	}
 
-	maker.driveSwaps(context.Background())
-	taker.driveSwaps(context.Background())
-	maker.lastRelaySync, taker.lastRelaySync = time.Time{}, time.Time{}
-	if err := maker.syncRelay(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if err := taker.syncRelay(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	maker.driveSwaps(context.Background())
-	taker.lastRelaySync = time.Time{}
-	if err := taker.syncRelay(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	taker.driveSwaps(context.Background())
-	maker.lastRelaySync = time.Time{}
-	if err := maker.syncRelay(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	maker.driveSwaps(context.Background())
-
 	makerRecord, err := maker.journal.Swap(makerSwap.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -350,11 +489,11 @@ func negotiateEngineTrade(t *testing.T, giveAsset, giveAmount, receiveAmount str
 	if err != nil {
 		t.Fatal(err)
 	}
-	if makerRecord.Phase != swapstate.PhaseTermsAgreed || takerRecord.Phase != swapstate.PhaseTermsAgreed {
+	if makerRecord.Phase != swapstate.PhaseAsyncTakerFunding || takerRecord.Phase != swapstate.PhaseMatched {
 		t.Fatalf("phases maker=%s (%s), taker=%s (%s)", makerRecord.Phase, makerRecord.LastError, takerRecord.Phase, takerRecord.LastError)
 	}
-	if makerRecord.AgreementJSON == "" || makerRecord.AgreementJSON != takerRecord.AgreementJSON || makerRecord.AgreementHash != takerRecord.AgreementHash {
-		t.Fatalf("agreements differ\nmaker=%#v\ntaker=%#v", makerRecord, takerRecord)
+	if makerRecord.AgreementJSON == "" || takerRecord.AgreementJSON != "" {
+		t.Fatalf("maker must validate terms before matching while offline taker initializes on return\nmaker=%#v\ntaker=%#v", makerRecord, takerRecord)
 	}
 	if len(makerQDAY.registered) != 1 || len(takerQDAY.registered) != 1 || len(makerBitcoin.watched) != 1 || len(takerBitcoin.watched) != 1 {
 		t.Fatalf("contracts registered makerQDAY=%d takerQDAY=%d makerBTC=%d takerBTC=%d", len(makerQDAY.registered), len(takerQDAY.registered), len(makerBitcoin.watched), len(takerBitcoin.watched))
@@ -375,30 +514,23 @@ func runEngineTrade(t *testing.T, giveAsset, giveAmount, receiveAmount, makerQDA
 	maker, taker := trade.maker, trade.taker
 	makerQDAY, takerQDAY := trade.makerQDAY, trade.takerQDAY
 	makerSwapID := trade.swapID
-	if makerQDAY.registered[makerSwapID].Role != makerQDAYRole || takerQDAY.registered[makerSwapID].Role != takerQDAYRole {
-		t.Fatalf("QDAY roles maker=%q taker=%q", makerQDAY.registered[makerSwapID].Role, takerQDAY.registered[makerSwapID].Role)
-	}
-
-	if _, err := maker.ApproveSwap(makerSwapID); err != nil {
-		t.Fatal(err)
-	}
-	taker.lastRelaySync = time.Time{}
-	if err := taker.syncRelay(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	taker.driveSwaps(context.Background())
-	if _, err := taker.ApproveSwap(makerSwapID); err != nil {
-		t.Fatal(err)
-	}
-	maker.lastRelaySync = time.Time{}
-	if err := maker.syncRelay(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	maker.driveSwaps(context.Background())
-	taker.driveSwaps(context.Background())
-	maker.driveSwaps(context.Background())
-
 	makerRecord, _ := maker.journal.Swap(makerSwapID)
+	if makerQDAY.registered[makerRecord.Order.Order.SessionID].Role != makerQDAYRole || takerQDAY.registered[makerSwapID].Role != takerQDAYRole {
+		t.Fatalf("QDAY roles maker=%q taker=%q", makerQDAY.registered[makerRecord.Order.Order.SessionID].Role, takerQDAY.registered[makerSwapID].Role)
+	}
+	for range 8 {
+		maker.lastRelaySync, taker.lastRelaySync = time.Time{}, time.Time{}
+		if err := maker.syncRelay(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := taker.syncRelay(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		maker.driveSwaps(context.Background())
+		taker.driveSwaps(context.Background())
+	}
+
+	makerRecord, _ = maker.journal.Swap(makerSwapID)
 	takerRecord, _ := taker.journal.Swap(makerSwapID)
 	if makerRecord.Phase != swapstate.PhaseComplete || takerRecord.Phase != swapstate.PhaseComplete {
 		t.Fatalf("completed phases maker=%s (%s), taker=%s (%s)", makerRecord.Phase, makerRecord.LastError, takerRecord.Phase, takerRecord.LastError)
@@ -407,35 +539,84 @@ func runEngineTrade(t *testing.T, giveAsset, giveAmount, receiveAmount, makerQDA
 		t.Fatalf("revealed secrets maker=%q taker=%q", makerRecord.RevealedSecret, takerRecord.RevealedSecret)
 	}
 
-	// Claims live on independent chains. If the first claim is reorganized
-	// after the second one confirmed, both clients must notice and the maker
-	// must replay the exact journaled claim instead of declaring the swap done.
-	if giveAsset == "QDAY" {
-		action, err := maker.journal.Action(makerSwapID + ":maker-claim")
-		if err != nil {
+}
+
+func TestEngineExecutesSignedTradeWithoutSecondApproval(t *testing.T) {
+	trade := negotiateEngineTrade(t, "QDAY", "1", "0.0001")
+	trade.maker.config.RequireSwapApproval = false
+	trade.taker.config.RequireSwapApproval = false
+	for range 8 {
+		trade.maker.lastRelaySync, trade.taker.lastRelaySync = time.Time{}, time.Time{}
+		if err := trade.maker.syncRelay(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		trade.bitcoinChain.mu.Lock()
-		delete(trade.bitcoinChain.txs, action.TransactionID)
-		trade.bitcoinChain.mu.Unlock()
-	} else {
-		trade.qdayChain.mu.Lock()
-		output := trade.qdayChain.outputs[makerSwapID]
-		output.Status, output.RevealedSecret, output.SpendTransaction, output.SpendHeight = "funded", "", "", nil
-		trade.qdayChain.mu.Unlock()
+		if err := trade.taker.syncRelay(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		trade.maker.driveSwaps(context.Background())
+		trade.taker.driveSwaps(context.Background())
 	}
-	taker.driveSwaps(context.Background())
-	takerRecord, _ = taker.journal.Swap(makerSwapID)
-	if takerRecord.Phase != swapstate.PhaseMakerClaiming {
-		t.Fatalf("taker did not rewind missing maker claim: %s (%s)", takerRecord.Phase, takerRecord.LastError)
+	makerRecord, err := trade.maker.journal.Swap(trade.swapID)
+	if err != nil {
+		t.Fatal(err)
 	}
-	maker.driveSwaps(context.Background())
-	maker.driveSwaps(context.Background())
-	taker.driveSwaps(context.Background())
-	makerRecord, _ = maker.journal.Swap(makerSwapID)
-	takerRecord, _ = taker.journal.Swap(makerSwapID)
+	takerRecord, err := trade.taker.journal.Swap(trade.swapID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !makerRecord.Approved || !takerRecord.Approved {
+		t.Fatalf("signed trade was not automatically authorized: maker=%v taker=%v", makerRecord.Approved, takerRecord.Approved)
+	}
 	if makerRecord.Phase != swapstate.PhaseComplete || takerRecord.Phase != swapstate.PhaseComplete {
-		t.Fatalf("claim replay did not recover completion: maker=%s (%s), taker=%s (%s)", makerRecord.Phase, makerRecord.LastError, takerRecord.Phase, takerRecord.LastError)
+		t.Fatalf("automatic trade did not complete: maker=%s (%s), taker=%s (%s)", makerRecord.Phase, makerRecord.LastError, takerRecord.Phase, takerRecord.LastError)
+	}
+}
+
+func TestEngineCompletesWhenParticipantsReturnSequentially(t *testing.T) {
+	for _, test := range []struct {
+		name, giveAsset, giveAmount, receiveAmount string
+	}{
+		{"maker gives QDAY", "QDAY", "1", "0.0001"},
+		{"maker gives Bitcoin", "BTC", "0.0001", "1"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			trade := negotiateEngineTrade(t, test.giveAsset, test.giveAmount, test.receiveAmount)
+
+			// The taker is offline. The maker can relay the exact funding package
+			// signed with the acceptance, fund its own leg and leave a claim
+			// template which needs only the taker's already committed secret.
+			trade.maker.driveSwaps(context.Background())
+			makerRecord, err := trade.maker.journal.Swap(trade.swapID)
+			if err != nil {
+				t.Fatal(err)
+			} else if makerRecord.Phase != swapstate.PhaseAsyncTakerClaiming || makerRecord.MakerClaimTemplate == "" {
+				t.Fatalf("maker did not finish its single online turn: %s (%s), template=%v", makerRecord.Phase, makerRecord.LastError, makerRecord.MakerClaimTemplate != "")
+			}
+
+			// The maker never runs again. On the taker's next opening, the relay
+			// delivers both the maker funding notice and claim template. The taker
+			// claims its leg and relays the completed maker claim in one turn.
+			trade.taker.lastRelaySync = time.Time{}
+			if err := trade.taker.syncRelay(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			trade.taker.driveSwaps(context.Background())
+			takerRecord, err := trade.taker.journal.Swap(trade.swapID)
+			if err != nil {
+				t.Fatal(err)
+			} else if takerRecord.Phase != swapstate.PhaseComplete {
+				t.Fatalf("taker did not complete both legs after returning: %s (%s)", takerRecord.Phase, takerRecord.LastError)
+			} else if takerRecord.RevealedSecret == "" {
+				t.Fatal("completed sequential swap did not reveal its committed secret")
+			}
+
+			makerRecord, err = trade.maker.journal.Swap(trade.swapID)
+			if err != nil {
+				t.Fatal(err)
+			} else if makerRecord.Phase != swapstate.PhaseAsyncTakerClaiming {
+				t.Fatalf("maker journal changed while its application was offline: %s", makerRecord.Phase)
+			}
+		})
 	}
 }
 
@@ -448,17 +629,12 @@ func TestEngineRefundsEitherMakerAssetAndRecoversAfterReorg(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			trade := negotiateEngineTrade(t, test.giveAsset, test.giveAmount, test.receiveAmount)
-			if _, err := trade.maker.ApproveSwap(trade.swapID); err != nil {
-				t.Fatal(err)
-			}
-			trade.taker.lastRelaySync = time.Time{}
-			if err := trade.taker.syncRelay(context.Background()); err != nil {
-				t.Fatal(err)
-			}
-			trade.taker.driveSwaps(context.Background())
+			trade.maker.driveSwaps(context.Background())
 			makerRecord, err := trade.maker.journal.Swap(trade.swapID)
 			if err != nil {
 				t.Fatal(err)
+			} else if makerRecord.Phase != swapstate.PhaseAsyncTakerClaiming {
+				t.Fatalf("maker did not reach claim wait before refund test: %s (%s)", makerRecord.Phase, makerRecord.LastError)
 			}
 			agreement, err := agreementFromRecord(makerRecord)
 			if err != nil {
@@ -482,10 +658,25 @@ func TestEngineRefundsEitherMakerAssetAndRecoversAfterReorg(t *testing.T) {
 			}
 
 			if test.giveAsset == "QDAY" {
+				makerFunding, ok, err := fundingFromRecord(makerRecord, "maker")
+				if err != nil || !ok {
+					t.Fatalf("maker QDAY funding notice: %#v, %v", makerFunding, err)
+				}
 				trade.qdayChain.mu.Lock()
-				output := trade.qdayChain.outputs[trade.swapID]
-				output.Status, output.SpendTransaction, output.SpendHeight = "funded", "", nil
+				var output *walletd.SwapOutput
+				for _, candidate := range trade.qdayChain.outputs {
+					if candidate.FundingTransaction == makerFunding.TransactionID {
+						output = candidate
+						break
+					}
+				}
+				if output != nil {
+					output.Status, output.SpendTransaction, output.SpendHeight = "funded", "", nil
+				}
 				trade.qdayChain.mu.Unlock()
+				if output == nil {
+					t.Fatal("maker QDAY funding output is missing")
+				}
 			} else {
 				action, err := trade.maker.journal.Action(trade.swapID + ":maker-refund")
 				if err != nil {
@@ -494,6 +685,9 @@ func TestEngineRefundsEitherMakerAssetAndRecoversAfterReorg(t *testing.T) {
 				trade.bitcoinChain.mu.Lock()
 				delete(trade.bitcoinChain.txs, action.TransactionID)
 				trade.bitcoinChain.mu.Unlock()
+				trade.makerBitcoin.mu.Lock()
+				trade.makerBitcoin.failNextBroadcast = true
+				trade.makerBitcoin.mu.Unlock()
 			}
 			trade.maker.driveSwaps(context.Background())
 			makerRecord, _ = trade.maker.journal.Swap(trade.swapID)
@@ -529,7 +723,7 @@ func TestEngineRestartBroadcastsExactPreparedFunding(t *testing.T) {
 	record, err := trade.maker.journal.Swap(trade.swapID)
 	if err != nil {
 		t.Fatal(err)
-	} else if record.Phase != swapstate.PhaseMakerFunding || record.MakerFunding != "" {
+	} else if record.Phase != swapstate.PhaseAsyncMakerFunding || record.MakerFunding != "" {
 		t.Fatalf("swap moved after interrupted broadcast: %#v", record)
 	}
 
@@ -563,7 +757,7 @@ func TestEngineRestartBroadcastsExactPreparedFunding(t *testing.T) {
 	record, err = restarted.journal.Swap(trade.swapID)
 	if err != nil {
 		t.Fatal(err)
-	} else if record.MakerFunding == "" || record.Phase != swapstate.PhaseMakerFunded {
+	} else if record.MakerFunding == "" || record.Phase != swapstate.PhaseAsyncTakerClaiming {
 		t.Fatalf("restart did not resume funding: %#v", record)
 	}
 	trade.bitcoinChain.mu.Lock()
@@ -585,8 +779,14 @@ func setEngineFundingConfirmations(t *testing.T, trade negotiatedEngineTrade, re
 	if notice.Asset == "QDAY" {
 		trade.qdayChain.mu.Lock()
 		defer trade.qdayChain.mu.Unlock()
-		output := trade.qdayChain.outputs[trade.swapID]
-		if output == nil || output.FundingTransaction != notice.TransactionID {
+		var output *walletd.SwapOutput
+		for _, candidate := range trade.qdayChain.outputs {
+			if candidate.FundingTransaction == notice.TransactionID {
+				output = candidate
+				break
+			}
+		}
+		if output == nil {
 			t.Fatalf("QDAY %s funding output is missing", party)
 		}
 		output.Confirmations = uint64(max(confirmations, 0))
@@ -616,45 +816,36 @@ func TestEngineWillNotClaimWhileEitherFundingLostConfirmations(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			trade := negotiateEngineTrade(t, test.giveAsset, test.giveAmount, test.receiveAmount)
-			if _, err := trade.maker.ApproveSwap(trade.swapID); err != nil {
+			trade.maker.driveSwaps(context.Background())
+			makerRecord, err := trade.maker.journal.Swap(trade.swapID)
+			if err != nil {
 				t.Fatal(err)
+			} else if makerRecord.Phase != swapstate.PhaseAsyncTakerClaiming {
+				t.Fatalf("maker did not finish asynchronous funding: %s (%s)", makerRecord.Phase, makerRecord.LastError)
 			}
+			setEngineFundingConfirmations(t, trade, makerRecord, "maker", 0)
+
 			trade.taker.lastRelaySync = time.Time{}
 			if err := trade.taker.syncRelay(context.Background()); err != nil {
 				t.Fatal(err)
 			}
 			trade.taker.driveSwaps(context.Background())
-			if _, err := trade.taker.ApproveSwap(trade.swapID); err != nil {
-				t.Fatal(err)
-			}
 			record, err := trade.taker.journal.Swap(trade.swapID)
 			if err != nil {
 				t.Fatal(err)
-			} else if record.Phase != swapstate.PhaseMakerClaiming {
-				t.Fatalf("taker did not reach pre-claim phase: %s (%s)", record.Phase, record.LastError)
-			}
-
-			setEngineFundingConfirmations(t, trade, record, "maker", 0)
-			trade.taker.driveSwaps(context.Background())
-			record, _ = trade.taker.journal.Swap(trade.swapID)
-			if record.Phase != swapstate.PhaseMakerFunding {
+			} else if record.Phase != swapstate.PhaseAsyncMakerFunding {
 				t.Fatalf("lost maker funding did not rewind before claim: %s (%s)", record.Phase, record.LastError)
-			}
-			if len(trade.qdayChain.outputs) > 1 || len(trade.bitcoinChain.txs) > 1 {
-				t.Fatal("a claim was broadcast while maker funding was unconfirmed")
+			} else if record.RevealedSecret != "" {
+				t.Fatal("the taker revealed its secret while maker funding was unconfirmed")
 			}
 
 			setEngineFundingConfirmations(t, trade, record, "maker", 3)
 			trade.taker.driveSwaps(context.Background())
-			trade.maker.lastRelaySync = time.Time{}
-			if err := trade.maker.syncRelay(context.Background()); err != nil {
-				t.Fatal(err)
-			}
 			for range 3 {
 				trade.maker.driveSwaps(context.Background())
 				trade.taker.driveSwaps(context.Background())
 			}
-			makerRecord, _ := trade.maker.journal.Swap(trade.swapID)
+			makerRecord, _ = trade.maker.journal.Swap(trade.swapID)
 			takerRecord, _ := trade.taker.journal.Swap(trade.swapID)
 			if makerRecord.Phase != swapstate.PhaseComplete || takerRecord.Phase != swapstate.PhaseComplete {
 				t.Fatalf("swap did not recover after funding reconfirmed: maker=%s (%s), taker=%s (%s)", makerRecord.Phase, makerRecord.LastError, takerRecord.Phase, takerRecord.LastError)
@@ -691,5 +882,49 @@ func TestEngineExpiresStaleAgreementBeforeAnyFunding(t *testing.T) {
 	}
 	if len(trade.qdayChain.outputs) != 0 || len(trade.bitcoinChain.txs) != 0 {
 		t.Fatalf("stale agreement moved funds: qday=%d bitcoin=%d", len(trade.qdayChain.outputs), len(trade.bitcoinChain.txs))
+	}
+}
+
+func TestEngineExpiresLateUnsubmittedTakerFunding(t *testing.T) {
+	for _, test := range []struct {
+		name, giveAsset, giveAmount, receiveAmount string
+	}{
+		{"taker prepared Bitcoin", "QDAY", "1", "0.0001"},
+		{"taker prepared QDAY", "BTC", "0.0001", "1"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			trade := negotiateEngineTrade(t, test.giveAsset, test.giveAmount, test.receiveAmount)
+			record, err := trade.maker.journal.Swap(trade.swapID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			agreement, err := agreementFromRecord(record)
+			if err != nil {
+				t.Fatal(err)
+			}
+			trade.qdayChain.mu.Lock()
+			trade.qdayChain.height = agreement.QDAYRefundHeight - minimumQDAYFundingWindowBlocks + 1
+			trade.qdayChain.mu.Unlock()
+			trade.bitcoinChain.mu.Lock()
+			trade.bitcoinChain.height = int32(agreement.BitcoinRefundHeight - minimumBitcoinFundingWindowBlocks + 1)
+			trade.bitcoinChain.mu.Unlock()
+
+			// The acceptance contains signed funding bytes, but neither participant
+			// published them. Returning too close to the refund window must release
+			// the reservation rather than broadcast a stale contract.
+			trade.taker.driveSwaps(context.Background())
+			record, err = trade.taker.journal.Swap(trade.swapID)
+			if err != nil {
+				t.Fatal(err)
+			} else if record.Phase != swapstate.PhaseExpired || record.TakerFundingSubmitted {
+				t.Fatalf("late unsubmitted taker funding = %#v", record)
+			}
+			if len(trade.qdayChain.outputs) != 0 || len(trade.bitcoinChain.txs) != 0 {
+				t.Fatalf("late taker funding moved funds: qday=%d bitcoin=%d", len(trade.qdayChain.outputs), len(trade.bitcoinChain.txs))
+			}
+			if test.receiveAmount == "1" && len(trade.qdayChain.prepared) != 0 {
+				t.Fatalf("expired QDAY acceptance retained %d prepared transaction(s)", len(trade.qdayChain.prepared))
+			}
+		})
 	}
 }

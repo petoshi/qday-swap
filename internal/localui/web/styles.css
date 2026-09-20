@@ -76,6 +76,7 @@ main { width: min(100%,1540px); min-height: calc(100vh - 210px); margin: 0 auto;
 .field { display: block; margin-top: 16px; }
 .field > span { display: block; margin-bottom: 6px; color: #687169; font-size: 10px; letter-spacing: .07em; }
 .field input, .field textarea, .field select { width: 100%; border: 1px solid var(--line-bright); border-radius: 0; background: #020302; color: var(--text); outline: 0; }
+.field input[hidden] { display: none; }
 .field input, .field select { height: 44px; padding: 0 12px; }
 .field textarea { min-height: 110px; padding: 11px 12px; resize: vertical; }
 .field input:focus, .field textarea:focus, .field select:focus { border-color: var(--green-dim); }

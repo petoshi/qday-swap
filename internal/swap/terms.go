@@ -4,27 +4,32 @@ package swap
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
 	"strings"
+	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/petoshi/qday-swap/internal/order"
+	"github.com/petoshi/qday-swap/internal/trade"
 )
 
 const (
-	ProtocolVersion = uint16(1)
+	ProtocolVersion      = uint16(1)
+	AsyncProtocolVersion = uint16(2)
 
 	PartyMaker = "maker"
 	PartyTaker = "taker"
 
-	MessageHello        = "hello"
-	MessageAgreement    = "agreement"
-	MessageAgreementAck = "agreement_ack"
-	MessageFunding      = "funding"
+	MessageHello         = "hello"
+	MessageAgreement     = "agreement"
+	MessageAgreementAck  = "agreement_ack"
+	MessageFunding       = "funding"
+	MessageClaimTemplate = "claim_template"
 
 	// The maker locks first and therefore receives the longer refund window.
 	// These windows target 48 and 24 hours at the consensus block intervals.
@@ -77,6 +82,16 @@ type FundingNotice struct {
 	RawTransaction string `json:"rawTransaction,omitempty"`
 }
 
+type ClaimTemplate struct {
+	Party                string   `json:"party"`
+	Asset                string   `json:"asset"`
+	FundingTransactionID string   `json:"fundingTransactionID"`
+	TransactionID        string   `json:"transactionID"`
+	RawTransactions      []string `json:"rawTransactions"`
+	BasisHeight          uint64   `json:"basisHeight,omitempty"`
+	BasisID              string   `json:"basisID,omitempty"`
+}
+
 type Message struct {
 	Version       uint16         `json:"version"`
 	Kind          string         `json:"kind"`
@@ -85,6 +100,7 @@ type Message struct {
 	Agreement     *Agreement     `json:"agreement,omitempty"`
 	AgreementHash string         `json:"agreementHash,omitempty"`
 	Funding       *FundingNotice `json:"funding,omitempty"`
+	ClaimTemplate *ClaimTemplate `json:"claimTemplate,omitempty"`
 }
 
 func NewHello(network, orderID, tradeID, party string, keys QDAYKeys, bitcoinPublicKey []byte, qdayHeight uint64, bitcoinHeight uint32) (Hello, error) {
@@ -98,7 +114,7 @@ func NewHello(network, orderID, tradeID, party string, keys QDAYKeys, bitcoinPub
 }
 
 func (h Hello) Validate(network, orderID, tradeID, party string) error {
-	if h.Version != ProtocolVersion {
+	if h.Version != ProtocolVersion && h.Version != AsyncProtocolVersion {
 		return fmt.Errorf("unsupported swap hello version %d", h.Version)
 	} else if h.Network != network || h.OrderID != orderID || h.TradeID != tradeID || h.Party != party {
 		return errors.New("swap hello does not match the selected trade")
@@ -118,6 +134,59 @@ func (h Hello) Validate(network, orderID, tradeID, party string) error {
 		return fmt.Errorf("invalid Bitcoin swap public key: %w", err)
 	}
 	return nil
+}
+
+func BuildAsyncAgreement(signed order.Signed, acceptance trade.SignedAcceptance) (Agreement, error) {
+	if signed.Order.Version != order.AsyncProtocolVersion || acceptance.Acceptance.Version != trade.AsyncProtocolVersion {
+		return Agreement{}, errors.New("asynchronous agreement requires version 2 order and acceptance")
+	}
+	verificationTime := time.Unix(acceptance.Acceptance.CreatedAt, 0)
+	if err := acceptance.Verify(signed, verificationTime); err != nil {
+		return Agreement{}, fmt.Errorf("verify asynchronous acceptance: %w", err)
+	}
+	return BuildAsyncTerms(signed, acceptance.Acceptance)
+}
+
+// BuildAsyncTerms constructs the immutable two-chain contract before the
+// taker's funding transaction is prepared. NewAsyncAcceptance subsequently
+// signs these descriptors, heights, hashlock and the exact funding bytes.
+func BuildAsyncTerms(signed order.Signed, accepted trade.AcceptancePayload) (Agreement, error) {
+	if signed.Order.Version != order.AsyncProtocolVersion || accepted.Version != trade.AsyncProtocolVersion {
+		return Agreement{}, errors.New("asynchronous terms require version 2 order and acceptance payload")
+	}
+	terms := signed.Order
+	maker := Hello{
+		Version: AsyncProtocolVersion, Network: terms.Network, OrderID: signed.ID,
+		TradeID: accepted.TradeID, Party: PartyMaker,
+		QDAY:             QDAYKeys{Classical: terms.MakerQDAY.Classical, Reserve: terms.MakerQDAY.Reserve, Address: terms.MakerQDAY.Address},
+		BitcoinPublicKey: terms.MakerBitcoinKey, QDAYHeight: terms.MakerQDAYHeight, BitcoinHeight: terms.MakerBTCHeight,
+	}
+	taker := Hello{
+		Version: AsyncProtocolVersion, Network: terms.Network, OrderID: signed.ID,
+		TradeID: accepted.TradeID, Party: PartyTaker,
+		QDAY:             QDAYKeys{Classical: accepted.TakerQDAY.Classical, Reserve: accepted.TakerQDAY.Reserve, Address: accepted.TakerQDAY.Address},
+		BitcoinPublicKey: accepted.TakerBitcoinKey, QDAYHeight: accepted.TakerQDAYHeight, BitcoinHeight: accepted.TakerBTCHeight,
+	}
+	agreement := Agreement{
+		Version: AsyncProtocolVersion, Network: terms.Network, OrderID: signed.ID,
+		TradeID: accepted.TradeID, MakerGives: terms.Give.Asset,
+		QDAYUnitAtomic: terms.QDAYUnitAtomic, SecretHash: accepted.SecretHash,
+		Maker: maker, Taker: taker,
+		QDAYRefundHeight: accepted.QDAYRefundHeight, BitcoinRefundHeight: accepted.BTCRefundHeight,
+		QDAYConfirmations: 3, BitcoinConfirmations: 1,
+	}
+	var bitcoinText string
+	if terms.Give.Asset == "QDAY" {
+		agreement.QDAYAmountAtomic, bitcoinText = terms.Give.Atomic, terms.Receive.Atomic
+	} else {
+		agreement.QDAYAmountAtomic, bitcoinText = terms.Receive.Atomic, terms.Give.Atomic
+	}
+	var err error
+	agreement.BitcoinAmountSatoshi, err = parseSatoshis(bitcoinText)
+	if err != nil {
+		return Agreement{}, err
+	}
+	return agreement, agreement.validateAsyncPayload(signed, accepted)
 }
 
 func BuildAgreement(signed order.Signed, tradeID, secretHash string, maker, taker Hello) (Agreement, error) {
@@ -200,6 +269,65 @@ func (a Agreement) Validate(signed order.Signed, maker, taker Hello) error {
 	return nil
 }
 
+func (a Agreement) ValidateAsync(signed order.Signed, acceptance trade.SignedAcceptance) error {
+	if a.Version != AsyncProtocolVersion || signed.Order.Version != order.AsyncProtocolVersion || acceptance.Acceptance.Version != trade.AsyncProtocolVersion {
+		return errors.New("asynchronous agreement protocol version is invalid")
+	}
+	verificationTime := time.Unix(acceptance.Acceptance.CreatedAt, 0)
+	if err := acceptance.Verify(signed, verificationTime); err != nil {
+		return err
+	}
+	return a.validateAsyncPayload(signed, acceptance.Acceptance)
+}
+
+func (a Agreement) validateAsyncPayload(signed order.Signed, p trade.AcceptancePayload) error {
+	if a.Network != signed.Order.Network || a.OrderID != signed.ID || a.TradeID != p.TradeID || a.MakerGives != signed.Order.Give.Asset {
+		return errors.New("asynchronous agreement does not match the selected order")
+	} else if a.QDAYUnitAtomic != signed.Order.QDAYUnitAtomic || a.SecretHash != p.SecretHash {
+		return errors.New("asynchronous agreement denomination or secret differs from the acceptance")
+	} else if err := a.Maker.Validate(a.Network, a.OrderID, a.TradeID, PartyMaker); err != nil {
+		return fmt.Errorf("maker descriptor: %w", err)
+	} else if err := a.Taker.Validate(a.Network, a.OrderID, a.TradeID, PartyTaker); err != nil {
+		return fmt.Errorf("taker descriptor: %w", err)
+	}
+	expectedMaker := Hello{
+		Version: AsyncProtocolVersion, Network: signed.Order.Network, OrderID: signed.ID, TradeID: p.TradeID, Party: PartyMaker,
+		QDAY:             QDAYKeys{Classical: signed.Order.MakerQDAY.Classical, Reserve: signed.Order.MakerQDAY.Reserve, Address: signed.Order.MakerQDAY.Address},
+		BitcoinPublicKey: signed.Order.MakerBitcoinKey, QDAYHeight: signed.Order.MakerQDAYHeight, BitcoinHeight: signed.Order.MakerBTCHeight,
+	}
+	expectedTaker := Hello{
+		Version: AsyncProtocolVersion, Network: signed.Order.Network, OrderID: signed.ID, TradeID: p.TradeID, Party: PartyTaker,
+		QDAY:             QDAYKeys{Classical: p.TakerQDAY.Classical, Reserve: p.TakerQDAY.Reserve, Address: p.TakerQDAY.Address},
+		BitcoinPublicKey: p.TakerBitcoinKey, QDAYHeight: p.TakerQDAYHeight, BitcoinHeight: p.TakerBTCHeight,
+	}
+	if !equalHello(a.Maker, expectedMaker) || !equalHello(a.Taker, expectedTaker) {
+		return errors.New("asynchronous agreement changed a participant descriptor")
+	}
+	var expectedQDAY, expectedBitcoin string
+	if signed.Order.Give.Asset == "QDAY" {
+		expectedQDAY, expectedBitcoin = signed.Order.Give.Atomic, signed.Order.Receive.Atomic
+	} else {
+		expectedQDAY, expectedBitcoin = signed.Order.Receive.Atomic, signed.Order.Give.Atomic
+	}
+	bitcoin, err := parseSatoshis(expectedBitcoin)
+	if err != nil {
+		return err
+	} else if a.QDAYAmountAtomic != expectedQDAY || a.BitcoinAmountSatoshi != bitcoin || a.QDAYConfirmations != 3 || a.BitcoinConfirmations != 1 {
+		return errors.New("asynchronous agreement amounts or confirmation policy are invalid")
+	}
+	qdayRefund, bitcoinRefund, err := asyncRefundHeights(signed.Order, p)
+	if err != nil {
+		return err
+	} else if a.QDAYRefundHeight != qdayRefund || a.BitcoinRefundHeight != bitcoinRefund {
+		return errors.New("asynchronous agreement refund heights are invalid")
+	}
+	return nil
+}
+
+func asyncRefundHeights(terms order.Payload, acceptance trade.AcceptancePayload) (uint64, uint32, error) {
+	return trade.AsyncRefundHeights(terms, acceptance.CreatedAt, acceptance.TakerQDAYHeight, acceptance.TakerBTCHeight)
+}
+
 func (a Agreement) Hash() (string, error) {
 	encoded, err := json.Marshal(a)
 	if err != nil {
@@ -210,33 +338,81 @@ func (a Agreement) Hash() (string, error) {
 }
 
 func (m Message) ValidateBasic() error {
-	if m.Version != ProtocolVersion {
+	if m.Version != ProtocolVersion && m.Version != AsyncProtocolVersion {
 		return fmt.Errorf("unsupported encrypted swap message version %d", m.Version)
 	} else if err := digestHex("trade ID", m.TradeID); err != nil {
 		return err
 	}
 	switch m.Kind {
 	case MessageHello:
-		if m.Hello == nil || m.Agreement != nil || m.AgreementHash != "" || m.Funding != nil {
+		if m.Version != ProtocolVersion {
+			return errors.New("asynchronous swaps do not exchange hello messages")
+		}
+		if m.Hello == nil || m.Agreement != nil || m.AgreementHash != "" || m.Funding != nil || m.ClaimTemplate != nil {
 			return errors.New("hello message payload is invalid")
 		}
 	case MessageAgreement:
-		if m.Agreement == nil || m.Hello != nil || m.AgreementHash != "" || m.Funding != nil {
+		if m.Version != ProtocolVersion {
+			return errors.New("asynchronous swaps do not exchange agreement messages")
+		}
+		if m.Agreement == nil || m.Hello != nil || m.AgreementHash != "" || m.Funding != nil || m.ClaimTemplate != nil {
 			return errors.New("agreement message payload is invalid")
 		}
 	case MessageAgreementAck:
-		if m.Agreement != nil || m.Hello != nil || m.Funding != nil || digestHex("agreement hash", m.AgreementHash) != nil {
+		if m.Version != ProtocolVersion {
+			return errors.New("asynchronous swaps do not exchange agreement acknowledgements")
+		}
+		if m.Agreement != nil || m.Hello != nil || m.Funding != nil || m.ClaimTemplate != nil || digestHex("agreement hash", m.AgreementHash) != nil {
 			return errors.New("agreement acknowledgement payload is invalid")
 		}
 	case MessageFunding:
-		if m.Funding == nil || m.Hello != nil || m.Agreement != nil || m.AgreementHash != "" {
+		if m.Funding == nil || m.Hello != nil || m.Agreement != nil || m.AgreementHash != "" || m.ClaimTemplate != nil {
 			return errors.New("funding message payload is invalid")
 		}
 		if err := m.Funding.Validate(); err != nil {
 			return err
 		}
+	case MessageClaimTemplate:
+		if m.Version != AsyncProtocolVersion || m.ClaimTemplate == nil || m.Funding != nil || m.Hello != nil || m.Agreement != nil || m.AgreementHash != "" {
+			return errors.New("claim template message payload is invalid")
+		}
+		if err := m.ClaimTemplate.Validate(); err != nil {
+			return err
+		}
 	default:
 		return fmt.Errorf("unknown encrypted swap message kind %q", m.Kind)
+	}
+	return nil
+}
+
+func (t ClaimTemplate) Validate() error {
+	if t.Party != PartyMaker {
+		return errors.New("claim template must spend to the maker")
+	} else if t.Asset != "QDAY" && t.Asset != "BTC" {
+		return errors.New("claim template asset must be QDAY or BTC")
+	} else if err := digestHex("claim template funding transaction ID", t.FundingTransactionID); err != nil {
+		return err
+	} else if err := digestHex("claim template transaction ID", t.TransactionID); err != nil {
+		return err
+	} else if len(t.RawTransactions) != 1 || t.RawTransactions[0] == "" || len(t.RawTransactions[0]) > 2<<20 {
+		return errors.New("claim template must contain one bounded transaction")
+	}
+	if t.Asset == "QDAY" {
+		if t.BasisHeight == 0 || digestHex("claim template QDAY basis ID", t.BasisID) != nil {
+			return errors.New("claim template QDAY basis is invalid")
+		}
+		raw, err := base64.RawStdEncoding.DecodeString(t.RawTransactions[0])
+		if err != nil || base64.RawStdEncoding.EncodeToString(raw) != t.RawTransactions[0] {
+			return errors.New("QDAY claim template is not canonical base64 data")
+		}
+	} else {
+		if t.BasisHeight != 0 || t.BasisID != "" {
+			return errors.New("Bitcoin claim template contains QDAY basis data")
+		}
+		raw, err := hex.DecodeString(t.RawTransactions[0])
+		if err != nil || len(raw) == 0 || hex.EncodeToString(raw) != t.RawTransactions[0] {
+			return errors.New("Bitcoin claim template is not lowercase hexadecimal data")
+		}
 	}
 	return nil
 }

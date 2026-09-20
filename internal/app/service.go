@@ -22,6 +22,7 @@ import (
 	"github.com/petoshi/qday-swap/internal/order"
 	"github.com/petoshi/qday-swap/internal/relay"
 	"github.com/petoshi/qday-swap/internal/relayclient"
+	swapprotocol "github.com/petoshi/qday-swap/internal/swap"
 	"github.com/petoshi/qday-swap/internal/swapstate"
 	"github.com/petoshi/qday-swap/internal/trade"
 	"github.com/petoshi/qday-swap/internal/walletd"
@@ -29,6 +30,8 @@ import (
 )
 
 const mainQDAYReceiveReference = "qday-swap-main-receive-v1"
+
+var errInvalidAsyncFunding = errors.New("invalid asynchronous acceptance funding")
 
 type Config struct {
 	DataDir         string
@@ -42,6 +45,10 @@ type Config struct {
 	BitcoinNetwork  string
 	BitcoinPeers    []string
 	BitcoinAddPeers []string
+	// RequireSwapApproval is reserved for protocol tests and recovery tools.
+	// The user-facing application treats a signed offer or acceptance as the
+	// authorization to execute those exact terms automatically.
+	RequireSwapApproval bool
 }
 
 func DefaultDataDir() string {
@@ -104,6 +111,7 @@ type relayAPI interface {
 	Price(context.Context) (relay.MarketPrice, error)
 	Trades(context.Context, int, int64) (relay.TradeHistory, error)
 	Orders(context.Context, relay.Status, string, int, int) (relay.ResultPage, error)
+	OrdersByMaker(context.Context, relay.Status, string, int, int) (relay.ResultPage, error)
 	Order(context.Context, string) (relay.Record, error)
 	Publish(context.Context, order.Signed) (relay.Record, error)
 	Cancel(context.Context, string, order.SignedCancellation) (relay.Record, error)
@@ -125,6 +133,7 @@ type Service struct {
 	negotiationMu  sync.Mutex
 	engineMu       sync.Mutex
 	withdrawalMu   sync.Mutex
+	fundsMu        sync.Mutex
 	workerCancel   context.CancelFunc
 	workerWG       sync.WaitGroup
 	lastRelaySync  time.Time
@@ -158,6 +167,7 @@ type State struct {
 	Balance           *walletd.Balance       `json:"balance,omitempty"`
 	Bitcoin           *bitcoinwallet.Status  `json:"bitcoin,omitempty"`
 	BitcoinBalance    *bitcoinwallet.Balance `json:"bitcoinBalance,omitempty"`
+	Funds             *Funds                 `json:"funds,omitempty"`
 	Relay             *relayclient.Status    `json:"relay,omitempty"`
 	PendingTrades     int                    `json:"pendingTrades"`
 	IncomingTrades    int                    `json:"incomingTrades"`
@@ -546,6 +556,8 @@ func (s *Service) MarketTrades(ctx context.Context, limit int, since int64) (rel
 }
 
 func (s *Service) CreateOffer(ctx context.Context, request CreateOfferRequest) (relay.Record, error) {
+	s.fundsMu.Lock()
+	defer s.fundsMu.Unlock()
 	identity, messagePublic, cleanup, err := s.identities()
 	if err != nil {
 		return relay.Record{}, err
@@ -555,13 +567,17 @@ func (s *Service) CreateOffer(ctx context.Context, request CreateOfferRequest) (
 		return relay.Record{}, errors.New("give asset must be QDAY or BTC")
 	}
 	if request.LifetimeMinutes == 0 {
-		request.LifetimeMinutes = 60
+		request.LifetimeMinutes = 24 * 60
 	}
 	lifetime := time.Duration(request.LifetimeMinutes) * time.Minute
 	if lifetime < time.Minute || lifetime > 30*24*time.Hour {
 		return relay.Record{}, errors.New("offer lifetime must be between 1 minute and 30 days")
 	}
 	qdayStatus, qdayBalance, bitcoinBalance, err := s.walletSnapshot(ctx)
+	if err != nil {
+		return relay.Record{}, err
+	}
+	funds, err := s.fundsSnapshot(ctx, qdayStatus, qdayBalance, bitcoinBalance)
 	if err != nil {
 		return relay.Record{}, err
 	}
@@ -574,7 +590,7 @@ func (s *Service) CreateOffer(ctx context.Context, request CreateOfferRequest) (
 			receive.Atomic, err = decimalToAtomic(request.ReceiveAmount, "100000000")
 		}
 		if err == nil {
-			err = requireAvailable(give.Atomic, qdayBalance.Spendable.Atomic, "QDAY")
+			err = requireAvailable(give.Atomic, funds.QDAY.AvailableAtomic, "QDAY")
 		}
 	} else {
 		give = order.Amount{Asset: "BTC", Atomic: ""}
@@ -584,14 +600,57 @@ func (s *Service) CreateOffer(ctx context.Context, request CreateOfferRequest) (
 			receive.Atomic, err = decimalToAtomic(request.ReceiveAmount, qdayStatus.UnitAtomic)
 		}
 		if err == nil {
-			err = requireAvailable(give.Atomic, bitcoinBalance.Confirmed.Satoshis, "BTC")
+			err = requireAvailable(give.Atomic, funds.Bitcoin.AvailableAtomic, "BTC")
 		}
 	}
 	if err != nil {
 		return relay.Record{}, err
 	}
 	now := time.Now().UTC()
-	payload, err := order.NewPayload(s.config.Network, qdayStatus.UnitAtomic, give, receive, lifetime, identity.Public().(ed25519.PublicKey), messagePublic, now)
+	sessionID, err := trade.NewTradeID()
+	if err != nil {
+		return relay.Record{}, err
+	}
+	s.mu.RLock()
+	var rootCopy walletroot.Root
+	haveRoot := s.root != nil
+	if haveRoot {
+		rootCopy = *s.root
+	}
+	qdayClient := s.client
+	bitcoinClient := s.bitcoinClient
+	s.mu.RUnlock()
+	if !haveRoot || qdayClient == nil || bitcoinClient == nil {
+		clear(rootCopy[:])
+		return relay.Record{}, errors.New("local swap wallets are unavailable")
+	}
+	defer clear(rootCopy[:])
+	qdaySwap, ok := qdayClient.(interface {
+		CreateSwapKeys(context.Context, string) (walletd.SwapKeyView, error)
+	})
+	if !ok {
+		return relay.Record{}, errors.New("QDAY wallet does not support atomic swaps")
+	}
+	qdayKeys, err := qdaySwap.CreateSwapKeys(ctx, sessionID)
+	if err != nil {
+		return relay.Record{}, fmt.Errorf("create maker QDAY swap keys: %w", err)
+	}
+	bitcoinStatus, err := bitcoinClient.Status()
+	if err != nil {
+		return relay.Record{}, fmt.Errorf("read Bitcoin swap height: %w", err)
+	} else if bitcoinStatus.WalletHeight <= 0 || uint64(bitcoinStatus.WalletHeight) > uint64(^uint32(0)) {
+		return relay.Record{}, errors.New("Bitcoin wallet height is outside the supported range")
+	}
+	bitcoinKey, err := rootCopy.BitcoinSwapKey(sessionID)
+	if err != nil {
+		return relay.Record{}, err
+	}
+	payload, err := order.NewAsyncPayload(
+		s.config.Network, qdayStatus.UnitAtomic, give, receive, lifetime,
+		identity.Public().(ed25519.PublicKey), messagePublic, sessionID,
+		order.QDAYKeys{Classical: qdayKeys.Keys.Classical, Reserve: qdayKeys.Keys.Reserve, Address: qdayKeys.Keys.Address},
+		hex.EncodeToString(bitcoinKey.PubKey().SerializeCompressed()), qdayStatus.Height, uint32(bitcoinStatus.WalletHeight), now,
+	)
 	if err != nil {
 		return relay.Record{}, err
 	}
@@ -613,6 +672,8 @@ func (s *Service) CreateOffer(ctx context.Context, request CreateOfferRequest) (
 }
 
 func (s *Service) QuoteOffer(ctx context.Context, request QuoteOfferRequest) (OfferQuote, error) {
+	s.fundsMu.Lock()
+	defer s.fundsMu.Unlock()
 	side := strings.ToLower(strings.TrimSpace(request.Side))
 	if side != "buy" && side != "sell" {
 		return OfferQuote{}, errors.New("choose BUY QDAY or SELL QDAY")
@@ -626,6 +687,10 @@ func (s *Service) QuoteOffer(ctx context.Context, request QuoteOfferRequest) (Of
 		return OfferQuote{}, err
 	}
 	qdayStatus, qdayBalance, bitcoinBalance, err := s.walletSnapshot(ctx)
+	if err != nil {
+		return OfferQuote{}, err
+	}
+	funds, err := s.fundsSnapshot(ctx, qdayStatus, qdayBalance, bitcoinBalance)
 	if err != nil {
 		return OfferQuote{}, err
 	}
@@ -672,9 +737,9 @@ func (s *Service) QuoteOffer(ctx context.Context, request QuoteOfferRequest) (Of
 	}
 	satoshis := totalSatoshis.String()
 	if side == "buy" {
-		err = requireAvailable(satoshis, bitcoinBalance.Confirmed.Satoshis, "BTC")
+		err = requireAvailable(satoshis, funds.Bitcoin.AvailableAtomic, "BTC")
 	} else {
-		err = requireAvailable(qdayAtomic, qdayBalance.Spendable.Atomic, "QDAY")
+		err = requireAvailable(qdayAtomic, funds.QDAY.AvailableAtomic, "QDAY")
 	}
 	if err != nil {
 		return OfferQuote{}, err
@@ -710,6 +775,8 @@ func (s *Service) QuoteOffer(ctx context.Context, request QuoteOfferRequest) (Of
 }
 
 func (s *Service) CancelOffer(ctx context.Context, orderID string) (relay.Record, error) {
+	s.fundsMu.Lock()
+	defer s.fundsMu.Unlock()
 	identity, _, cleanup, err := s.identities()
 	if err != nil {
 		return relay.Record{}, err
@@ -736,6 +803,8 @@ func (s *Service) CancelOffer(ctx context.Context, orderID string) (relay.Record
 func (s *Service) AcceptOffer(ctx context.Context, orderID string) (swapstate.Negotiation, error) {
 	s.negotiationMu.Lock()
 	defer s.negotiationMu.Unlock()
+	s.fundsMu.Lock()
+	defer s.fundsMu.Unlock()
 	identity, messagePublic, cleanup, err := s.identities()
 	if err != nil {
 		return swapstate.Negotiation{}, err
@@ -757,10 +826,14 @@ func (s *Service) AcceptOffer(ctx context.Context, orderID string) (swapstate.Ne
 	} else if record.Signed.Order.QDAYUnitAtomic != qdayStatus.UnitAtomic {
 		return swapstate.Negotiation{}, errors.New("offer uses a different QDAY consensus unit")
 	}
+	funds, err := s.fundsSnapshot(ctx, qdayStatus, qdayBalance, bitcoinBalance)
+	if err != nil {
+		return swapstate.Negotiation{}, err
+	}
 	if record.Signed.Order.Give.Asset == "QDAY" {
-		err = requireAvailable(record.Signed.Order.Receive.Atomic, bitcoinBalance.Confirmed.Satoshis, "BTC")
+		err = requireAvailable(record.Signed.Order.Receive.Atomic, funds.Bitcoin.AvailableAtomic, "BTC")
 	} else {
-		err = requireAvailable(record.Signed.Order.Receive.Atomic, qdayBalance.Spendable.Atomic, "QDAY")
+		err = requireAvailable(record.Signed.Order.Receive.Atomic, funds.QDAY.AvailableAtomic, "QDAY")
 	}
 	if err != nil {
 		return swapstate.Negotiation{}, err
@@ -780,6 +853,7 @@ func (s *Service) AcceptOffer(ctx context.Context, orderID string) (swapstate.Ne
 			continue
 		}
 		if pending.Acceptance.Acceptance.ExpiresAt <= now.Unix() {
+			s.releasePendingFunding(ctx, pending)
 			if err := journal.RemovePendingAcceptance(pending.Acceptance.ID); err != nil {
 				return swapstate.Negotiation{}, err
 			}
@@ -795,7 +869,120 @@ func (s *Service) AcceptOffer(ctx context.Context, orderID string) (swapstate.Ne
 		}
 		return pending, nil
 	}
-	acceptance, err := trade.NewAcceptance(record.Signed, 15*time.Minute, identity, messagePublic, now)
+	if record.Signed.Order.Version != order.AsyncProtocolVersion {
+		return swapstate.Negotiation{}, errors.New("legacy online-only offers are no longer accepted")
+	}
+	wallets, _, err := s.engineWalletSnapshot()
+	if err != nil {
+		return swapstate.Negotiation{}, err
+	}
+	defer wallets.clear()
+	qdayAsync, ok := wallets.qday.(qdayAsyncSwapClient)
+	if !ok {
+		return swapstate.Negotiation{}, errors.New("QDAY wallet does not support prepared swap funding")
+	}
+	bitcoinAsync, ok := wallets.bitcoin.(bitcoinAsyncSwapClient)
+	if !ok {
+		return swapstate.Negotiation{}, errors.New("Bitcoin wallet does not support prepared swap funding")
+	}
+	tradeID, err := trade.NewTradeID()
+	if err != nil {
+		return swapstate.Negotiation{}, err
+	}
+	qdayKeys, err := qdayAsync.CreateSwapKeys(ctx, tradeID)
+	if err != nil {
+		return swapstate.Negotiation{}, fmt.Errorf("create taker QDAY swap keys: %w", err)
+	}
+	bitcoinStatus, err := bitcoinAsync.Status()
+	if err != nil {
+		return swapstate.Negotiation{}, fmt.Errorf("read Bitcoin swap height: %w", err)
+	} else if bitcoinStatus.WalletHeight <= 0 || uint64(bitcoinStatus.WalletHeight) > uint64(^uint32(0)) {
+		return swapstate.Negotiation{}, errors.New("Bitcoin wallet height is outside the supported range")
+	}
+	bitcoinKey, err := wallets.root.BitcoinSwapKey(tradeID)
+	if err != nil {
+		return swapstate.Negotiation{}, err
+	}
+	secret, secretHash, err := wallets.root.SwapSecret(tradeID)
+	clear(secret[:])
+	if err != nil {
+		return swapstate.Negotiation{}, err
+	}
+	qdayRefundHeight, bitcoinRefundHeight, err := trade.AsyncRefundHeights(record.Signed.Order, now.Unix(), qdayStatus.Height, uint32(bitcoinStatus.WalletHeight))
+	if err != nil {
+		return swapstate.Negotiation{}, err
+	}
+	unsignedAcceptance := trade.AcceptancePayload{
+		Version: trade.AsyncProtocolVersion, Network: record.Signed.Order.Network, OrderID: record.Signed.ID, TradeID: tradeID,
+		TakerPublicKey: hex.EncodeToString(identity.Public().(ed25519.PublicKey)), TakerMessageKey: hex.EncodeToString(messagePublic[:]),
+		CreatedAt: now.Unix(), ExpiresAt: record.Signed.Order.ExpiresAt,
+		TakerQDAY:       order.QDAYKeys{Classical: qdayKeys.Keys.Classical, Reserve: qdayKeys.Keys.Reserve, Address: qdayKeys.Keys.Address},
+		TakerBitcoinKey: hex.EncodeToString(bitcoinKey.PubKey().SerializeCompressed()),
+		TakerQDAYHeight: qdayStatus.Height, TakerBTCHeight: uint32(bitcoinStatus.WalletHeight),
+		SecretHash: hex.EncodeToString(secretHash[:]), QDAYRefundHeight: qdayRefundHeight, BTCRefundHeight: bitcoinRefundHeight,
+	}
+	agreement, err := swapprotocol.BuildAsyncTerms(record.Signed, unsignedAcceptance)
+	if err != nil {
+		return swapstate.Negotiation{}, err
+	}
+	localGivesQDAY := agreement.MakerGives == "BTC"
+	qdayRole := "recipient"
+	if localGivesQDAY {
+		qdayRole = "refund"
+	}
+	if _, err := qdayAsync.RegisterSwap(ctx, walletd.RegisterSwapRequest{
+		SwapID: tradeID, Role: qdayRole,
+		Counterparty: walletd.SwapKeys{Classical: agreement.Maker.QDAY.Classical, Reserve: agreement.Maker.QDAY.Reserve, Address: agreement.Maker.QDAY.Address},
+		SecretHash:   agreement.SecretHash, RefundHeight: agreement.QDAYRefundHeight,
+	}); err != nil {
+		return swapstate.Negotiation{}, fmt.Errorf("register asynchronous QDAY contract: %w", err)
+	}
+	bitcoinContract, err := bitcoinContract(agreement)
+	if err != nil {
+		return swapstate.Negotiation{}, err
+	} else if err := bitcoinAsync.WatchContract(bitcoinContract); err != nil {
+		return swapstate.Negotiation{}, fmt.Errorf("watch asynchronous Bitcoin contract: %w", err)
+	}
+	var funding trade.FundingPackage
+	preparedQDAY := false
+	preparedBitcoin := ""
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		if preparedQDAY {
+			_ = qdayAsync.CancelPreparedSwapFunding(context.Background(), tradeID)
+		}
+		if preparedBitcoin != "" {
+			_ = bitcoinAsync.ReleaseFunding(preparedBitcoin)
+		}
+	}()
+	if record.Signed.Order.Receive.Asset == "QDAY" {
+		action, err := qdayAsync.PrepareSwapFunding(ctx, tradeID, walletd.FundSwapRequest{
+			AmountAtomic: agreement.QDAYAmountAtomic, ExpectedUnitAtomic: agreement.QDAYUnitAtomic,
+		})
+		if err != nil {
+			return swapstate.Negotiation{}, fmt.Errorf("prepare QDAY acceptance funding: %w", err)
+		}
+		preparedQDAY = true
+		funding = trade.FundingPackage{
+			Asset: "QDAY", TransactionID: action.TransactionID,
+			RawTransactions: []string{action.RawTransaction}, BasisHeight: action.BasisHeight, BasisID: action.BasisID,
+		}
+	} else {
+		prepared, err := bitcoinAsync.PrepareFunding(bitcoinContract)
+		if err != nil {
+			return swapstate.Negotiation{}, fmt.Errorf("prepare Bitcoin acceptance funding: %w", err)
+		}
+		preparedBitcoin = prepared.Raw
+		funding = trade.FundingPackage{Asset: "BTC", TransactionID: prepared.TxID, RawTransactions: []string{prepared.Raw}}
+	}
+	acceptance, err := trade.NewAsyncAcceptance(
+		record.Signed, tradeID, unsignedAcceptance.TakerQDAY, unsignedAcceptance.TakerBitcoinKey,
+		unsignedAcceptance.TakerQDAYHeight, unsignedAcceptance.TakerBTCHeight, unsignedAcceptance.SecretHash,
+		qdayRefundHeight, bitcoinRefundHeight, funding, identity, messagePublic, now,
+	)
 	if err != nil {
 		return swapstate.Negotiation{}, err
 	}
@@ -803,6 +990,7 @@ func (s *Service) AcceptOffer(ctx context.Context, orderID string) (swapstate.Ne
 	if err != nil {
 		return swapstate.Negotiation{}, err
 	}
+	committed = true
 	if _, err := s.relay.Accept(ctx, orderID, acceptance); err != nil {
 		return pending, err
 	}
@@ -838,6 +1026,25 @@ func (s *Service) matchAcceptance(ctx context.Context, journal *swapstate.Journa
 		if matchErr != nil {
 			return swapstate.Swap{}, matchErr
 		}
+		if negotiation.Acceptance.Acceptance.Version == trade.AsyncProtocolVersion {
+			wallets, _, walletErr := s.engineWalletSnapshot()
+			if walletErr != nil {
+				return swapstate.Swap{}, walletErr
+			}
+			candidate := swapstate.Swap{
+				Version: trade.AsyncProtocolVersion, ID: negotiation.Acceptance.Acceptance.TradeID,
+				Role: swapstate.RoleMaker, Phase: swapstate.PhaseMatched,
+				Order: negotiation.Order, Acceptance: negotiation.Acceptance, Match: match,
+			}
+			agreement, agreementErr := swapprotocol.BuildAsyncAgreement(candidate.Order, candidate.Acceptance)
+			if agreementErr == nil {
+				agreementErr = validateAsyncTakerFunding(ctx, wallets, candidate, agreement)
+			}
+			wallets.clear()
+			if agreementErr != nil {
+				return swapstate.Swap{}, fmt.Errorf("%w: %v", errInvalidAsyncFunding, agreementErr)
+			}
+		}
 		record, _, err = journal.Create(swapstate.RoleMaker, negotiation.Order, negotiation.Acceptance, match, now)
 	} else if err == nil {
 		if record.Role != swapstate.RoleMaker || record.Order.ID != negotiation.Order.ID || record.Acceptance.ID != negotiation.Acceptance.ID {
@@ -846,6 +1053,17 @@ func (s *Service) matchAcceptance(ctx context.Context, journal *swapstate.Journa
 	}
 	if err != nil {
 		return swapstate.Swap{}, err
+	}
+	if record.Version == trade.AsyncProtocolVersion && (record.AgreementJSON == "" || record.Phase == swapstate.PhaseMatched) {
+		wallets, _, walletErr := s.engineWalletSnapshot()
+		if walletErr != nil {
+			return record, walletErr
+		}
+		record, err = s.initializeAsyncSwap(ctx, wallets, journal, record)
+		wallets.clear()
+		if err != nil {
+			return record, fmt.Errorf("validate asynchronous acceptance funding: %w", err)
+		}
 	}
 	// The exact signed match is persisted before contacting the relay. A retry
 	// after a timeout must resend those bytes instead of creating another match.
@@ -1033,7 +1251,7 @@ func requireAvailable(wanted, available, asset string) error {
 		return errors.New("wallet returned an invalid balance")
 	}
 	if want.Cmp(have) > 0 {
-		return fmt.Errorf("insufficient confirmed %s balance", asset)
+		return fmt.Errorf("insufficient available %s balance after open order reservations", asset)
 	}
 	return nil
 }
@@ -1060,13 +1278,20 @@ func (s *Service) syncRelay(ctx context.Context) error {
 	}
 	defer cleanup()
 	identityPublic := hex.EncodeToString(identity.Public().(ed25519.PublicKey))
+	now := time.Now().UTC()
+	if err := s.reconcileNegotiations(ctx, journal, now); err != nil {
+		return err
+	}
 	cursor, err := journal.RelayCursor()
 	if err != nil {
 		return err
 	}
 	for pages := 0; pages < 10; pages++ {
-		now := time.Now().UTC()
-		poll, err := trade.NewPoll(s.config.Network, cursor, 100, identity, now)
+		now = time.Now().UTC()
+		// A version 2 acceptance can contain a large post-quantum QDAY funding
+		// transaction. Fetch one mailbox record at a time to keep relay responses
+		// bounded independently of the number of queued buyers.
+		poll, err := trade.NewPoll(s.config.Network, cursor, 1, identity, now)
 		if err != nil {
 			return err
 		}
@@ -1113,13 +1338,19 @@ func (s *Service) syncRelay(ctx context.Context) error {
 					return err
 				}
 				// An order has identical terms for every taker, so the first valid
-				// acceptance wins automatically. Funding still waits for the maker's
-				// explicit approval of the complete cross-chain agreement.
+				// acceptance wins automatically. The signed offer authorizes funding
+				// only after both clients validate the complete immutable agreement.
 				s.negotiationMu.Lock()
 				_, err = s.matchAcceptance(ctx, journal, identity, acceptance.ID)
 				s.negotiationMu.Unlock()
 				if err != nil {
-					return fmt.Errorf("automatically match acceptance: %w", err)
+					if errors.Is(err, errInvalidAsyncFunding) {
+						if removeErr := journal.RemoveIncomingAcceptance(acceptance.ID); removeErr != nil {
+							return removeErr
+						}
+					} else {
+						return fmt.Errorf("automatically match acceptance: %w", err)
+					}
 				}
 			case relay.MailboxMatch:
 				if item.Match == nil {
@@ -1168,7 +1399,96 @@ func (s *Service) syncRelay(ctx context.Context) error {
 			return nil
 		}
 	}
-	return errors.New("relay mailbox exceeded ten pages in one synchronization")
+	// Continue from the durable cursor on the next worker tick. Bounding one
+	// pass keeps a busy order from starving wallet and chain processing.
+	return nil
+}
+
+func (s *Service) reconcileNegotiations(ctx context.Context, journal *swapstate.Journal, now time.Time) error {
+	records := make(map[string]relay.Record)
+	orderRecord := func(orderID string) (relay.Record, error) {
+		if record, ok := records[orderID]; ok {
+			return record, nil
+		}
+		record, err := s.relay.Order(ctx, orderID)
+		if err == nil {
+			records[orderID] = record
+		}
+		return record, err
+	}
+	pending, err := journal.PendingAcceptances()
+	if err != nil {
+		return err
+	}
+	for _, negotiation := range pending {
+		remove := negotiation.Acceptance.Acceptance.ExpiresAt <= now.Unix()
+		if !remove {
+			record, err := orderRecord(negotiation.Order.ID)
+			if err != nil {
+				return err
+			}
+			selected := record.Status == relay.StatusMatched && record.Acceptance != nil && record.Acceptance.ID == negotiation.Acceptance.ID
+			remove = record.Status != relay.StatusOpen && !selected
+		}
+		if remove {
+			s.releasePendingFunding(ctx, negotiation)
+			if err := journal.RemovePendingAcceptance(negotiation.Acceptance.ID); err != nil {
+				return err
+			}
+		} else if negotiation.Acceptance.Acceptance.Version == trade.AsyncProtocolVersion {
+			funding := negotiation.Acceptance.Acceptance.Funding
+			if funding.Asset == "BTC" && len(funding.RawTransactions) == 1 {
+				s.mu.RLock()
+				bitcoinClient := s.bitcoinClient
+				s.mu.RUnlock()
+				if bitcoin, ok := bitcoinClient.(bitcoinAsyncSwapClient); ok {
+					if err := bitcoin.ReserveFunding(funding.RawTransactions[0]); err != nil {
+						return fmt.Errorf("restore pending Bitcoin funding reservation: %w", err)
+					}
+				}
+			}
+		}
+	}
+	incoming, err := journal.IncomingAcceptances()
+	if err != nil {
+		return err
+	}
+	for _, negotiation := range incoming {
+		remove := negotiation.Acceptance.Acceptance.ExpiresAt <= now.Unix()
+		if !remove {
+			record, err := orderRecord(negotiation.Order.ID)
+			if err != nil {
+				return err
+			}
+			selected := record.Status == relay.StatusMatched && record.Acceptance != nil && record.Acceptance.ID == negotiation.Acceptance.ID
+			remove = record.Status != relay.StatusOpen && !selected
+		}
+		if remove {
+			if err := journal.RemoveIncomingAcceptance(negotiation.Acceptance.ID); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Service) releasePendingFunding(ctx context.Context, negotiation swapstate.Negotiation) {
+	if negotiation.Acceptance.Acceptance.Version != trade.AsyncProtocolVersion {
+		return
+	}
+	funding := negotiation.Acceptance.Acceptance.Funding
+	s.mu.RLock()
+	qdayClient, bitcoinClient := s.client, s.bitcoinClient
+	s.mu.RUnlock()
+	if funding.Asset == "QDAY" {
+		if qday, ok := qdayClient.(qdayAsyncSwapClient); ok {
+			_ = qday.CancelPreparedSwapFunding(ctx, negotiation.Acceptance.Acceptance.TradeID)
+		}
+	} else if funding.Asset == "BTC" && len(funding.RawTransactions) == 1 {
+		if bitcoinClient, ok := bitcoinClient.(bitcoinAsyncSwapClient); ok {
+			_ = bitcoinClient.ReleaseFunding(funding.RawTransactions[0])
+		}
+	}
 }
 
 func (s *Service) State(ctx context.Context) State {
@@ -1230,6 +1550,18 @@ func (s *Service) State(ctx context.Context) State {
 		state.ActiveSwaps = len(negotiations.Swaps)
 	} else if state.Configured {
 		state.RelayError = joinError(state.RelayError, err)
+	}
+	if state.Unlocked && state.QDAY != nil && state.Balance != nil && state.BitcoinBalance != nil {
+		fundsCtx, fundsCancel := context.WithTimeout(ctx, 5*time.Second)
+		s.fundsMu.Lock()
+		funds, err := s.fundsSnapshot(fundsCtx, *state.QDAY, *state.Balance, *state.BitcoinBalance)
+		s.fundsMu.Unlock()
+		fundsCancel()
+		if err != nil {
+			state.RelayError = joinError(state.RelayError, err)
+		} else {
+			state.Funds = &funds
+		}
 	}
 	return state
 }

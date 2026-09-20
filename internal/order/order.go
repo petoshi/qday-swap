@@ -11,13 +11,16 @@ import (
 	"math/big"
 	"strings"
 	"time"
+
+	"github.com/btcsuite/btcd/btcec/v2"
 )
 
 const (
-	ProtocolVersion = uint16(1)
-	MarketQDAYBTC   = "QDAY-BTC"
-	QDAYLegacyUnit  = "1000000000000000000000000"
-	QDAYDefendUnit  = "1000000000000000000"
+	ProtocolVersion      = uint16(1)
+	AsyncProtocolVersion = uint16(2)
+	MarketQDAYBTC        = "QDAY-BTC"
+	QDAYLegacyUnit       = "1000000000000000000000000"
+	QDAYDefendUnit       = "1000000000000000000"
 	// MinimumBitcoinSwapSatoshis leaves enough value for the independent
 	// claim or refund transaction after its network fee. Tiny signed offers
 	// are rejected by every client and relay before negotiation starts.
@@ -31,8 +34,9 @@ const (
 )
 
 var (
-	orderDomain  = []byte("QDAY_SWAP_ORDER_V1")
-	cancelDomain = []byte("QDAY_SWAP_CANCEL_V1")
+	orderDomain      = []byte("QDAY_SWAP_ORDER_V1")
+	asyncOrderDomain = []byte("QDAY_SWAP_ORDER_V2")
+	cancelDomain     = []byte("QDAY_SWAP_CANCEL_V1")
 )
 
 type Amount struct {
@@ -40,18 +44,29 @@ type Amount struct {
 	Atomic string `json:"atomic"`
 }
 
+type QDAYKeys struct {
+	Classical string `json:"classical"`
+	Reserve   string `json:"reserve"`
+	Address   string `json:"address"`
+}
+
 type Payload struct {
-	Version         uint16 `json:"version"`
-	Network         string `json:"network"`
-	Market          string `json:"market"`
-	QDAYUnitAtomic  string `json:"qdayUnitAtomic"`
-	MakerPublicKey  string `json:"makerPublicKey"`
-	MakerMessageKey string `json:"makerMessageKey"`
-	Give            Amount `json:"give"`
-	Receive         Amount `json:"receive"`
-	CreatedAt       int64  `json:"createdAt"`
-	ExpiresAt       int64  `json:"expiresAt"`
-	Nonce           string `json:"nonce"`
+	Version         uint16   `json:"version"`
+	Network         string   `json:"network"`
+	Market          string   `json:"market"`
+	QDAYUnitAtomic  string   `json:"qdayUnitAtomic"`
+	MakerPublicKey  string   `json:"makerPublicKey"`
+	MakerMessageKey string   `json:"makerMessageKey"`
+	Give            Amount   `json:"give"`
+	Receive         Amount   `json:"receive"`
+	CreatedAt       int64    `json:"createdAt"`
+	ExpiresAt       int64    `json:"expiresAt"`
+	Nonce           string   `json:"nonce"`
+	SessionID       string   `json:"sessionID,omitempty"`
+	MakerQDAY       QDAYKeys `json:"makerQDAY,omitempty"`
+	MakerBitcoinKey string   `json:"makerBitcoinPublicKey,omitempty"`
+	MakerQDAYHeight uint64   `json:"makerQDAYHeight,omitempty"`
+	MakerBTCHeight  uint32   `json:"makerBitcoinHeight,omitempty"`
 }
 
 type Signed struct {
@@ -73,6 +88,26 @@ type SignedCancellation struct {
 }
 
 func NewPayload(network, qdayUnitAtomic string, give, receive Amount, lifetime time.Duration, publicKey ed25519.PublicKey, messageKey [messageKeySize]byte, now time.Time) (Payload, error) {
+	return newPayload(ProtocolVersion, network, qdayUnitAtomic, give, receive, lifetime, publicKey, messageKey, now)
+}
+
+func NewAsyncPayload(network, qdayUnitAtomic string, give, receive Amount, lifetime time.Duration, publicKey ed25519.PublicKey, messageKey [messageKeySize]byte, sessionID string, qdayKeys QDAYKeys, bitcoinPublicKey string, qdayHeight uint64, bitcoinHeight uint32, now time.Time) (Payload, error) {
+	payload, err := newPayload(AsyncProtocolVersion, network, qdayUnitAtomic, give, receive, lifetime, publicKey, messageKey, now)
+	if err != nil {
+		return Payload{}, err
+	}
+	payload.SessionID = sessionID
+	payload.MakerQDAY = qdayKeys
+	payload.MakerBitcoinKey = bitcoinPublicKey
+	payload.MakerQDAYHeight = qdayHeight
+	payload.MakerBTCHeight = bitcoinHeight
+	if err := payload.Validate(now); err != nil {
+		return Payload{}, err
+	}
+	return payload, nil
+}
+
+func newPayload(version uint16, network, qdayUnitAtomic string, give, receive Amount, lifetime time.Duration, publicKey ed25519.PublicKey, messageKey [messageKeySize]byte, now time.Time) (Payload, error) {
 	if lifetime < minimumLifetime || lifetime > maximumLifetime {
 		return Payload{}, fmt.Errorf("order lifetime must be between %s and %s", minimumLifetime, maximumLifetime)
 	}
@@ -81,7 +116,7 @@ func NewPayload(network, qdayUnitAtomic string, give, receive Amount, lifetime t
 		return Payload{}, fmt.Errorf("generate nonce: %w", err)
 	}
 	payload := Payload{
-		Version:         ProtocolVersion,
+		Version:         version,
 		Network:         network,
 		Market:          MarketQDAYBTC,
 		QDAYUnitAtomic:  qdayUnitAtomic,
@@ -93,14 +128,16 @@ func NewPayload(network, qdayUnitAtomic string, give, receive Amount, lifetime t
 		ExpiresAt:       now.Add(lifetime).Unix(),
 		Nonce:           hex.EncodeToString(nonce),
 	}
-	if err := payload.Validate(now); err != nil {
-		return Payload{}, err
+	if version == ProtocolVersion {
+		if err := payload.Validate(now); err != nil {
+			return Payload{}, err
+		}
 	}
 	return payload, nil
 }
 
 func (p Payload) Validate(now time.Time) error {
-	if p.Version != ProtocolVersion {
+	if p.Version != ProtocolVersion && p.Version != AsyncProtocolVersion {
 		return fmt.Errorf("unsupported order version %d", p.Version)
 	}
 	switch p.Network {
@@ -122,6 +159,19 @@ func (p Payload) Validate(now time.Time) error {
 	}
 	if _, err := parseMessageKey(p.MakerMessageKey); err != nil {
 		return err
+	}
+	if p.Version == AsyncProtocolVersion {
+		if _, err := parseDigest(p.SessionID, "session ID"); err != nil {
+			return err
+		} else if err := p.MakerQDAY.validate(); err != nil {
+			return fmt.Errorf("maker QDAY keys: %w", err)
+		} else if err := validateBitcoinPublicKey(p.MakerBitcoinKey); err != nil {
+			return fmt.Errorf("maker Bitcoin key: %w", err)
+		} else if p.MakerQDAYHeight == 0 || p.MakerBTCHeight == 0 {
+			return errors.New("maker chain heights must be positive")
+		}
+	} else if p.SessionID != "" || p.MakerQDAY != (QDAYKeys{}) || p.MakerBitcoinKey != "" || p.MakerQDAYHeight != 0 || p.MakerBTCHeight != 0 {
+		return errors.New("version 1 order contains asynchronous protocol fields")
 	}
 	nonce, err := hex.DecodeString(p.Nonce)
 	if err != nil || len(nonce) != 16 || p.Nonce != strings.ToLower(p.Nonce) {
@@ -185,7 +235,11 @@ func validateAtomic(name, value string) error {
 }
 
 func (p Payload) signingBytes() []byte {
-	encoder := canonicalEncoder{bytes: append([]byte(nil), orderDomain...)}
+	domain := orderDomain
+	if p.Version == AsyncProtocolVersion {
+		domain = asyncOrderDomain
+	}
+	encoder := canonicalEncoder{bytes: append([]byte(nil), domain...)}
 	encoder.uint16(p.Version)
 	encoder.text(p.Network)
 	encoder.text(p.Market)
@@ -199,7 +253,40 @@ func (p Payload) signingBytes() []byte {
 	encoder.int64(p.CreatedAt)
 	encoder.int64(p.ExpiresAt)
 	encoder.text(p.Nonce)
+	if p.Version == AsyncProtocolVersion {
+		encoder.text(p.SessionID)
+		encoder.text(p.MakerQDAY.Classical)
+		encoder.text(p.MakerQDAY.Reserve)
+		encoder.text(p.MakerQDAY.Address)
+		encoder.text(p.MakerBitcoinKey)
+		encoder.uint64(p.MakerQDAYHeight)
+		encoder.uint32(p.MakerBTCHeight)
+	}
 	return encoder.bytes
+}
+
+func (k QDAYKeys) validate() error {
+	for _, field := range []struct{ name, value string }{{"classical", k.Classical}, {"reserve", k.Reserve}} {
+		decoded, err := hex.DecodeString(field.value)
+		if err != nil || len(decoded) != 32 || field.value != strings.ToLower(field.value) {
+			return fmt.Errorf("%s key must be 32 lowercase hexadecimal bytes", field.name)
+		}
+	}
+	if strings.TrimSpace(k.Address) == "" || len(k.Address) > 128 {
+		return errors.New("address is invalid")
+	}
+	return nil
+}
+
+func validateBitcoinPublicKey(value string) error {
+	decoded, err := hex.DecodeString(value)
+	if err != nil || len(decoded) != 33 || value != strings.ToLower(value) {
+		return errors.New("public key must be 33 lowercase hexadecimal bytes")
+	}
+	if _, err := btcec.ParsePubKey(decoded); err != nil {
+		return errors.New("public key must be valid compressed secp256k1 data")
+	}
+	return nil
 }
 
 func (p Payload) ID() string {
@@ -367,6 +454,18 @@ func (e *canonicalEncoder) uint16(value uint16) {
 func (e *canonicalEncoder) int64(value int64) {
 	var buffer [8]byte
 	binary.BigEndian.PutUint64(buffer[:], uint64(value))
+	e.bytes = append(e.bytes, buffer[:]...)
+}
+
+func (e *canonicalEncoder) uint32(value uint32) {
+	var buffer [4]byte
+	binary.BigEndian.PutUint32(buffer[:], value)
+	e.bytes = append(e.bytes, buffer[:]...)
+}
+
+func (e *canonicalEncoder) uint64(value uint64) {
+	var buffer [8]byte
+	binary.BigEndian.PutUint64(buffer[:], value)
 	e.bytes = append(e.bytes, buffer[:]...)
 }
 

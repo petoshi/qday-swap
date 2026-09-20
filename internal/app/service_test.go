@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/btcsuite/btcd/chainhash/v2"
+	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/petoshi/qday-swap/internal/bitcoin"
 	"github.com/petoshi/qday-swap/internal/bitcoinwallet"
 	"github.com/petoshi/qday-swap/internal/order"
 	"github.com/petoshi/qday-swap/internal/relay"
@@ -157,6 +161,44 @@ func (f *fakeBitcoin) SendPayment(destination string, satoshis, expectedFee int6
 	}
 	return bitcoinwallet.Payment{PaymentQuote: quote, TransactionID: "bitcoin-payment"}, nil
 }
+
+func (f *fakeBitcoin) WatchContract(bitcoin.Contract) error { return nil }
+
+func (f *fakeBitcoin) PrepareFunding(contract bitcoin.Contract) (bitcoin.Funding, error) {
+	pkScript, err := contract.PkScript()
+	if err != nil {
+		return bitcoin.Funding{}, err
+	}
+	previous := chainhash.Hash{1}
+	tx := wire.NewMsgTx(2)
+	tx.AddTxIn(wire.NewTxIn(wire.NewOutPoint(&previous, 1), nil, nil))
+	tx.AddTxOut(wire.NewTxOut(contract.Amount, pkScript))
+	raw, err := bitcoin.EncodeTransaction(tx)
+	if err != nil {
+		return bitcoin.Funding{}, err
+	}
+	return contract.FundingFromRaw(raw)
+}
+
+func (f *fakeBitcoin) Broadcast(raw string) (bitcoinwallet.Transaction, error) {
+	tx, err := bitcoin.DecodeTransaction(raw)
+	if err != nil {
+		return bitcoinwallet.Transaction{}, err
+	}
+	return bitcoinwallet.Transaction{ID: tx.TxID(), Raw: raw, Height: 900_000, Confirmations: 1}, nil
+}
+
+func (f *fakeBitcoin) Transaction(string) (bitcoinwallet.Transaction, error) {
+	return bitcoinwallet.Transaction{}, bitcoinwallet.ErrTransactionNotFound
+}
+
+func (f *fakeBitcoin) FindSpend(bitcoin.Funding) (bitcoinwallet.Transaction, error) {
+	return bitcoinwallet.Transaction{}, bitcoinwallet.ErrTransactionNotFound
+}
+
+func (f *fakeBitcoin) DestinationScript() ([]byte, error) { return []byte{0x51}, nil }
+func (f *fakeBitcoin) ReserveFunding(string) error        { return nil }
+func (f *fakeBitcoin) ReleaseFunding(string) error        { return nil }
 
 func TestSetupLockUnlockAndReceiveAddress(t *testing.T) {
 	relayURL := testRelayURL(t)
@@ -386,6 +428,7 @@ func TestImportRecoveryReplacesWalletWithoutKeepingBackup(t *testing.T) {
 
 func TestTwoApplicationsPublishAcceptAndMatchOffer(t *testing.T) {
 	relayURL := testRelayURL(t)
+	registered := make(map[string]walletd.RegisterSwapRequest)
 	qdayServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer "+fakeToken {
 			http.Error(w, `{"error":"authentication required"}`, http.StatusUnauthorized)
@@ -403,6 +446,28 @@ func TestTwoApplicationsPublishAcceptAndMatchOffer(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(walletd.Balance{Height: 12_000, Synced: true, UnitAtomic: order.QDAYLegacyUnit, Spendable: walletd.Amount{Atomic: "5000000000000000000000000", QDAY: "5"}})
 		case "/v1/addresses":
 			_ = json.NewEncoder(w).Encode(walletd.Address{Index: 0, Address: "qday1ptest", Reference: mainQDAYReceiveReference, Kind: "deposit"})
+		case "/v1/swap-keys":
+			var request struct {
+				SwapID string `json:"swapID"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatal(err)
+			}
+			classical := sha256.Sum256([]byte("classical:" + request.SwapID))
+			reserve := sha256.Sum256([]byte("reserve:" + request.SwapID))
+			_ = json.NewEncoder(w).Encode(walletd.SwapKeyView{SwapID: request.SwapID, Keys: walletd.SwapKeys{
+				Classical: fmt.Sprintf("%x", classical), Reserve: fmt.Sprintf("%x", reserve), Address: "qday1ptest" + request.SwapID[:8],
+			}})
+		case "/v1/swaps":
+			var request walletd.RegisterSwapRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatal(err)
+			}
+			registered[request.SwapID] = request
+			_ = json.NewEncoder(w).Encode(walletd.Swap{
+				SwapID: request.SwapID, Role: request.Role, SecretHash: request.SecretHash,
+				RefundHeight: request.RefundHeight, Height: 12_000,
+			})
 		default:
 			http.NotFound(w, r)
 		}
@@ -458,13 +523,25 @@ func TestTwoApplicationsPublishAcceptAndMatchOffer(t *testing.T) {
 		t.Fatalf("small Bitcoin quote error = %v", err)
 	}
 	expensive, err := maker.CreateOffer(context.Background(), CreateOfferRequest{
-		GiveAsset: "QDAY", GiveAmount: "0.1", ReceiveAmount: "2", LifetimeMinutes: 60,
+		GiveAsset: "QDAY", GiveAmount: "0.1", ReceiveAmount: "2",
 	})
 	if err != nil {
 		t.Fatal(err)
+	} else if expensive.Signed.Order.ExpiresAt-expensive.Signed.Order.CreatedAt != int64((24*time.Hour)/time.Second) {
+		t.Fatalf("default offer lifetime = %d seconds", expensive.Signed.Order.ExpiresAt-expensive.Signed.Order.CreatedAt)
 	}
-	if _, err := taker.AcceptOffer(context.Background(), expensive.Signed.ID); err == nil || !strings.Contains(err.Error(), "insufficient confirmed BTC") {
+	if _, err := taker.AcceptOffer(context.Background(), expensive.Signed.ID); err == nil || !strings.Contains(err.Error(), "insufficient available BTC") {
 		t.Fatalf("underfunded taker error = %v", err)
+	}
+	cancelled, err := maker.CancelOffer(context.Background(), expensive.Signed.ID)
+	if err != nil {
+		t.Fatal(err)
+	} else if cancelled.Status != relay.StatusCancelled {
+		t.Fatalf("cancelled offer status = %q", cancelled.Status)
+	}
+	state := maker.State(context.Background())
+	if state.Funds == nil || state.Funds.OpenOrders != 0 || state.Funds.QDAY.Reserved != "0" || state.Funds.QDAY.Available != "5" {
+		t.Fatalf("funds after cancellation = %#v", state.Funds)
 	}
 	offer, err := maker.CreateOffer(context.Background(), CreateOfferRequest{
 		GiveAsset: "QDAY", GiveAmount: "1.25", ReceiveAmount: "0.0001", LifetimeMinutes: 60,
@@ -473,6 +550,20 @@ func TestTwoApplicationsPublishAcceptAndMatchOffer(t *testing.T) {
 		t.Fatal(err)
 	} else if offer.Status != relay.StatusOpen {
 		t.Fatalf("offer status = %q", offer.Status)
+	}
+	state = maker.State(context.Background())
+	if state.Funds == nil || state.Funds.OpenOrders != 1 || state.Funds.QDAY.Total != "5" || state.Funds.QDAY.Reserved != "1.25" || state.Funds.QDAY.Available != "3.75" {
+		t.Fatalf("funds with open sell order = %#v", state.Funds)
+	}
+	if _, err := maker.QuoteOffer(context.Background(), QuoteOfferRequest{
+		Side: "sell", Quantity: "4", Price: "0.0001", PriceCurrency: "BTC",
+	}); err == nil || !strings.Contains(err.Error(), "insufficient available QDAY") {
+		t.Fatalf("reserved QDAY was offered twice: %v", err)
+	}
+	if _, err := maker.QuoteWithdrawal(context.Background(), WithdrawalQuoteRequest{
+		Asset: "QDAY", Destination: "qday1" + strings.Repeat("q", 59), Amount: "4",
+	}); err == nil || !strings.Contains(err.Error(), "open order reservations") {
+		t.Fatalf("reserved QDAY was withdrawable: %v", err)
 	}
 	flakyAcceptRelay := &failOnceAcceptRelay{relayAPI: taker.relay}
 	taker.relay = flakyAcceptRelay
@@ -488,10 +579,14 @@ func TestTwoApplicationsPublishAcceptAndMatchOffer(t *testing.T) {
 	} else if pending.Order.ID != offer.Signed.ID {
 		t.Fatalf("pending order = %q", pending.Order.ID)
 	}
+	state = taker.State(context.Background())
+	if state.Funds == nil || state.Funds.OpenOrders != 0 || state.Funds.Bitcoin.Reserved != "0.0001" || state.Funds.Bitcoin.Available != "1.2499" {
+		t.Fatalf("taker pending acceptance reservation = %#v", state.Funds)
+	}
 	flakyRelay := &failOnceMatchRelay{relayAPI: maker.relay}
 	maker.relay = flakyRelay
 	maker.lastRelaySync = time.Time{}
-	state := maker.State(context.Background())
+	state = maker.State(context.Background())
 	if !strings.Contains(state.RelayError, "simulated relay timeout") || state.IncomingTrades != 1 || state.ActiveSwaps != 1 {
 		t.Fatalf("maker state after relay timeout = %#v", state)
 	}
@@ -507,6 +602,8 @@ func TestTwoApplicationsPublishAcceptAndMatchOffer(t *testing.T) {
 	state = maker.State(context.Background())
 	if state.RelayError != "" || state.IncomingTrades != 0 || state.ActiveSwaps != 1 {
 		t.Fatalf("maker state after relay retry = %#v", state)
+	} else if state.Funds == nil || state.Funds.OpenOrders != 0 || state.Funds.QDAY.Reserved != "1.25" || state.Funds.QDAY.Available != "3.75" {
+		t.Fatalf("maker matched swap reservation = %#v", state.Funds)
 	}
 	negotiations, err = maker.Negotiations()
 	if err != nil || len(negotiations.Swaps) != 1 {
@@ -515,7 +612,7 @@ func TestTwoApplicationsPublishAcceptAndMatchOffer(t *testing.T) {
 	matched := negotiations.Swaps[0]
 	if matched.Match.ID != firstMatch.Match.ID {
 		t.Fatalf("match retry changed signed payload: first=%q retry=%q", firstMatch.Match.ID, matched.Match.ID)
-	} else if matched.Phase != swapstate.PhaseMatched || matched.Role != swapstate.RoleMaker {
+	} else if matched.Phase != swapstate.PhaseAsyncTakerFunding || matched.Role != swapstate.RoleMaker {
 		t.Fatalf("maker swap = %#v", matched)
 	}
 	taker.lastRelaySync = time.Time{}

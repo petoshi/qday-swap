@@ -90,6 +90,14 @@ func positiveAtomic(value, name string) (*big.Int, error) {
 	return integer, nil
 }
 
+func nonNegativeAtomic(value, name string) (*big.Int, error) {
+	integer, ok := new(big.Int).SetString(value, 10)
+	if !ok || integer.Sign() < 0 {
+		return nil, fmt.Errorf("%s is invalid", name)
+	}
+	return integer, nil
+}
+
 func validQDAYAddressShape(value string) bool {
 	if len(value) == 141 && strings.HasPrefix(value, "qday1") {
 		for _, character := range value[5:] {
@@ -112,6 +120,8 @@ func validQDAYAddressShape(value string) bool {
 }
 
 func (s *Service) QuoteWithdrawal(ctx context.Context, request WithdrawalQuoteRequest) (WithdrawalQuote, error) {
+	s.fundsMu.Lock()
+	defer s.fundsMu.Unlock()
 	request.Asset = strings.ToUpper(strings.TrimSpace(request.Asset))
 	request.Destination = strings.TrimSpace(request.Destination)
 	if request.Destination == "" {
@@ -137,6 +147,8 @@ func (s *Service) QuoteWithdrawal(ctx context.Context, request WithdrawalQuoteRe
 		}
 		if qdayClient == nil {
 			return WithdrawalQuote{}, errors.New("QDAY wallet is unavailable")
+		} else if bitcoinClient == nil {
+			return WithdrawalQuote{}, errors.New("Bitcoin wallet is unavailable")
 		}
 		status, err := qdayClient.Status(ctx)
 		if err != nil {
@@ -148,7 +160,15 @@ func (s *Service) QuoteWithdrawal(ctx context.Context, request WithdrawalQuoteRe
 		if err != nil {
 			return WithdrawalQuote{}, err
 		}
-		available, err := positiveAtomic(balance.Spendable.Atomic, "QDAY balance")
+		bitcoinBalance, err := bitcoinClient.Balance()
+		if err != nil {
+			return WithdrawalQuote{}, err
+		}
+		funds, err := s.fundsSnapshot(ctx, status, balance, bitcoinBalance)
+		if err != nil {
+			return WithdrawalQuote{}, err
+		}
+		available, err := nonNegativeAtomic(funds.QDAY.AvailableAtomic, "available QDAY balance")
 		if err != nil {
 			return WithdrawalQuote{}, err
 		}
@@ -170,7 +190,7 @@ func (s *Service) QuoteWithdrawal(ctx context.Context, request WithdrawalQuoteRe
 		}
 		total := new(big.Int).Add(new(big.Int).Set(amount), fee)
 		if total.Cmp(available) > 0 {
-			return WithdrawalQuote{}, errors.New("amount plus network fee exceeds the spendable QDAY balance")
+			return WithdrawalQuote{}, errors.New("amount plus network fee exceeds the available QDAY balance after open order reservations")
 		}
 		return WithdrawalQuote{
 			RequestID: requestID, Asset: "QDAY", Destination: request.Destination,
@@ -184,6 +204,8 @@ func (s *Service) QuoteWithdrawal(ctx context.Context, request WithdrawalQuoteRe
 	case "BTC", "BITCOIN":
 		if bitcoinClient == nil {
 			return WithdrawalQuote{}, errors.New("Bitcoin wallet is unavailable")
+		} else if qdayClient == nil {
+			return WithdrawalQuote{}, errors.New("QDAY wallet is unavailable")
 		}
 		status, err := bitcoinClient.Status()
 		if err != nil {
@@ -199,7 +221,19 @@ func (s *Service) QuoteWithdrawal(ctx context.Context, request WithdrawalQuoteRe
 		if err != nil {
 			return WithdrawalQuote{}, err
 		}
-		available, err := positiveAtomic(balance.Confirmed.Satoshis, "Bitcoin balance")
+		qdayStatus, err := qdayClient.Status(ctx)
+		if err != nil {
+			return WithdrawalQuote{}, err
+		}
+		qdayBalance, err := qdayClient.Balance(ctx)
+		if err != nil {
+			return WithdrawalQuote{}, err
+		}
+		funds, err := s.fundsSnapshot(ctx, qdayStatus, qdayBalance, balance)
+		if err != nil {
+			return WithdrawalQuote{}, err
+		}
+		available, err := nonNegativeAtomic(funds.Bitcoin.AvailableAtomic, "available Bitcoin balance")
 		if err != nil {
 			return WithdrawalQuote{}, err
 		}
@@ -215,7 +249,23 @@ func (s *Service) QuoteWithdrawal(ctx context.Context, request WithdrawalQuoteRe
 			}
 			satoshis = value.Int64()
 		}
-		quote, err := payments.QuotePayment(request.Destination, satoshis, request.Maximum)
+		maximum := request.Maximum && funds.Bitcoin.ReservedAtomic == "0"
+		if request.Maximum && !maximum {
+			fullQuote, quoteErr := payments.QuotePayment(request.Destination, 0, true)
+			if quoteErr != nil {
+				return WithdrawalQuote{}, quoteErr
+			}
+			fee, quoteErr := positiveAtomic(fullQuote.Fee.Satoshis, "Bitcoin fee")
+			if quoteErr != nil {
+				return WithdrawalQuote{}, quoteErr
+			}
+			amount := new(big.Int).Sub(new(big.Int).Set(available), fee)
+			if amount.Sign() <= 0 || !amount.IsInt64() {
+				return WithdrawalQuote{}, errors.New("available Bitcoin balance cannot cover the network fee")
+			}
+			satoshis = amount.Int64()
+		}
+		quote, err := payments.QuotePayment(request.Destination, satoshis, maximum)
 		if err != nil {
 			return WithdrawalQuote{}, err
 		}
@@ -229,14 +279,14 @@ func (s *Service) QuoteWithdrawal(ctx context.Context, request WithdrawalQuoteRe
 		}
 		total := new(big.Int).Add(new(big.Int).Set(amountAtomic), feeAtomic)
 		if total.Cmp(available) > 0 {
-			return WithdrawalQuote{}, errors.New("amount plus network fee exceeds the confirmed Bitcoin balance")
+			return WithdrawalQuote{}, errors.New("amount plus network fee exceeds the available Bitcoin balance after open order reservations")
 		}
 		return WithdrawalQuote{
 			RequestID: requestID, Asset: "BTC", Destination: quote.Destination,
 			Amount: quote.Amount.BTC, AmountAtomic: quote.Amount.Satoshis,
 			Fee: quote.Fee.BTC, FeeAtomic: quote.Fee.Satoshis,
 			Total: quote.Total.BTC, TotalAtomic: quote.Total.Satoshis,
-			Available: balance.Confirmed.BTC, AvailableAtomic: balance.Confirmed.Satoshis,
+			Available: funds.Bitcoin.Available, AvailableAtomic: funds.Bitcoin.AvailableAtomic,
 			UnitAtomic: "100000000", FeeRateSatPerVByte: quote.FeeRateSatPerVByte,
 		}, nil
 	default:
@@ -260,6 +310,8 @@ func (s *Service) SendWithdrawal(ctx context.Context, request SendWithdrawalRequ
 	}
 	s.withdrawalMu.Lock()
 	defer s.withdrawalMu.Unlock()
+	s.fundsMu.Lock()
+	defer s.fundsMu.Unlock()
 	if previous, ok := s.withdrawals[request.RequestID]; ok {
 		if previous.Request != request {
 			return WithdrawalResult{}, errors.New("withdrawal request ID is already bound to another payment")
@@ -286,6 +338,8 @@ func (s *Service) SendWithdrawal(ctx context.Context, request SendWithdrawalRequ
 	case "QDAY":
 		if qdayClient == nil {
 			return WithdrawalResult{}, errors.New("QDAY wallet is unavailable")
+		} else if bitcoinClient == nil {
+			return WithdrawalResult{}, errors.New("Bitcoin wallet is unavailable")
 		}
 		if request.FeeAtomic != qdayWithdrawalFeeAtomic {
 			return WithdrawalResult{}, errors.New("QDAY network fee changed; review the payment again")
@@ -302,12 +356,20 @@ func (s *Service) SendWithdrawal(ctx context.Context, request SendWithdrawalRequ
 		if err != nil {
 			return WithdrawalResult{}, err
 		}
-		available, err := positiveAtomic(balance.Spendable.Atomic, "QDAY balance")
+		bitcoinBalance, err := bitcoinClient.Balance()
+		if err != nil {
+			return WithdrawalResult{}, err
+		}
+		funds, err := s.fundsSnapshot(ctx, status, balance, bitcoinBalance)
+		if err != nil {
+			return WithdrawalResult{}, err
+		}
+		available, err := nonNegativeAtomic(funds.QDAY.AvailableAtomic, "available QDAY balance")
 		if err != nil {
 			return WithdrawalResult{}, err
 		}
 		if new(big.Int).Add(new(big.Int).Set(amount), fee).Cmp(available) > 0 {
-			return WithdrawalResult{}, errors.New("amount plus network fee exceeds the spendable QDAY balance")
+			return WithdrawalResult{}, errors.New("amount plus network fee exceeds the available QDAY balance after open order reservations")
 		}
 		withdrawals, ok := qdayClient.(qdayWithdrawalClient)
 		if !ok {
@@ -326,6 +388,8 @@ func (s *Service) SendWithdrawal(ctx context.Context, request SendWithdrawalRequ
 	case "BTC", "BITCOIN":
 		if bitcoinClient == nil {
 			return WithdrawalResult{}, errors.New("Bitcoin wallet is unavailable")
+		} else if qdayClient == nil {
+			return WithdrawalResult{}, errors.New("QDAY wallet is unavailable")
 		} else if request.UnitAtomic != "100000000" || !amount.IsInt64() || !fee.IsInt64() || amount.Int64() > math.MaxInt64-fee.Int64() {
 			return WithdrawalResult{}, errors.New("Bitcoin payment is invalid")
 		}
@@ -334,6 +398,29 @@ func (s *Service) SendWithdrawal(ctx context.Context, request SendWithdrawalRequ
 			return WithdrawalResult{}, err
 		} else if !status.HeadersSynced || !status.WalletSynced {
 			return WithdrawalResult{}, errors.New("Bitcoin wallet is still synchronizing")
+		}
+		bitcoinBalance, err := bitcoinClient.Balance()
+		if err != nil {
+			return WithdrawalResult{}, err
+		}
+		qdayStatus, err := qdayClient.Status(ctx)
+		if err != nil {
+			return WithdrawalResult{}, err
+		}
+		qdayBalance, err := qdayClient.Balance(ctx)
+		if err != nil {
+			return WithdrawalResult{}, err
+		}
+		funds, err := s.fundsSnapshot(ctx, qdayStatus, qdayBalance, bitcoinBalance)
+		if err != nil {
+			return WithdrawalResult{}, err
+		}
+		available, err := nonNegativeAtomic(funds.Bitcoin.AvailableAtomic, "available Bitcoin balance")
+		if err != nil {
+			return WithdrawalResult{}, err
+		}
+		if new(big.Int).Add(new(big.Int).Set(amount), fee).Cmp(available) > 0 {
+			return WithdrawalResult{}, errors.New("amount plus network fee exceeds the available Bitcoin balance after open order reservations")
 		}
 		payments, ok := bitcoinClient.(bitcoinPaymentClient)
 		if !ok {

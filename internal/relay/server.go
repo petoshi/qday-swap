@@ -2,6 +2,7 @@ package relay
 
 import (
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,7 +22,7 @@ import (
 	"github.com/petoshi/qday-swap/internal/trade"
 )
 
-const maxRequestBody = 64 << 10
+const maxRequestBody = 6 << 20
 
 //go:embed web
 var embeddedWeb embed.FS
@@ -259,7 +260,15 @@ func (s *Server) handleOrders(response http.ResponseWriter, request *http.Reques
 		writeError(response, http.StatusBadRequest, "giveAsset must be QDAY or BTC")
 		return
 	}
-	result, err := s.store.List(Query{Status: status, Market: market, GiveAsset: giveAsset, Page: page, Limit: limit}, s.now())
+	maker := query.Get("maker")
+	if maker != "" {
+		decoded, decodeErr := hex.DecodeString(maker)
+		if decodeErr != nil || len(decoded) != 32 || maker != strings.ToLower(maker) {
+			writeError(response, http.StatusBadRequest, "maker must be a 32-byte lowercase hexadecimal public key")
+			return
+		}
+	}
+	result, err := s.store.List(Query{Status: status, Market: market, GiveAsset: giveAsset, MakerPublicKey: maker, Page: page, Limit: limit}, s.now())
 	if err != nil {
 		s.internalError(response, err)
 		return
