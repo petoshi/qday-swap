@@ -447,7 +447,7 @@ function setupPriceChart() {
     let minimumPrice = Math.floor(Math.max(0, observedMinimum - pricePad) / tickStep) * tickStep;
     let maximumPrice = Math.ceil((observedMaximum + pricePad) / tickStep) * tickStep;
     if (maximumPrice <= minimumPrice) maximumPrice = minimumPrice + tickStep * targetPriceTicks;
-    context.font = '9px ui-monospace, SFMono-Regular, Menlo, monospace';
+    context.font = '11px ui-monospace, SFMono-Regular, Menlo, monospace';
     const axisWidth = Math.max(
       context.measureText(priceLabel(minimumPrice, tickStep)).width,
       context.measureText(priceLabel(maximumPrice, tickStep)).width,
@@ -476,7 +476,7 @@ function setupPriceChart() {
     const maximumVolume = Math.max(...points.map(point => point.volume), 1);
     geometry = {width, height, padding, chartBottom, volumeTop, minimumTime, maximumTime, minimumPrice, maximumPrice, tickStep, x, y};
 
-    context.font = '9px ui-monospace, SFMono-Regular, Menlo, monospace';
+    context.font = '11px ui-monospace, SFMono-Regular, Menlo, monospace';
     context.textBaseline = 'middle';
     const tickCount = Math.max(2, Math.round((maximumPrice - minimumPrice) / tickStep));
     for (let index = 0; index <= tickCount; index++) {
@@ -527,11 +527,11 @@ function setupPriceChart() {
     context.beginPath(); context.moveTo(padding.left, latestY); context.lineTo(width - padding.right, latestY); context.stroke();
     context.setLineDash([]);
     const latestText = priceLabel(latest.price);
-    context.font = 'bold 9px ui-monospace, SFMono-Regular, Menlo, monospace';
+    context.font = 'bold 11px ui-monospace, SFMono-Regular, Menlo, monospace';
     const latestWidth = Math.min(padding.right - 8, context.measureText(latestText).width + 12);
-    context.fillStyle = trendColor; context.fillRect(width - padding.right + 4, latestY - 9, latestWidth, 18);
+    context.fillStyle = trendColor; context.fillRect(width - padding.right + 4, latestY - 10, latestWidth, 20);
     context.fillStyle = '#021005'; context.textAlign = 'center'; context.fillText(latestText, width - padding.right + 4 + latestWidth / 2, latestY);
-    context.font = '9px ui-monospace, SFMono-Regular, Menlo, monospace';
+    context.font = '11px ui-monospace, SFMono-Regular, Menlo, monospace';
 
     if (points.length < 80) {
       context.fillStyle = trendColor;
@@ -547,12 +547,12 @@ function setupPriceChart() {
       context.beginPath(); context.arc(pointX, pointY, 4, 0, Math.PI * 2); context.fill(); context.stroke();
       const hoverText = priceLabel(point.price);
       const hoverWidth = Math.min(padding.right - 8, context.measureText(hoverText).width + 12);
-      context.fillStyle = '#667068'; context.fillRect(width - padding.right + 4, pointY - 9, hoverWidth, 18);
+      context.fillStyle = '#667068'; context.fillRect(width - padding.right + 4, pointY - 10, hoverWidth, 20);
       context.fillStyle = '#f0f4f0'; context.textAlign = 'center'; context.fillText(hoverText, width - padding.right + 4 + hoverWidth / 2, pointY);
       const hoverTime = timeLabel(point.time, maximumTime - minimumTime);
       const hoverTimeWidth = context.measureText(hoverTime).width + 12;
       const hoverTimeX = Math.max(padding.left, Math.min(width - padding.right - hoverTimeWidth, pointX - hoverTimeWidth / 2));
-      context.fillStyle = '#273029'; context.fillRect(hoverTimeX, height - padding.bottom + 3, hoverTimeWidth, 18);
+      context.fillStyle = '#273029'; context.fillRect(hoverTimeX, height - padding.bottom + 2, hoverTimeWidth, 20);
       context.fillStyle = '#dce2dc'; context.fillText(hoverTime, hoverTimeX + hoverTimeWidth / 2, height - padding.bottom + 12);
     }
   }
