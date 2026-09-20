@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/petoshi/qday-swap/internal/app"
 	"github.com/petoshi/qday-swap/internal/relay"
@@ -61,7 +62,8 @@ func (fakeApplication) Negotiations() (app.Negotiations, error) {
 
 func TestBootstrapSessionHostAndOriginProtection(t *testing.T) {
 	const host = "127.0.0.1:42424"
-	server, err := New(fakeApplication{}, host)
+	shutdown := make(chan struct{}, 1)
+	server, err := New(fakeApplication{}, host, func() { shutdown <- struct{}{} })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,5 +126,21 @@ func TestBootstrapSessionHostAndOriginProtection(t *testing.T) {
 	server.ServeHTTP(response, wrongHost)
 	if response.Code != http.StatusMisdirectedRequest {
 		t.Fatalf("wrong-host status = %d", response.Code)
+	}
+
+	shutdownRequest := httptest.NewRequest(http.MethodPost, "http://"+host+"/api/v1/shutdown", strings.NewReader(`{}`))
+	shutdownRequest.Host = host
+	shutdownRequest.Header.Set("Content-Type", "application/json")
+	shutdownRequest.Header.Set("Origin", "http://"+host)
+	shutdownRequest.AddCookie(cookie)
+	response = httptest.NewRecorder()
+	server.ServeHTTP(response, shutdownRequest)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"status":"shutting down"`) {
+		t.Fatalf("shutdown status=%d body=%q", response.Code, response.Body.String())
+	}
+	select {
+	case <-shutdown:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown callback was not called")
 	}
 }

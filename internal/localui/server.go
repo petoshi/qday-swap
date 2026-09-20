@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/petoshi/qday-swap/internal/app"
 	"github.com/petoshi/qday-swap/internal/relay"
@@ -53,17 +54,21 @@ type Application interface {
 }
 
 type Server struct {
-	application Application
-	host        string
-	origin      string
-	bootstrap   string
-	session     string
-	static      http.Handler
+	application  Application
+	shutdown     func()
+	shutdownOnce sync.Once
+	host         string
+	origin       string
+	bootstrap    string
+	session      string
+	static       http.Handler
 }
 
-func New(application Application, host string) (*Server, error) {
+func New(application Application, host string, shutdown func()) (*Server, error) {
 	if application == nil {
 		return nil, errors.New("local application is required")
+	} else if shutdown == nil {
+		return nil, errors.New("shutdown callback is required")
 	} else if host == "" || strings.ContainsAny(host, "/\\") {
 		return nil, errors.New("local UI host is invalid")
 	}
@@ -80,7 +85,7 @@ func New(application Application, host string) (*Server, error) {
 		return nil, err
 	}
 	return &Server{
-		application: application, host: host, origin: "http://" + host,
+		application: application, shutdown: shutdown, host: host, origin: "http://" + host,
 		bootstrap: bootstrap, session: session, static: http.FileServer(http.FS(web)),
 	}, nil
 }
@@ -192,6 +197,13 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, s.application.State(r.Context()))
+	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/shutdown":
+		var request struct{}
+		if !decode(w, r, &request) {
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "shutting down"})
+		go s.shutdownOnce.Do(s.shutdown)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/recovery":
 		var request struct{}
 		if !decode(w, r, &request) {

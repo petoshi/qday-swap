@@ -6,6 +6,7 @@ const headerBitcoin = document.querySelector('#header-bitcoin');
 const headerSwaps = document.querySelector('#header-swaps');
 const headerBitcoinUSD = document.querySelector('#header-btc-usd');
 const headerQDAYUSD = document.querySelector('#header-qday-usd');
+const exitButton = document.querySelector('#exit-app');
 const modalBackdrop = document.querySelector('#modal-backdrop');
 const modal = document.querySelector('#modal');
 const toast = document.querySelector('#toast');
@@ -27,6 +28,7 @@ let pendingOffer = null;
 let selectedOrderID = '';
 let chartRange = 'ALL';
 let destroyChart = () => {};
+let applicationStopped = false;
 
 const escapeHTML = value => String(value ?? '').replace(/[&<>'"]/g, character => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
@@ -163,6 +165,7 @@ function refreshQDAYDollarPrice() {
 }
 
 async function refreshPriceLoop() {
+  if (applicationStopped) return;
   try {
     const result = await api('/api/v1/price');
     const numeric = Number(result.usd);
@@ -176,7 +179,7 @@ async function refreshPriceLoop() {
   } catch (_) {
     if (!bitcoinUSD) headerBitcoinUSD.textContent = '—';
   }
-  setTimeout(refreshPriceLoop, 20000);
+  if (!applicationStopped) setTimeout(refreshPriceLoop, 20000);
 }
 
 function short(value, left = 8, right = 6) {
@@ -211,7 +214,7 @@ function updateChrome() {
     nodePill.classList.add('waiting');
     label.textContent = state.bitcoin ? `BTC SYNC ${commas(state.bitcoin.walletHeight)} / ${commas(state.bitcoin.headerHeight)}` : 'BTC STARTING';
   } else {
-    label.textContent = `${state.qday.connections} QDAY · ${state.bitcoin.peers} BTC`;
+    label.textContent = `PEERS: ${state.qday.connections} QDAY · ${state.bitcoin.peers} BTC`;
   }
 }
 
@@ -939,6 +942,7 @@ function render() {
 }
 
 async function refreshState() {
+  if (applicationStopped) return;
   try {
     state = await api('/api/v1/state');
     marketError = '';
@@ -961,6 +965,25 @@ async function refreshState() {
   }
 }
 
+function showStopped() {
+  applicationStopped = true;
+  clearTimeout(refreshTimer);
+  destroyChart();
+  destroyChart = () => {};
+  closeModal();
+  nav.hidden = true;
+  nodePill.classList.remove('waiting', 'error');
+  nodePill.classList.add('error');
+  nodePill.querySelector('span').textContent = 'STOPPED';
+  exitButton.disabled = true;
+  exitButton.querySelector('span').textContent = 'QDAY SWAP STOPPED';
+  root.innerHTML = `<section class="gate"><div class="gate-card">
+    <div class="gate-head"><span class="eyebrow">LOCAL SERVICES STOPPED</span><h1>OFFLINE.</h1><p>QDAY Swap, its QDAY node and Bitcoin light client have shut down cleanly.</p></div>
+    <div class="gate-body"><p class="stopped-note">You can close this tab. Run QDAY Swap again when you want to trade.</p></div>
+  </div></section>`;
+  window.scrollTo({top: 0, behavior: 'instant'});
+}
+
 function recoveryModal(phrase, firstRun = false) {
   const words = phrase.trim().split(/\s+/);
   openModal(`<div class="modal-head"><span class="eyebrow">${firstRun ? 'WALLET CREATED' : 'RECOVERY'}</span><h2>SAVE ALL 24 WORDS.</h2></div><div class="modal-body"><p>Write them down in order and keep them offline. They restore QDAY, Bitcoin and the swap identity. The password cannot replace them.</p><div class="phrase">${words.map(word => `<span>${escapeHTML(word)}</span>`).join('')}</div><div class="modal-actions"><button class="secondary" id="copy-phrase">COPY</button><button class="primary" id="saved-phrase">I SAVED ALL 24 WORDS</button></div></div>`);
@@ -972,6 +995,20 @@ function recoveryModal(phrase, firstRun = false) {
 }
 
 document.addEventListener('click', async event => {
+  if (event.target.closest('#exit-app')) {
+    if (applicationStopped || exitButton.disabled) return;
+    exitButton.disabled = true;
+    exitButton.querySelector('span').textContent = 'STOPPING…';
+    try {
+      await post('/api/v1/shutdown');
+      showStopped();
+    } catch (error) {
+      exitButton.disabled = false;
+      exitButton.querySelector('span').textContent = 'EXIT QDAY SWAP';
+      showToast(error.message);
+    }
+    return;
+  }
   if (event.target.closest('#close-modal')) {
     closeModal();
     return;

@@ -36,10 +36,15 @@ button { color: inherit; }
 .header-stats > span { display: flex; min-width: 105px; align-items: center; justify-content: space-between; gap: 12px; padding: 0 13px; border-right: 1px solid var(--line); color: var(--muted); font-size: 8px; letter-spacing: .07em; }
 .header-stats > span:last-child { border-right: 0; }
 .header-stats b { color: var(--text); font-size: 10px; }
-.node-pill { display: flex; align-items: center; gap: 8px; margin-left: auto; color: var(--green); font-size: 9px; letter-spacing: .06em; }
+.runtime-actions { display: flex; align-items: center; gap: 14px; margin-left: auto; }
+.node-pill { display: flex; align-items: center; gap: 8px; color: var(--green); font-size: 9px; letter-spacing: .06em; white-space: nowrap; }
 .node-pill i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; box-shadow: 0 0 9px currentColor; }
 .node-pill.waiting { color: var(--amber); }
 .node-pill.error { color: var(--red); }
+.exit-button { display: inline-flex; min-height: 34px; align-items: center; gap: 7px; padding: 0 11px; border: 1px solid var(--line-bright); border-radius: 0; background: transparent; color: #aeb6af; font-size: 9px; letter-spacing: .05em; white-space: nowrap; cursor: pointer; }
+.exit-button:hover:not(:disabled) { border-color: var(--red); color: var(--red); background: #110706; }
+.exit-button:disabled { cursor: default; opacity: .55; }
+.exit-button svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; }
 .header-tools { min-height: 46px; }
 #main-nav { display: flex; align-items: center; gap: 5px; }
 #main-nav[hidden] { display: none; }
@@ -83,6 +88,7 @@ main { width: min(100%,1540px); min-height: calc(100vh - 210px); margin: 0 auto;
 .danger { border: 1px solid #65312d; color: var(--red); }
 .text-button { min-height: 28px; padding: 0; border: 0; color: var(--green-dim); }
 .gate .primary { width: 100%; margin-top: 22px; }
+.stopped-note { margin: 0; color: var(--muted); }
 .form-error { margin: 12px 0 0; color: var(--red); font-size: 10px; }
 .form-error.dark { color: var(--red); }
 
@@ -339,7 +345,7 @@ footer { display: flex; min-height: 90px; align-items: center; gap: 20px; paddin
 @media (max-width: 760px) {
   .header-line { padding-right: 16px; padding-left: 16px; }
   .brand { margin-right: auto; }
-  .node-pill { margin-left: 0; }
+  .runtime-actions { order: 2; width: 100%; justify-content: space-between; margin-left: 0; }
   .header-tools { align-items: flex-start; flex-direction: column; }
   #main-nav { width: 100%; overflow-x: auto; }
   #main-nav a { flex: 0 0 auto; }

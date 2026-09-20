@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"syscall"
 	"time"
@@ -43,6 +44,24 @@ func run(arguments []string) error {
 		fmt.Println("qday-swap", version)
 		return nil
 	}
+	absoluteDataDir, err := filepath.Abs(*dataDir)
+	if err != nil {
+		return err
+	}
+	*dataDir = absoluteDataDir
+	instance, err := acquireInstance(*dataDir)
+	if err != nil {
+		var running *alreadyRunningError
+		if errors.As(err, &running) {
+			fmt.Println("QDAY Swap is already running at:", running.URL)
+			if *noOpen {
+				return nil
+			}
+			return openBrowser(running.URL)
+		}
+		return err
+	}
+	defer instance.Close()
 
 	listener, err := loopbackListener(*listen)
 	if err != nil {
@@ -59,7 +78,7 @@ func run(arguments []string) error {
 		return err
 	}
 	defer application.Close()
-	interfaceServer, err := localui.New(application, listener.Addr().String())
+	interfaceServer, err := localui.New(application, listener.Addr().String(), stop)
 	if err != nil {
 		return err
 	}
@@ -71,6 +90,9 @@ func run(arguments []string) error {
 	serverErrors := make(chan error, 1)
 	go func() { serverErrors <- server.Serve(listener) }()
 	openURL := interfaceServer.OpenURL()
+	if err := instance.Publish(openURL); err != nil {
+		return err
+	}
 	fmt.Println("QDAY Swap local interface:", openURL)
 	if !*noOpen {
 		if err := openBrowser(openURL); err != nil {
