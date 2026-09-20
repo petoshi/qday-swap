@@ -299,3 +299,75 @@ footer { display: flex; min-height: 90px; align-items: center; gap: 20px; paddin
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
+
+/* Public market view: matched activity only. Open offers stay in the local app. */
+.market-header { padding: 34px 0 28px; border-bottom: 1px solid var(--line-bright); }
+.market-header h1 { margin: 0; color: var(--text); font-size: clamp(30px, 4vw, 52px); line-height: 1; letter-spacing: -.05em; }
+.market-header h1::before { color: var(--green); content: "> "; }
+.market-header p { max-width: 760px; margin: 14px 0 0; color: var(--muted); font-size: 12px; }
+.market-layout { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; margin-top: 24px; }
+.market-panel { min-width: 0; border: 1px solid var(--line); background: var(--panel); }
+.panel-head { display: flex; min-height: 58px; align-items: center; justify-content: space-between; gap: 15px; padding: 10px 15px; border-bottom: 1px solid var(--line); }
+.panel-head span, .panel-head small { display: block; color: #59625a; font-size: 9px; letter-spacing: .09em; }
+.panel-head strong { display: block; margin-top: 2px; color: #dce2dc; font-size: 12px; }
+.chart-summary { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); border-bottom: 1px solid var(--line); }
+.chart-summary > div { min-width: 0; min-height: 54px; padding: 10px 14px; border-right: 1px solid #151a16; }
+.chart-summary > div:last-child { border-right: 0; }
+.chart-summary span, .chart-summary strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chart-summary span { color: #59625a; font-size: 8px; letter-spacing: .09em; }
+.chart-summary strong { margin-top: 5px; color: #cdd4ce; font-size: 11px; font-variant-numeric: tabular-nums; }
+.chart-summary strong.up { color: var(--green); }
+.chart-summary strong.down { color: #ff896d; }
+.chart-wrap { position: relative; height: clamp(390px, 44vw, 570px); overflow: hidden; background: #030503; }
+#price-chart { display: block; width: 100%; height: 100%; touch-action: pan-y; }
+.chart-empty { position: absolute; inset: 0; display: grid; place-items: center; color: #555e56; font-size: 11px; }
+.chart-empty[hidden] { display: none; }
+.chart-tooltip { position: absolute; z-index: 2; top: 10px; left: 10px; width: 205px; padding: 10px 11px; border: 1px solid var(--line-bright); background: rgba(3,5,3,.96); pointer-events: none; }
+.chart-tooltip strong, .chart-tooltip span, .chart-tooltip time { display: block; }
+.chart-tooltip strong { color: var(--green); font-size: 12px; }
+.chart-tooltip span, .chart-tooltip time { margin-top: 3px; color: var(--muted); font-size: 9px; }
+.chart-controls { display: flex; align-items: center; gap: 10px; }
+.chart-scale { color: #3f4c42; font-size: 8px; letter-spacing: .09em; white-space: nowrap; }
+.chart-scale::before { display: inline-block; width: 5px; height: 5px; margin-right: 6px; border-radius: 50%; background: var(--green); box-shadow: 0 0 7px rgba(125,255,155,.55); content: ""; vertical-align: 1px; }
+.chart-ranges { display: flex; gap: 3px; }
+.chart-ranges button { min-width: 38px; padding: 5px 7px; border: 1px solid transparent; background: transparent; color: var(--muted); font-size: 9px; cursor: pointer; }
+.chart-ranges button:hover, .chart-ranges button.active { border-color: var(--line-bright); color: var(--green); background: #071108; }
+.activity-scroll { width: 100%; overflow-x: auto; }
+.activity-table { width: 100%; min-width: 760px; border-collapse: collapse; font-size: 11px; }
+.activity-table th { height: 38px; padding: 0 15px; border-bottom: 1px solid var(--line); color: #555f57; font-size: 8px; font-weight: 500; text-align: left; letter-spacing: .09em; }
+.activity-table td { height: 55px; padding: 9px 15px; border-bottom: 1px solid #171b17; color: #b9c0ba; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.activity-table tbody tr:last-child td { border-bottom: 0; }
+.activity-table td span:not(.side) { color: #687169; font-size: 9px; }
+.activity-table .market-price { color: var(--green); }
+.activity-time { color: var(--muted) !important; }
+.market-empty { height: 150px !important; color: #555e56 !important; text-align: center; }
+.market-empty::before { color: var(--green-dim); content: "$ "; }
+.market-disclosure { margin: 14px 0 0; color: #515a52; font-size: 9px; }
+
+@media (max-width: 700px) {
+  .market-header { padding-top: 18px; }
+  .market-header h1 { font-size: clamp(28px, 10vw, 40px); }
+  .panel-head { align-items: flex-start; flex-direction: column; }
+  .chart-controls { width: 100%; justify-content: space-between; }
+  .chart-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .chart-summary > div { border-bottom: 1px solid #151a16; }
+  .chart-summary > div:nth-child(2n) { border-right: 0; }
+  .chart-summary > div:last-child { grid-column: 1 / -1; border-bottom: 0; }
+  .chart-wrap { height: 410px; }
+  .activity-table { min-width: 0; }
+  .activity-table thead { display: none; }
+  .activity-table, .activity-table tbody { display: block; }
+  .activity-table tr { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 16px; padding: 14px; border-bottom: 1px solid var(--line); }
+  .activity-table td { display: block; height: auto; padding: 0; border: 0; white-space: normal; }
+  .activity-table td::before { display: block; margin-bottom: 3px; color: #4f5850; content: attr(data-label); font-size: 7px; letter-spacing: .07em; }
+  .activity-table .numeric { text-align: left !important; }
+  .activity-table .activity-time { text-align: right; }
+  .activity-table .market-empty { grid-column: 1 / -1; padding: 55px 0; }
+  .activity-table .market-empty::before { display: inline; margin: 0; content: "$ "; font-size: inherit; }
+}
+
+@media (max-width: 460px) {
+  .header-stats > span:nth-child(3) { display: none; }
+  .chart-wrap { height: 360px; }
+  .chart-scale { display: none; }
+}

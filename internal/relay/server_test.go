@@ -144,7 +144,7 @@ func TestWebRoutesAndSecurityHeaders(t *testing.T) {
 	if err != nil || health.StatusCode != http.StatusOK || string(healthBody) != "ok\n" {
 		t.Fatalf("health status=%d body=%q err=%v", health.StatusCode, healthBody, err)
 	}
-	for _, route := range []string{"/", "/orders", "/activity", "/protocol", "/order/example"} {
+	for _, route := range []string{"/", "/market", "/orders", "/activity", "/protocol", "/order/example"} {
 		response, err := server.Client().Get(server.URL + route)
 		if err != nil {
 			t.Fatal(err)
@@ -153,7 +153,7 @@ func TestWebRoutesAndSecurityHeaders(t *testing.T) {
 		response.Body.Close()
 		if err != nil {
 			t.Fatal(err)
-		} else if response.StatusCode != http.StatusOK || !bytes.Contains(body, []byte("QDAY Order Explorer")) {
+		} else if response.StatusCode != http.StatusOK || !bytes.Contains(body, []byte("<title>QDAY Swap</title>")) {
 			t.Fatalf("route %s status=%d", route, response.StatusCode)
 		} else if response.Header.Get("Content-Security-Policy") == "" || response.Header.Get("X-Content-Type-Options") != "nosniff" {
 			t.Fatalf("route %s missing security headers", route)
@@ -163,8 +163,8 @@ func TestWebRoutesAndSecurityHeaders(t *testing.T) {
 		path         string
 		cacheControl string
 	}{
-		{"/app.js?v=9", "no-cache"},
-		{"/styles.css?v=9", "no-cache"},
+		{"/app.js?v=11", "no-cache"},
+		{"/styles.css?v=11", "no-cache"},
 		{"/assets/protocol-art.webp", "public, max-age=86400"},
 		{"/assets/protocol-slogan.webp", "public, max-age=86400"},
 	} {
@@ -176,6 +176,21 @@ func TestWebRoutesAndSecurityHeaders(t *testing.T) {
 		if response.StatusCode != http.StatusOK || response.Header.Get("Cache-Control") != asset.cacheControl {
 			t.Fatalf("asset %s status=%d cache-control=%q", asset.path, response.StatusCode, response.Header.Get("Cache-Control"))
 		}
+	}
+	appResponse, err := server.Client().Get(server.URL + "/app.js?v=11")
+	if err != nil {
+		t.Fatal(err)
+	}
+	appBody, err := io.ReadAll(appResponse.Body)
+	appResponse.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(appBody, []byte("/api/v1/orders")) || bytes.Contains(appBody, []byte("ORDER EXPLORER")) {
+		t.Fatal("public market frontend must not expose the open-order feed")
+	}
+	if !bytes.Contains(appBody, []byte("/api/v1/trades?limit=2000")) {
+		t.Fatal("public market frontend must load matched market activity")
 	}
 	response, err := server.Client().Get(server.URL + "/api/nope")
 	if err != nil {

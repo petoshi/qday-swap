@@ -108,7 +108,8 @@ terms. The relay cannot change an amount, address, key, hash or timeout.
 
 - stores signed, short-lived offers and signed cancellations
 - exposes a small versioned API to installed applications
-- serves a public read-only order explorer at `dex.pqday.com`
+- serves protocol information and aggregate matched-market activity at
+  `dex.pqday.com`; open offers are shown only in the installed application
 - relays signed acceptance, atomic maker selection and end-to-end encrypted
   negotiation messages between local applications
 - stores no wallet seed or signing key
@@ -116,13 +117,14 @@ terms. The relay cannot change an amount, address, key, hash or timeout.
 - may delay, hide or delete messages, so clients always retain unilateral refund
   paths
 
-### Order book
+### Order book and public market data
 
-The installed application and `dex.pqday.com` read the same signed relay order
-book. The website is an explorer: it can inspect terms and open a selected order
-in the local application. It never asks for a seed and never runs a swap inside
-a browser tab. A later mesh can distribute the same signed records between
-several relays and installed applications.
+The installed application reads the signed relay order book and is the only UI
+that lists or accepts open offers. `dex.pqday.com` publishes protocol information,
+aggregate statistics, matched-price history and recent matched activity. It never
+asks for a seed and never runs a swap inside a browser tab. A later mesh can
+distribute the same signed records between several relays and installed
+applications.
 
 ## Safety policy
 
@@ -163,7 +165,7 @@ several relays and installed applications.
 4. Exercise real QDAY and Bitcoin-family contracts across claims, refunds,
    restarts, stalled transactions, concurrent swaps and reorganizations.
    Complete in automated regtest coverage for QDAY/BTC and QDAY/LTC.
-5. Add the single public signed-order relay and web order explorer. Complete.
+5. Add the single public signed-order relay and protocol/market website. Complete.
 6. Add signed acceptance and the encrypted durable relay mailbox. Complete.
 7. Connect the local UI to the persistent swap state machine, automatic maker
    matching and one-click recovery. Complete.

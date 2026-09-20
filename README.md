@@ -77,7 +77,7 @@ See [the product plan](docs/PRODUCT.md) and [chain adapter plan](docs/CHAINS.md)
 
 ## DEX relay development server
 
-The relay API and embedded order explorer can be started locally with:
+The relay API and embedded protocol/market site can be started locally with:
 
 ```sh
 go run ./cmd/qday-swap-relay \
