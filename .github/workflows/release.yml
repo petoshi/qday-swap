@@ -1,0 +1,262 @@
+name: release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+env:
+  WALLETD_VERSION: v0.2.1
+
+jobs:
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: petoshi/qday-walletd
+          ref: ${{ env.WALLETD_VERSION }}
+          path: walletd
+          submodules: recursive
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.26.x'
+      - name: Build complete Linux package
+        shell: bash
+        env:
+          RELEASE_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if [ "$GITHUB_REF_TYPE" != tag ]; then version=1.0.0; fi
+          package="QDAY-Swap-linux-${RELEASE_ARCH}"
+          go mod verify
+          (cd walletd && go mod verify)
+          mkdir "$package"
+          CGO_ENABLED=0 GOOS=linux GOARCH="$RELEASE_ARCH" go build -buildvcs=false -trimpath \
+            -ldflags="-s -w -X main.version=${version}" -o "$package/qday-swap" ./cmd/qday-swap
+          (cd walletd && CGO_ENABLED=1 go build -buildvcs=false -trimpath \
+            -ldflags="-s -w -X main.version=${WALLETD_VERSION#v}" -o "../$package/qday-walletd" .)
+          cp README.md LICENSE docs/INSTALL.md "$package/"
+          cp walletd/LICENSE "$package/WALLETD-LICENSE"
+          cat > "$package/start-qday-swap.sh" <<'SCRIPT'
+          #!/bin/sh
+          cd "$(dirname "$0")"
+          exec ./qday-swap "$@"
+          SCRIPT
+          chmod 0755 "$package/qday-swap" "$package/qday-walletd" "$package/start-qday-swap.sh"
+          "$package/qday-swap" -version
+          "$package/qday-walletd" version
+          tar -czf "${package}.tar.gz" "$package"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: QDAY-Swap-linux-${{ matrix.arch }}
+          path: QDAY-Swap-linux-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: petoshi/qday-walletd
+          ref: ${{ env.WALLETD_VERSION }}
+          path: walletd
+          submodules: recursive
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.26.x'
+      - name: Set up native Windows C compiler
+        id: msys2
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: mingw-w64-ucrt-x86_64-gcc
+      - name: Select native Windows C compiler
+        shell: pwsh
+        run: |
+          $compiler = '${{ steps.msys2.outputs['msys2-location'] }}\ucrt64\bin\gcc.exe'
+          if (-not (Test-Path $compiler)) { throw 'Native C compiler was not installed' }
+          "CC=$compiler" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Build complete Windows package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          if ($env:GITHUB_REF_TYPE -ne 'tag') { $version = '1.0.0' }
+          $package = 'QDAY-Swap-windows-amd64'
+          go mod verify
+          Push-Location walletd
+          go mod verify
+          Pop-Location
+          New-Item -ItemType Directory -Path $package | Out-Null
+          $env:CGO_ENABLED = '0'
+          $env:GOOS = 'windows'
+          $env:GOARCH = 'amd64'
+          go build -buildvcs=false -trimpath -ldflags "-s -w -X main.version=$version" -o "$package/qday-swap.exe" ./cmd/qday-swap
+          $env:CGO_ENABLED = '1'
+          Push-Location walletd
+          go build -buildvcs=false -trimpath -ldflags "-s -w -X main.version=0.2.1" -o "../$package/qday-walletd.exe" .
+          Pop-Location
+          Copy-Item README.md, LICENSE, docs/INSTALL.md -Destination $package
+          Copy-Item walletd/LICENSE "$package/WALLETD-LICENSE"
+          "@echo off`r`ncd /d `"%~dp0`"`r`nqday-swap.exe`r`n" | Set-Content -Encoding ascii "$package/START QDAY SWAP.bat"
+          & "$package/qday-swap.exe" -version
+          & "$package/qday-walletd.exe" version
+          Compress-Archive -Path $package -DestinationPath "$package.zip" -CompressionLevel Optimal
+      - name: Scan Windows executables and archive with Microsoft Defender
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $platform = Join-Path $env:ProgramData 'Microsoft\Windows Defender\Platform'
+          $defender = Get-ChildItem -Path $platform -Filter MpCmdRun.exe -Recurse -File -ErrorAction SilentlyContinue |
+            Sort-Object DirectoryName -Descending |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $defender) {
+            $fallback = Join-Path $env:ProgramFiles 'Windows Defender\MpCmdRun.exe'
+            if (Test-Path $fallback) { $defender = $fallback }
+          }
+          if (-not $defender) { throw 'Microsoft Defender command line scanner is unavailable' }
+          & $defender -SignatureUpdate
+          if ($LASTEXITCODE -ne 0) { throw "Microsoft Defender signature update failed: $LASTEXITCODE" }
+          & $defender -Scan -ScanType 3 -File (Resolve-Path 'QDAY-Swap-windows-amd64')
+          if ($LASTEXITCODE -ne 0) { throw "Microsoft Defender executable scan failed: $LASTEXITCODE" }
+          & $defender -Scan -ScanType 3 -File (Resolve-Path 'QDAY-Swap-windows-amd64.zip')
+          if ($LASTEXITCODE -ne 0) { throw "Microsoft Defender archive scan failed: $LASTEXITCODE" }
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: QDAY-Swap-windows-amd64
+          path: QDAY-Swap-windows-amd64.zip
+          if-no-files-found: error
+
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: petoshi/qday-walletd
+          ref: ${{ env.WALLETD_VERSION }}
+          path: walletd
+          submodules: recursive
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.26.x'
+      - name: Build universal macOS application
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if [ "$GITHUB_REF_TYPE" != tag ]; then version=1.0.0; fi
+          go mod verify
+          (cd walletd && go mod verify)
+          mkdir -p build/amd64 build/arm64 "QDAY-Swap-macos-universal/QDAY Swap.app/Contents/MacOS"
+          for arch in amd64 arm64; do
+            if [ "$arch" = amd64 ]; then apple_arch=x86_64; else apple_arch=arm64; fi
+            CGO_ENABLED=0 GOOS=darwin GOARCH="$arch" go build -buildvcs=false -trimpath \
+              -ldflags="-s -w -X main.version=${version}" -o "build/${arch}/qday-swap" ./cmd/qday-swap
+            (cd walletd && CGO_ENABLED=1 GOOS=darwin GOARCH="$arch" CC=clang \
+              CGO_CFLAGS="-arch ${apple_arch}" CGO_LDFLAGS="-arch ${apple_arch}" \
+              go build -buildvcs=false -trimpath -ldflags="-s -w -X main.version=${WALLETD_VERSION#v}" \
+              -o "../build/${arch}/qday-walletd" .)
+          done
+          app="QDAY-Swap-macos-universal/QDAY Swap.app"
+          lipo -create build/amd64/qday-swap build/arm64/qday-swap -output "$app/Contents/MacOS/qday-swap"
+          lipo -create build/amd64/qday-walletd build/arm64/qday-walletd -output "$app/Contents/MacOS/qday-walletd"
+          cat > "$app/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleDisplayName</key><string>QDAY Swap</string>
+            <key>CFBundleExecutable</key><string>qday-swap</string>
+            <key>CFBundleIdentifier</key><string>com.pqday.swap</string>
+            <key>CFBundleName</key><string>QDAY Swap</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${version}</string>
+            <key>CFBundleVersion</key><string>${version}</string>
+            <key>LSMinimumSystemVersion</key><string>12.0</string>
+          </dict></plist>
+          PLIST
+          chmod 0755 "$app/Contents/MacOS/qday-swap" "$app/Contents/MacOS/qday-walletd"
+          cp README.md LICENSE docs/INSTALL.md QDAY-Swap-macos-universal/
+          cp walletd/LICENSE QDAY-Swap-macos-universal/WALLETD-LICENSE
+          lipo -info "$app/Contents/MacOS/qday-swap"
+          lipo -info "$app/Contents/MacOS/qday-walletd"
+          "$app/Contents/MacOS/qday-swap" -version
+          "$app/Contents/MacOS/qday-walletd" version
+          ditto -c -k --sequesterRsrc --keepParent QDAY-Swap-macos-universal QDAY-Swap-macos-universal.zip
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: QDAY-Swap-macos-universal
+          path: QDAY-Swap-macos-universal.zip
+          if-no-files-found: error
+
+  scan:
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: QDAY-Swap-*
+          path: artifacts
+          merge-multiple: true
+      - name: Scan every release archive with ClamAV
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends clamav clamav-freshclam
+          sudo systemctl stop clamav-freshclam.service 2>/dev/null || true
+          updated=false
+          for attempt in 1 2 3; do
+            if sudo freshclam --stdout; then updated=true; break; fi
+            sleep 10
+          done
+          if [ "$updated" != true ] && ! find /var/lib/clamav -maxdepth 1 -type f \( -name '*.cvd' -o -name '*.cld' \) -print -quit | grep -q .; then
+            echo 'No ClamAV signature database is available' >&2
+            exit 1
+          fi
+          clamscan --recursive --infected --scan-archive=yes artifacts
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, windows, macos, scan]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: QDAY-Swap-*
+          path: artifacts
+          merge-multiple: true
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cd artifacts
+          sha256sum QDAY-Swap-* > SHA256SUMS
+          gh release create "$RELEASE_TAG" QDAY-Swap-* SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --notes-from-tag \
+            --title "QDAY Swap ${RELEASE_TAG}: HYBRID POST QUANTUM ATOMIC SWAPS"

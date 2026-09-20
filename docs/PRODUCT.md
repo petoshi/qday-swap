@@ -143,9 +143,10 @@ several relays and installed applications.
 9. Add peer-to-peer order discovery when real usage justifies it.
 10. Add EVM and XRP adapters, then DOGE, LTC and BCH markets.
 
-No public release is ready until a fresh install can complete and refund a
-trade without a command line, a foreign full-chain download or a manual API
-call.
+The v1.0.0 application provides the complete browser flow without a foreign
+full-chain download or manual API call. Initial mainnet use remains deliberately
+low value while independent machines exercise the public relay and recovery
+paths.
 
 ## BasicSwap
 

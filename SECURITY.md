@@ -8,4 +8,5 @@ impact when possible. Reports involving seed handling, signatures, amount
 validation, swap timeouts, chain reorganizations or remote code execution are
 prioritized.
 
-Only the latest commit on `main` is supported during pre-release development.
+The latest tagged release and the latest commit on `main` receive security
+fixes. Verify downloaded archives against the `SHA256SUMS` release asset.
