@@ -8,6 +8,7 @@ import (
 
 	"github.com/btcsuite/btcd/chaincfg/v2"
 	"github.com/btcsuite/btcwallet/wallet"
+	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/petoshi/qday-swap/internal/walletroot"
 )
 
@@ -49,6 +50,46 @@ func TestInitializeCreatesRecoverableEncryptedBitcoinWallet(t *testing.T) {
 	}
 	if err := manager.Initialize(context.Background(), root, "correct horse battery staple", birthday); err == nil {
 		t.Fatal("initialized an existing Bitcoin wallet twice")
+	}
+}
+
+func TestFullHistoryInitializePersistsRecoveryOrigin(t *testing.T) {
+	root, err := walletroot.ParsePhrase(testPhrase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := filepath.Join(t.TempDir(), "bitcoin")
+	manager, err := NewManager(Config{DataDir: directory, Network: "mainnet"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Initialize(context.Background(), root, "correct horse battery staple", time.Unix(0, 0)); err != nil {
+		t.Fatal(err)
+	}
+	loader := wallet.NewLoader(&chaincfg.MainNetParams, filepath.Join(directory, "wallet"), false, wallet.DefaultDBTimeout, recoveryWindow)
+	loaded, err := loader.OpenExistingWallet([]byte(wallet.InsecurePubPassphrase), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = walletdb.View(loaded.Database(), func(tx walletdb.ReadTx) error {
+		namespace := tx.ReadBucket([]byte("waddrmgr"))
+		stamp, verified, err := loaded.Manager.BirthdayBlock(namespace)
+		if err != nil {
+			return err
+		}
+		if !verified {
+			t.Fatal("full-history recovery origin is not verified")
+		}
+		if stamp.Height != 0 || stamp.Hash != *chaincfg.MainNetParams.GenesisHash {
+			t.Fatalf("recovery origin = %d %v, want mainnet genesis", stamp.Height, stamp.Hash)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := loader.UnloadWallet(); err != nil {
+		t.Fatal(err)
 	}
 }
 

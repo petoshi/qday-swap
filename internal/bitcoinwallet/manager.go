@@ -161,6 +161,7 @@ func (m *Manager) Initialize(_ context.Context, root walletroot.Root, password s
 	if len(password) < 12 {
 		return errors.New("Bitcoin wallet password must contain at least 12 bytes")
 	}
+	fullHistory := birthday.IsZero()
 	if birthday.IsZero() {
 		birthday = m.params.GenesisBlock.Header.Timestamp
 	}
@@ -168,6 +169,7 @@ func (m *Manager) Initialize(_ context.Context, root walletroot.Root, password s
 	// lands on genesis instead of before the network existed.
 	minimumBirthday := m.params.GenesisBlock.Header.Timestamp.Add(48 * time.Hour)
 	if birthday.Before(minimumBirthday) {
+		fullHistory = true
 		birthday = minimumBirthday
 	}
 	walletDir := filepath.Join(m.config.DataDir, "wallet")
@@ -183,11 +185,36 @@ func (m *Manager) Initialize(_ context.Context, root walletroot.Root, password s
 		return err
 	}
 	privatePass := []byte(password)
-	_, err = loader.CreateNewWallet([]byte(wallet.InsecurePubPassphrase), privatePass, seed[:], birthday)
+	loaded, err := loader.CreateNewWallet([]byte(wallet.InsecurePubPassphrase), privatePass, seed[:], birthday)
 	clear(seed[:])
 	clear(privatePass)
 	if err != nil {
 		return fmt.Errorf("create Bitcoin wallet: %w", err)
+	}
+	if fullHistory {
+		// btcwallet retries a failed initial recovery with the birthday block
+		// value captured before the first attempt. If it was nil, every
+		// transient compact-filter error resets recovery to genesis. Persist a
+		// verified genesis stamp before synchronization so retries continue
+		// from the last committed height instead.
+		genesis := waddrmgr.BlockStamp{
+			Hash:      *m.params.GenesisHash,
+			Height:    0,
+			Timestamp: m.params.GenesisBlock.Header.Timestamp,
+		}
+		if err := walletdb.Update(loaded.Database(), func(tx walletdb.ReadWriteTx) error {
+			namespace := tx.ReadWriteBucket([]byte("waddrmgr"))
+			if namespace == nil {
+				return errors.New("Bitcoin address manager namespace is missing")
+			}
+			if err := loaded.Manager.SetBirthdayBlock(namespace, genesis, true); err != nil {
+				return err
+			}
+			return loaded.Manager.SetSyncedTo(namespace, &genesis)
+		}); err != nil {
+			_ = loader.UnloadWallet()
+			return fmt.Errorf("set Bitcoin recovery origin: %w", err)
+		}
 	}
 	if err := loader.UnloadWallet(); err != nil {
 		return fmt.Errorf("close new Bitcoin wallet: %w", err)
@@ -217,7 +244,9 @@ func (m *Manager) Start(ctx context.Context) (*Client, error) {
 		DataDir: lightDir, Database: lightDB, ChainParams: *m.params,
 		ConnectPeers: m.config.ConnectPeers, AddPeers: m.config.AddPeers,
 		FilterCacheSize: filterCache, BlockCacheSize: blockCache,
-		PersistToDisk: true, BroadcastTimeout: 30 * time.Second,
+		// Compact filters are disposable scan data. Persisting every fetched
+		// filter makes a full recovery cache grow by multiple gigabytes.
+		PersistToDisk: false, BroadcastTimeout: 30 * time.Second,
 	})
 	if err != nil {
 		_ = lightDB.Close()
