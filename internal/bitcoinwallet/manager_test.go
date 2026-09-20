@@ -55,6 +55,9 @@ func TestInitializeCreatesRecoverableEncryptedBitcoinWallet(t *testing.T) {
 }
 
 func TestFullHistoryInitializePersistsRecoveryOrigin(t *testing.T) {
+	if got := mainnetSwapRecoveryOrigin.Height + 1; got != mainnetSwapBitcoinLaunchHeight {
+		t.Fatalf("first scanned block = %d, want %d", got, mainnetSwapBitcoinLaunchHeight)
+	}
 	root, err := walletroot.ParsePhrase(testPhrase)
 	if err != nil {
 		t.Fatal(err)
@@ -81,11 +84,11 @@ func TestFullHistoryInitializePersistsRecoveryOrigin(t *testing.T) {
 		if !verified {
 			t.Fatal("full-history recovery origin is not verified")
 		}
-		if stamp.Height != mainnetNativeSegWitOrigin.Height ||
-			stamp.Hash != mainnetNativeSegWitOrigin.Hash ||
-			!stamp.Timestamp.Equal(mainnetNativeSegWitOrigin.Timestamp) {
+		if stamp.Height != mainnetSwapRecoveryOrigin.Height ||
+			stamp.Hash != mainnetSwapRecoveryOrigin.Hash ||
+			!stamp.Timestamp.Equal(mainnetSwapRecoveryOrigin.Timestamp) {
 
-			t.Fatalf("recovery origin = %v, want %v", stamp, mainnetNativeSegWitOrigin)
+			t.Fatalf("recovery origin = %v, want %v", stamp, mainnetSwapRecoveryOrigin)
 		}
 		return nil
 	})
@@ -97,7 +100,7 @@ func TestFullHistoryInitializePersistsRecoveryOrigin(t *testing.T) {
 	}
 }
 
-func TestMigrateLegacyFullHistoryToNativeSegWitOrigin(t *testing.T) {
+func TestMigrateLegacyFullHistoryToSwapRecoveryOrigin(t *testing.T) {
 	root, err := walletroot.ParsePhrase(testPhrase)
 	if err != nil {
 		t.Fatal(err)
@@ -136,11 +139,11 @@ func TestMigrateLegacyFullHistoryToNativeSegWitOrigin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.migrateNativeSegWitRecovery(loaded); err != nil {
+	if err := manager.migrateMainnetRecoveryOrigin(loaded); err != nil {
 		t.Fatal(err)
 	}
-	if got := loaded.SyncedTo(); got.Height != mainnetNativeSegWitOrigin.Height || got.Hash != mainnetNativeSegWitOrigin.Hash {
-		t.Fatalf("synced to = %v, want %v", got, mainnetNativeSegWitOrigin)
+	if got := loaded.SyncedTo(); got.Height != mainnetSwapRecoveryOrigin.Height || got.Hash != mainnetSwapRecoveryOrigin.Hash {
+		t.Fatalf("synced to = %v, want %v", got, mainnetSwapRecoveryOrigin)
 	}
 	if err := loader.UnloadWallet(); err != nil {
 		t.Fatal(err)

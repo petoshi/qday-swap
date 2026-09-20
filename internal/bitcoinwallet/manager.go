@@ -26,18 +26,23 @@ import (
 )
 
 const (
-	recoveryWindow = 250
-	filterCache    = 32 << 20
-	blockCache     = 32 << 20
-	peerQuorum     = 3
-	peerLagLimit   = int32(144)
-	peerCheckEvery = 5 * time.Second
+	recoveryWindow                 = 250
+	filterCache                    = 32 << 20
+	blockCache                     = 32 << 20
+	peerQuorum                     = 3
+	peerLagLimit                   = int32(144)
+	peerCheckEvery                 = 5 * time.Second
+	mainnetSwapBitcoinLaunchHeight = int32(967_809)
 )
 
-var mainnetNativeSegWitOrigin = waddrmgr.BlockStamp{
-	Height:    481_823,
-	Hash:      mustHash("000000000000000000cbeff0b533f8e1189cf09dfbebf57a8ebe349362811b80"),
-	Timestamp: time.Unix(1_503_539_571, 0).UTC(),
+// mainnetSwapRecoveryOrigin is the block immediately before QDAY Swap's
+// Bitcoin launch boundary. Imported swap seeds scan from block 967,809.
+// QDAY Swap uses an isolated BIP84 branch and does not import external Bitcoin
+// wallet seeds, so older Bitcoin history is outside the application's scope.
+var mainnetSwapRecoveryOrigin = waddrmgr.BlockStamp{
+	Height:    mainnetSwapBitcoinLaunchHeight - 1,
+	Hash:      mustHash("000000000000000000011b47a03fcb98b12160bc688120ec65741c7d05e2b58a"),
+	Timestamp: time.Unix(1_789_888_065, 0).UTC(),
 }
 
 type Config struct {
@@ -181,9 +186,7 @@ func (m *Manager) Initialize(_ context.Context, root walletroot.Root, password s
 		birthday = origin.Timestamp
 	}
 	// btcwallet stores a 48-hour safety margin. Clamp imports so that margin
-	// lands on the first relevant block instead of before it. This wallet only
-	// derives BIP84 Native SegWit addresses, so mainnet history before SegWit
-	// activation cannot contain a standard payment to one of its addresses.
+	// lands on the configured QDAY Swap recovery boundary instead of before it.
 	minimumBirthday := origin.Timestamp.Add(48 * time.Hour)
 	if birthday.Before(minimumBirthday) {
 		fullHistory = true
@@ -279,7 +282,7 @@ func (m *Manager) Start(ctx context.Context) (*Client, error) {
 		_ = lightDB.Close()
 		return nil, fmt.Errorf("open Bitcoin wallet: %w", err)
 	}
-	if err := m.migrateNativeSegWitRecovery(loaded); err != nil {
+	if err := m.migrateMainnetRecoveryOrigin(loaded); err != nil {
 		_ = loader.UnloadWallet()
 		lightClient.Stop()
 		lightClient.WaitForShutdown()
@@ -302,7 +305,7 @@ func (m *Manager) Start(ctx context.Context) (*Client, error) {
 
 func (m *Manager) recoveryOrigin() waddrmgr.BlockStamp {
 	if m.config.Network == "mainnet" {
-		return mainnetNativeSegWitOrigin
+		return mainnetSwapRecoveryOrigin
 	}
 	return waddrmgr.BlockStamp{
 		Hash:      *m.params.GenesisHash,
@@ -311,14 +314,14 @@ func (m *Manager) recoveryOrigin() waddrmgr.BlockStamp {
 	}
 }
 
-func (m *Manager) migrateNativeSegWitRecovery(loaded *wallet.Wallet) error {
+func (m *Manager) migrateMainnetRecoveryOrigin(loaded *wallet.Wallet) error {
 	if m.config.Network != "mainnet" ||
-		loaded.Manager.Birthday().After(mainnetNativeSegWitOrigin.Timestamp) ||
-		loaded.SyncedTo().Height >= mainnetNativeSegWitOrigin.Height {
+		loaded.Manager.Birthday().After(mainnetSwapRecoveryOrigin.Timestamp) ||
+		loaded.SyncedTo().Height >= mainnetSwapRecoveryOrigin.Height {
 
 		return nil
 	}
-	origin := mainnetNativeSegWitOrigin
+	origin := mainnetSwapRecoveryOrigin
 	if err := walletdb.Update(loaded.Database(), func(tx walletdb.ReadWriteTx) error {
 		namespace := tx.ReadWriteBucket([]byte("waddrmgr"))
 		if namespace == nil {
@@ -335,7 +338,7 @@ func (m *Manager) migrateNativeSegWitRecovery(loaded *wallet.Wallet) error {
 		}
 		return loaded.Manager.SetBirthdayBlock(namespace, origin, true)
 	}); err != nil {
-		return fmt.Errorf("advance Bitcoin Native SegWit recovery origin: %w", err)
+		return fmt.Errorf("advance Bitcoin recovery origin: %w", err)
 	}
 	return nil
 }
