@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -153,6 +154,15 @@ func (n *regtestNode) mineEmpty(address string) string {
 		n.t.Fatal(err)
 	}
 	return result.Hash
+}
+
+func (n *regtestNode) receivedSatoshis(address string, confirmations int) int64 {
+	n.t.Helper()
+	var received float64
+	if err := n.call(true, &received, "getreceivedbyaddress", address, confirmations); err != nil {
+		n.t.Fatal(err)
+	}
+	return int64(math.Round(received * 100_000_000))
 }
 
 func (n *regtestNode) close() {
@@ -310,5 +320,102 @@ func TestNeutrinoSwapFundingClaimRestartAndReorg(t *testing.T) {
 	waitFor(t, 20*time.Second, "reconfirmed claim", func() bool {
 		spend, findErr := client.FindSpend(funding)
 		return findErr == nil && spend.Confirmations >= 1
+	})
+}
+
+func TestNeutrinoPaymentPartialAndMaximum(t *testing.T) {
+	node := startRegtestNode(t)
+	root, err := walletroot.ParsePhrase(testPhrase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clear(root[:])
+	manager, err := NewManager(Config{DataDir: t.TempDir(), Network: "regtest", ConnectPeers: []string{node.p2p}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Initialize(context.Background(), root, "correct horse battery staple", time.Unix(0, 0)); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client, err := manager.Start(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Stop()
+	if err := client.Unlock("correct horse battery staple"); err != nil {
+		t.Fatal(err)
+	}
+	receive, err := client.ReceiveAddress()
+	if err != nil {
+		t.Fatal(err)
+	}
+	node.mine(1, receive)
+	node.mine(101, node.miningAddress())
+	waitFor(t, 30*time.Second, "spendable payment funding", func() bool {
+		status, statusErr := client.Status()
+		balance, balanceErr := client.Balance()
+		return statusErr == nil && balanceErr == nil && status.WalletHeight >= 102 && balance.Confirmed.Satoshis == "5000000000"
+	})
+
+	partialRecipient := node.miningAddress()
+	partialQuote, err := client.QuotePayment(partialRecipient, 100_000_000, false)
+	if err != nil {
+		t.Fatal(err)
+	} else if partialQuote.Amount.Satoshis != "100000000" || partialQuote.Fee.Satoshis == "0" || partialQuote.Total.Satoshis == "" {
+		t.Fatalf("partial payment quote = %#v", partialQuote)
+	}
+	fee, err := parseSatoshis(partialQuote.Fee.Satoshis)
+	if err != nil {
+		t.Fatal(err)
+	}
+	partial, err := client.SendPayment(partialQuote.Destination, 100_000_000, fee)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 10*time.Second, "partial payment in isolated mempool", func() bool {
+		return node.receivedSatoshis(partialRecipient, 0) == 100_000_000
+	})
+	node.mine(1, node.miningAddress())
+	waitFor(t, 20*time.Second, "partial payment confirmation and wallet change", func() bool {
+		transaction, transactionErr := client.Transaction(partial.TransactionID)
+		balance, balanceErr := client.Balance()
+		return transactionErr == nil && balanceErr == nil && transaction.Confirmations >= 1 &&
+			balance.Confirmed.Satoshis != "0" && node.receivedSatoshis(partialRecipient, 1) == 100_000_000
+	})
+
+	remaining, err := client.Balance()
+	if err != nil {
+		t.Fatal(err)
+	}
+	maximumRecipient := node.miningAddress()
+	maximumQuote, err := client.QuotePayment(maximumRecipient, 0, true)
+	if err != nil {
+		t.Fatal(err)
+	} else if maximumQuote.Total.Satoshis != remaining.Confirmed.Satoshis {
+		t.Fatalf("MAX total %s does not consume confirmed balance %s", maximumQuote.Total.Satoshis, remaining.Confirmed.Satoshis)
+	}
+	maximumAmount, err := parseSatoshis(maximumQuote.Amount.Satoshis)
+	if err != nil {
+		t.Fatal(err)
+	}
+	maximumFee, err := parseSatoshis(maximumQuote.Fee.Satoshis)
+	if err != nil {
+		t.Fatal(err)
+	}
+	maximum, err := client.SendPayment(maximumQuote.Destination, maximumAmount, maximumFee)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 10*time.Second, "MAX payment in isolated mempool", func() bool {
+		return node.receivedSatoshis(maximumRecipient, 0) == maximumAmount
+	})
+	node.mine(1, node.miningAddress())
+	waitFor(t, 20*time.Second, "MAX payment confirmation and empty sender", func() bool {
+		transaction, transactionErr := client.Transaction(maximum.TransactionID)
+		balance, balanceErr := client.Balance()
+		return transactionErr == nil && balanceErr == nil && transaction.Confirmations >= 1 &&
+			balance.Confirmed.Satoshis == "0" && node.receivedSatoshis(maximumRecipient, 1) == maximumAmount
 	})
 }

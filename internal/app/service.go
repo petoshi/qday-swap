@@ -122,6 +122,7 @@ type Service struct {
 	relaySyncMu    sync.Mutex
 	negotiationMu  sync.Mutex
 	engineMu       sync.Mutex
+	withdrawalMu   sync.Mutex
 	workerCancel   context.CancelFunc
 	workerWG       sync.WaitGroup
 	lastRelaySync  time.Time
@@ -132,6 +133,7 @@ type Service struct {
 	journal        *swapstate.Journal
 	root           *walletroot.Root
 	lastError      string
+	withdrawals    map[string]withdrawalRecord
 }
 
 type State struct {
@@ -471,15 +473,6 @@ func (s *Service) Lock(ctx context.Context) error {
 		s.bitcoinClient.Lock()
 	}
 	return err
-}
-
-func (s *Service) RecoveryPhrase() (string, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.root == nil {
-		return "", errors.New("wallet is locked")
-	}
-	return s.root.Phrase()
 }
 
 func (s *Service) QDAYReceiveAddress(ctx context.Context) (walletd.Address, error) {

@@ -158,6 +158,30 @@ type Address struct {
 	CreatedAt time.Time `json:"createdAt"`
 }
 
+type WithdrawalRequest struct {
+	RequestID          string `json:"requestID"`
+	Destination        string `json:"destination"`
+	AmountAtomic       string `json:"amountAtomic"`
+	FeeAtomic          string `json:"feeAtomic,omitempty"`
+	ExpectedUnitAtomic string `json:"expectedUnitAtomic"`
+}
+
+type Withdrawal struct {
+	RequestID     string    `json:"requestID"`
+	Kind          string    `json:"kind"`
+	TransactionID string    `json:"transactionID"`
+	Destination   string    `json:"destination"`
+	Amount        Amount    `json:"amount"`
+	Fee           Amount    `json:"fee"`
+	Basis         string    `json:"basis"`
+	Status        string    `json:"status"`
+	Confirmations uint64    `json:"confirmations"`
+	BlockHeight   *uint64   `json:"blockHeight,omitempty"`
+	BlockID       string    `json:"blockID,omitempty"`
+	CreatedAt     time.Time `json:"createdAt"`
+	LastError     string    `json:"lastError,omitempty"`
+}
+
 type SwapKeys struct {
 	Classical string `json:"classical"`
 	Reserve   string `json:"reserve"`
@@ -273,6 +297,12 @@ func (c *Client) CreateAddress(ctx context.Context, reference string) (Address, 
 	err := c.request(ctx, http.MethodPost, "/v1/addresses", struct {
 		Reference string `json:"reference"`
 	}{Reference: reference}, &value, true)
+	return value, err
+}
+
+func (c *Client) CreateWithdrawal(ctx context.Context, request WithdrawalRequest) (Withdrawal, error) {
+	var value Withdrawal
+	err := c.request(ctx, http.MethodPost, "/v1/withdrawals", request, &value, true)
 	return value, err
 }
 

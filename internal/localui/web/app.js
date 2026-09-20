@@ -25,6 +25,9 @@ let lastTrade = null;
 let offerSide = 'buy';
 let offerPriceCurrency = 'USD';
 let pendingOffer = null;
+let pendingWithdrawalQuote = null;
+let withdrawalQuoteTimer;
+let withdrawalQuoteSequence = 0;
 let selectedOrderID = '';
 let chartRange = 'ALL';
 let destroyChart = () => {};
@@ -54,6 +57,9 @@ function showToast(message) {
 }
 
 function closeModal() {
+  clearTimeout(withdrawalQuoteTimer);
+  withdrawalQuoteSequence += 1;
+  pendingWithdrawalQuote = null;
   modal.textContent = '';
   modalBackdrop.classList.add('hidden');
 }
@@ -188,7 +194,8 @@ function short(value, left = 8, right = 6) {
 }
 
 function route() {
-  return (location.hash.slice(1).split('?')[0] || 'market').replace(/[^a-z]/g, '');
+  const current = (location.hash.slice(1).split('?')[0] || 'market').replace(/[^a-z]/g, '');
+  return current === 'settings' ? 'wallets' : current;
 }
 
 function updateChrome() {
@@ -898,15 +905,41 @@ function renderEmpty(title, copy, action = '') {
   root.innerHTML = `<section class="page-head"><div><span class="eyebrow">QDAY SWAP</span><h1>${escapeHTML(title)}</h1><p>${escapeHTML(copy)}</p></div>${action}</section><section class="card"><div class="empty"><strong>NOTHING HERE YET.</strong><p>Completed and recoverable swaps will stay in the local journal.</p></div></section>`;
 }
 
-function renderSettings() {
-  root.innerHTML = `<section class="page-head"><div><span class="eyebrow">LOCAL APPLICATION</span><h1>SETTINGS.</h1><p>Keys stay encrypted on this computer. The QDAY node keeps validating the chain.</p></div></section>
+function renderWallets() {
+  const qdayBalance = state.balance?.spendable?.qday ?? '0';
+  const qdayPending = state.balance?.pendingIn?.qday ?? '0';
+  const qdayImmature = state.balance?.immature?.qday ?? '0';
+  const bitcoinBalance = state.bitcoinBalance?.confirmed?.btc ?? '0';
+  const bitcoinPending = state.bitcoinBalance?.pending?.btc ?? '0';
+  const bitcoinImmature = state.bitcoinBalance?.immature?.btc ?? '0';
+  const qdayReady = Boolean(state.qday?.synced && state.qday?.networkSynced && state.balance);
+  const bitcoinReady = Boolean(state.bitcoin?.headersSynced && state.bitcoin?.walletSynced && state.bitcoinBalance);
+  root.innerHTML = `<section class="page-head"><div><span class="eyebrow">LOCAL NONCUSTODIAL WALLETS</span><h1>WALLETS.</h1><p>Receive, send or replace the local wallet from one screen. Every transaction is signed on this computer.</p></div></section>
     ${state.error ? `<div class="alert"><strong>Local node error</strong>${escapeHTML(state.error)}</div>` : ''}
-    <section class="settings-grid">
-      <article class="card setting"><h2>QDAY RECEIVE.</h2><p>Generate the wallet address used to fund swaps and ordinary QDAY transfers.</p><button class="secondary" id="receive-qday">SHOW ADDRESS</button></article>
-      <article class="card setting"><h2>BITCOIN RECEIVE.</h2><p>Show your standard Native SegWit address for funding BTC swaps.</p><button class="secondary" id="receive-bitcoin">SHOW ADDRESS</button></article>
-      <article class="card setting"><h2>RECOVERY PHRASE.</h2><p>Reveal the 24 words that restore every chain branch and swap identity.</p><button class="secondary" id="show-recovery">REVEAL 24 WORDS</button></article>
-      <article class="card setting"><h2>PUBLIC MARKET.</h2><p>${escapeHTML(state.relayURL || 'Relay is not configured')}</p><a class="secondary" href="${escapeHTML(state.relayURL || '#')}" target="_blank" rel="noreferrer">OPEN ORDER EXPLORER</a></article>
-      <article class="card setting"><h2>LOCK WALLET.</h2><p>Clear private material from memory while the QDAY node continues syncing.</p><button class="danger" id="lock-wallet">LOCK NOW</button></article>
+    <section class="wallet-section recovery-section">
+      <header><div><span class="eyebrow">01 / RECOVERY PHRASE</span><h2>RESTORE BOTH WALLETS.</h2></div><p>These 24 words restore QDAY, Native SegWit Bitcoin and your swap identity.</p></header>
+      <div class="wallet-actions">
+        <article><h3>EXPORT.</h3><p>Enter the wallet password, then reveal and copy all 24 words.</p><button class="secondary" id="export-recovery">EXPORT 24 WORDS</button></article>
+        <article><h3>IMPORT.</h3><p>Replace both local wallets and the local swap identity with another 24-word phrase.</p><button class="secondary" id="import-recovery">IMPORT NEW WALLET</button></article>
+      </div>
+    </section>
+    <section class="wallet-section asset-wallet">
+      <header><div><span class="eyebrow">02 / QDAY</span><h2>QDAY WALLET.</h2></div><div class="wallet-balance"><span>SPENDABLE BALANCE</span><strong>${escapeHTML(commas(qdayBalance))} QDAY</strong><small>${escapeHTML(commas(qdayPending))} pending · ${escapeHTML(commas(qdayImmature))} immature</small></div></header>
+      <div class="wallet-actions">
+        <article><h3>RECEIVE.</h3><p>Show the QDAY address controlled by this local recovery phrase.</p><button class="secondary" id="receive-qday" ${qdayReady ? '' : 'disabled'}>SHOW ADDRESS</button></article>
+        <article><h3>WITHDRAW.</h3><p>Send any part of the spendable balance. The network fee is calculated before approval.</p><button class="primary" data-withdraw="QDAY" ${qdayReady ? '' : 'disabled'}>WITHDRAW QDAY</button></article>
+      </div>
+    </section>
+    <section class="wallet-section asset-wallet">
+      <header><div><span class="eyebrow">03 / BITCOIN</span><h2>BITCOIN WALLET.</h2></div><div class="wallet-balance"><span>CONFIRMED BALANCE</span><strong>${escapeHTML(commas(bitcoinBalance))} BTC</strong><small>${escapeHTML(commas(bitcoinPending))} pending · ${escapeHTML(commas(bitcoinImmature))} immature</small></div></header>
+      <div class="wallet-actions">
+        <article><h3>RECEIVE.</h3><p>Show the Native SegWit Bitcoin address controlled by this local recovery phrase.</p><button class="secondary" id="receive-bitcoin" ${bitcoinReady ? '' : 'disabled'}>SHOW ADDRESS</button></article>
+        <article><h3>WITHDRAW.</h3><p>Send any part of the confirmed balance. The exact Bitcoin fee is built from your UTXOs.</p><button class="primary" data-withdraw="BTC" ${bitcoinReady ? '' : 'disabled'}>WITHDRAW BITCOIN</button></article>
+      </div>
+    </section>
+    <section class="wallet-section lock-section">
+      <header><div><span class="eyebrow">04 / SESSION</span><h2>LOCK WALLET.</h2></div><p>Clear private material from memory while both local chain clients keep synchronizing.</p></header>
+      <button class="danger" id="lock-wallet">LOCK NOW</button>
     </section>`;
 }
 
@@ -915,7 +948,7 @@ function currentFingerprint() {
   if (!state.configured) return 'setup';
   if (!state.unlocked) return 'locked';
   if (current === 'create') return 'create';
-  if (current === 'settings') return JSON.stringify({current, error: state.error, relay: state.relayURL});
+  if (current === 'wallets') return JSON.stringify({current, error: state.error, qday: state.qday, bitcoin: state.bitcoin, balance: state.balance, bitcoinBalance: state.bitcoinBalance});
   if (current === 'swaps' || current === 'history') return JSON.stringify({current, negotiations, relayError: state.relayError});
   return JSON.stringify({
     current: 'market', orders, marketTrades, offerSide, selectedOrderID,
@@ -940,7 +973,7 @@ function render() {
         case 'create': renderCreate(); break;
         case 'swaps': renderSwaps(); break;
         case 'history': renderSwaps(true); break;
-        case 'settings': renderSettings(); break;
+        case 'wallets': renderWallets(); break;
         default: renderMarket();
       }
     }
@@ -999,6 +1032,168 @@ function recoveryModal(phrase, firstRun = false) {
     showToast('Recovery phrase copied');
   });
   document.querySelector('#saved-phrase').addEventListener('click', closeModal);
+}
+
+function exportRecoveryModal() {
+  openModal(`<div class="modal-head"><span class="eyebrow">RECOVERY PHRASE</span><h2>EXPORT 24 WORDS.</h2></div><div class="modal-body">
+    <p>Enter the wallet password to reveal the phrase. Make sure nobody can see your screen.</p>
+    <form id="export-recovery-form">
+      <label class="field"><span>Wallet password</span><input name="password" type="password" required autocomplete="current-password"></label>
+      <p class="form-error dark" id="form-error" hidden></p>
+      <div class="modal-actions"><button class="secondary" id="close-modal" type="button">CANCEL</button><button class="primary" type="submit">EXPORT RECOVERY PHRASE</button></div>
+    </form>
+  </div>`);
+}
+
+function importRecoveryModal() {
+  openModal(`<div class="modal-head"><span class="eyebrow">REPLACE LOCAL WALLETS</span><h2>IMPORT 24 WORDS.</h2></div><div class="modal-body">
+    <p>This replaces the current QDAY wallet, Bitcoin wallet, swap identity and local swap history. The old wallet data is deleted after the new wallets open successfully.</p>
+    <form id="import-recovery-form">
+      <label class="field"><span>Recovery phrase</span><textarea name="phrase" required autocomplete="off" spellcheck="false" placeholder="Enter all 24 words in order"></textarea></label>
+      <label class="field"><span>New wallet password</span><input name="password" type="password" minlength="12" required autocomplete="new-password"><small>At least 12 characters. This encrypts the imported wallets on this computer.</small></label>
+      <label class="field"><span>Repeat new password</span><input name="confirm" type="password" minlength="12" required autocomplete="new-password"></label>
+      <label class="confirm-replace"><input name="replace" type="checkbox" required><span>I understand that this replaces the wallets currently open in QDAY Swap.</span></label>
+      <p class="form-error dark" id="form-error" hidden></p>
+      <div class="modal-actions"><button class="secondary" id="close-modal" type="button">CANCEL</button><button class="danger" type="submit">IMPORT AND REPLACE</button></div>
+    </form>
+  </div>`);
+}
+
+function inputAtomic(value, unit) {
+  const decimals = decimalsFromUnit(unit);
+  const text = String(value || '').trim();
+  if (decimals === null || !/^\d+(?:\.\d+)?$/.test(text)) throw new Error('Enter a positive plain decimal amount');
+  const [whole, fraction = ''] = text.split('.');
+  if (fraction.length > decimals) throw new Error(`Amount has more than ${decimals} decimal places`);
+  const atomic = BigInt(`${whole}${fraction.padEnd(decimals, '0')}`);
+  if (atomic <= 0n) throw new Error('Amount must be greater than zero');
+  return atomic;
+}
+
+function walletAvailable(asset) {
+  if (asset === 'QDAY') {
+    return {
+      display: state.balance?.spendable?.qday ?? '0',
+      atomic: state.balance?.spendable?.atomic ?? '0',
+      unit: state.qday?.unitAtomic || state.balance?.unitAtomic || ''
+    };
+  }
+  return {
+    display: state.bitcoinBalance?.confirmed?.btc ?? '0',
+    atomic: state.bitcoinBalance?.confirmed?.satoshis ?? '0',
+    unit: '100000000'
+  };
+}
+
+function withdrawModal(asset) {
+  const available = walletAvailable(asset);
+  const name = asset === 'QDAY' ? 'QDAY' : 'BITCOIN';
+  pendingWithdrawalQuote = null;
+  openModal(`<div class="modal-head"><span class="eyebrow">${name} WALLET</span><h2>SEND ${name}.</h2></div><div class="modal-body">
+    <div class="send-balance"><span>AVAILABLE</span><strong>${escapeHTML(commas(available.display))} ${asset === 'QDAY' ? 'QDAY' : 'BTC'}</strong></div>
+    <form id="withdrawal-form" data-asset="${asset}" data-unit="${escapeHTML(available.unit)}" data-available="${escapeHTML(available.atomic)}">
+      <label class="field"><span>Send to</span><input name="destination" required autocomplete="off" spellcheck="false" placeholder="${asset === 'QDAY' ? 'qday1…' : 'bc1q…'}"></label>
+      <label class="field"><span>Amount</span><div class="amount-input"><input name="amount" inputmode="decimal" required autocomplete="off" placeholder="0"><button class="secondary" id="withdraw-max" type="button">MAX</button><b>${asset === 'QDAY' ? 'QDAY' : 'BTC'}</b></div><small>MAX leaves exactly enough for the calculated network fee.</small></label>
+      <div class="send-summary">
+        <div><span>NETWORK FEE</span><strong id="withdraw-fee">— ${asset === 'QDAY' ? 'QDAY' : 'BTC'}</strong><small id="withdraw-fee-note">Enter a valid address and amount</small></div>
+        <div><span>TOTAL FROM WALLET</span><strong id="withdraw-total">— ${asset === 'QDAY' ? 'QDAY' : 'BTC'}</strong><small>Amount plus network fee</small></div>
+      </div>
+      <p class="form-error dark" id="withdraw-error" hidden></p>
+      <div class="modal-actions"><button class="secondary" id="close-modal" type="button">CANCEL</button><button class="primary" id="review-withdrawal" type="submit" disabled>REVIEW SEND</button></div>
+    </form>
+  </div>`);
+}
+
+function withdrawalError(message = '') {
+  const box = document.querySelector('#withdraw-error');
+  if (!box) return;
+  box.textContent = message;
+  box.hidden = !message;
+}
+
+function showWithdrawalQuote(quote) {
+  const form = document.querySelector('#withdrawal-form');
+  if (!form) return;
+  pendingWithdrawalQuote = quote;
+  form.elements.destination.value = quote.destination;
+  form.elements.amount.value = quote.amount;
+  document.querySelector('#withdraw-fee').textContent = `${commas(quote.fee)} ${quote.asset === 'QDAY' ? 'QDAY' : 'BTC'}`;
+  document.querySelector('#withdraw-total').textContent = `${commas(quote.total)} ${quote.asset === 'QDAY' ? 'QDAY' : 'BTC'}`;
+  document.querySelector('#withdraw-fee-note').textContent = quote.asset === 'BTC'
+    ? `${quote.feeRateSatPerVByte} sat/vB · exact fee for selected UTXOs`
+    : 'Current QDAY network fee';
+  document.querySelector('#review-withdrawal').disabled = false;
+  withdrawalError();
+}
+
+function validateWithdrawalForm(form, maximum = false) {
+  const destination = form.elements.destination.value.trim();
+  if (!destination) throw new Error('Enter the destination address');
+  if (form.dataset.asset === 'QDAY' && !(/^qday1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{59}$/i.test(destination) || /^qday1[0-9a-f]{136}$/i.test(destination))) {
+    throw new Error('Enter a complete QDAY address');
+  }
+  if (!maximum) {
+    const atomic = inputAtomic(form.elements.amount.value, form.dataset.unit);
+    const available = BigInt(form.dataset.available || '0');
+    if (atomic > available) throw new Error('Amount exceeds the available balance');
+  }
+  return destination;
+}
+
+async function requestWithdrawalQuote(maximum = false, quiet = false) {
+  const form = document.querySelector('#withdrawal-form');
+  if (!form) return null;
+  const sequence = ++withdrawalQuoteSequence;
+  pendingWithdrawalQuote = null;
+  document.querySelector('#review-withdrawal').disabled = true;
+  try {
+    const destination = validateWithdrawalForm(form, maximum);
+    if (!quiet) withdrawalError();
+    const quote = await post('/api/v1/wallets/quote', {
+      asset: form.dataset.asset,
+      destination,
+      amount: maximum ? '' : form.elements.amount.value.trim(),
+      maximum
+    });
+    if (sequence !== withdrawalQuoteSequence || !document.querySelector('#withdrawal-form')) return null;
+    showWithdrawalQuote(quote);
+    return quote;
+  } catch (error) {
+    if (sequence !== withdrawalQuoteSequence || !document.querySelector('#withdrawal-form')) return null;
+    document.querySelector('#withdraw-fee').textContent = `— ${form.dataset.asset === 'QDAY' ? 'QDAY' : 'BTC'}`;
+    document.querySelector('#withdraw-total').textContent = `— ${form.dataset.asset === 'QDAY' ? 'QDAY' : 'BTC'}`;
+    document.querySelector('#withdraw-fee-note').textContent = 'Enter a valid address and amount';
+    if (!quiet || form.elements.destination.value.trim()) withdrawalError(error.message);
+    return null;
+  }
+}
+
+function scheduleWithdrawalQuote() {
+  clearTimeout(withdrawalQuoteTimer);
+  pendingWithdrawalQuote = null;
+  const button = document.querySelector('#review-withdrawal');
+  if (button) button.disabled = true;
+  withdrawalQuoteTimer = setTimeout(() => requestWithdrawalQuote(false, true), 450);
+}
+
+function withdrawalReview(quote) {
+  const ticker = quote.asset === 'QDAY' ? 'QDAY' : 'BTC';
+  openModal(`<div class="modal-head"><span class="eyebrow">FINAL CHECK</span><h2>SEND ${escapeHTML(quote.amount)} ${ticker}?</h2></div><div class="modal-body">
+    <div class="final-quote withdrawal-review">
+      <div><span>DESTINATION</span><strong>${escapeHTML(quote.destination)}</strong></div>
+      <div><span>RECIPIENT GETS</span><strong>${escapeHTML(commas(quote.amount))} ${ticker}</strong></div>
+      <div><span>NETWORK FEE</span><strong>${escapeHTML(commas(quote.fee))} ${ticker}</strong><small>${quote.asset === 'BTC' ? `${escapeHTML(quote.feeRateSatPerVByte)} sat/vB` : 'QDAY network fee'}</small></div>
+      <div><span>TOTAL FROM WALLET</span><strong>${escapeHTML(commas(quote.total))} ${ticker}</strong></div>
+    </div>
+    <p>Check the address carefully. A broadcast transaction cannot be cancelled.</p>
+    <div class="modal-actions"><button class="secondary" id="close-modal">CANCEL</button><button class="primary" id="confirm-withdrawal">SEND NOW</button></div>
+  </div>`);
+  pendingWithdrawalQuote = quote;
+}
+
+function withdrawalSent(result) {
+  const ticker = result.asset === 'QDAY' ? 'QDAY' : 'BITCOIN';
+  openModal(`<div class="modal-head"><span class="eyebrow">TRANSACTION BROADCAST</span><h2>${ticker} SENT.</h2></div><div class="modal-body"><p>The local wallet broadcast the transaction to the network.</p><div class="address-box">${escapeHTML(result.transactionID)}</div><div class="modal-actions"><button class="primary" id="close-modal">DONE</button></div></div>`);
 }
 
 document.addEventListener('click', async event => {
@@ -1082,8 +1277,51 @@ document.addEventListener('click', async event => {
     renderSetup();
     return;
   }
+  if (event.target.closest('#export-recovery')) {
+    exportRecoveryModal();
+    return;
+  }
+  if (event.target.closest('#import-recovery')) {
+    importRecoveryModal();
+    return;
+  }
+  const withdrawal = event.target.closest('[data-withdraw]');
+  if (withdrawal) {
+    withdrawModal(withdrawal.dataset.withdraw);
+    return;
+  }
+  if (event.target.closest('#withdraw-max')) {
+    await requestWithdrawalQuote(true);
+    return;
+  }
+  if (event.target.closest('#confirm-withdrawal') && pendingWithdrawalQuote) {
+    const button = event.target.closest('#confirm-withdrawal');
+    const quote = pendingWithdrawalQuote;
+    button.disabled = true;
+    button.textContent = 'SIGNING AND BROADCASTING…';
+    try {
+      const result = await post('/api/v1/wallets/send', {
+        requestID: quote.requestID,
+        asset: quote.asset,
+        destination: quote.destination,
+        amountAtomic: quote.amountAtomic,
+        feeAtomic: quote.feeAtomic,
+        unitAtomic: quote.unitAtomic
+      });
+      pendingWithdrawalQuote = null;
+      renderFingerprint = '';
+      await refreshState();
+      withdrawalSent(result);
+    } catch (error) {
+      showToast(error.message);
+      button.disabled = false;
+      button.textContent = 'TRY AGAIN';
+    }
+    return;
+  }
   if (event.target.closest('#lock-wallet')) {
-    try { state = await post('/api/v1/lock'); location.hash = 'market'; render(); } catch (error) { showToast(error.message); }
+    try { state = await post('/api/v1/lock'); renderFingerprint = ''; render(); } catch (error) { showToast(error.message); }
+    return;
   }
   if (event.target.closest('#receive-qday')) {
     try {
@@ -1100,10 +1338,6 @@ document.addEventListener('click', async event => {
       document.querySelector('#close-modal').addEventListener('click', closeModal);
       document.querySelector('#copy-address').addEventListener('click', async () => { await navigator.clipboard.writeText(result.address); showToast('Bitcoin address copied'); });
     } catch (error) { showToast(error.message); }
-  }
-  if (event.target.closest('#show-recovery')) {
-    if (!confirm('Reveal the recovery phrase on this screen?')) return;
-    try { recoveryModal((await post('/api/v1/recovery')).phrase); } catch (error) { showToast(error.message); }
   }
   const accept = event.target.closest('[data-accept-order]');
   if (accept) {
@@ -1181,11 +1415,71 @@ document.addEventListener('click', async event => {
 });
 
 document.addEventListener('input', event => {
+  if (event.target.closest('#withdrawal-form')) scheduleWithdrawalQuote();
   if (event.target.closest('#create-offer-form')) updateOfferPreview();
 });
 
 document.addEventListener('submit', async event => {
   event.preventDefault();
+  if (event.target.id === 'export-recovery-form') {
+    const form = event.target;
+    const button = form.querySelector('[type=submit]');
+    const errorBox = form.querySelector('#form-error');
+    button.disabled = true;
+    button.textContent = 'DECRYPTING…';
+    try {
+      const result = await post('/api/v1/recovery', {password: form.elements.password.value});
+      form.reset();
+      recoveryModal(result.phrase);
+    } catch (error) {
+      errorBox.textContent = error.message;
+      errorBox.hidden = false;
+      button.disabled = false;
+      button.textContent = 'EXPORT RECOVERY PHRASE';
+    }
+    return;
+  }
+  if (event.target.id === 'import-recovery-form') {
+    const form = event.target;
+    const errorBox = form.querySelector('#form-error');
+    if (form.elements.password.value !== form.elements.confirm.value) {
+      errorBox.textContent = 'Passwords do not match.';
+      errorBox.hidden = false;
+      return;
+    }
+    if (form.elements.phrase.value.trim().split(/\s+/).length !== 24) {
+      errorBox.textContent = 'Enter all 24 recovery words in order.';
+      errorBox.hidden = false;
+      return;
+    }
+    const button = form.querySelector('[type=submit]');
+    button.disabled = true;
+    button.textContent = 'REPLACING LOCAL WALLETS…';
+    try {
+      const result = await post('/api/v1/recovery/import', {
+        password: form.elements.password.value,
+        phrase: form.elements.phrase.value.trim()
+      });
+      form.reset();
+      state = result;
+      closeModal();
+      location.hash = 'wallets';
+      renderFingerprint = '';
+      render();
+      showToast('Wallets imported');
+    } catch (error) {
+      errorBox.textContent = error.message;
+      errorBox.hidden = false;
+      button.disabled = false;
+      button.textContent = 'IMPORT AND REPLACE';
+    }
+    return;
+  }
+  if (event.target.id === 'withdrawal-form') {
+    const quote = await requestWithdrawalQuote(false);
+    if (quote) withdrawalReview(quote);
+    return;
+  }
   if (event.target.id === 'setup-form') {
     const form = event.target;
     const errorBox = form.querySelector('#form-error');

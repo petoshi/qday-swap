@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -131,9 +132,34 @@ func (f *fakeBitcoin) ReceiveAddress() (string, error) {
 	}
 	return "bc1qtest", nil
 }
+func (f *fakeBitcoin) QuotePayment(destination string, satoshis int64, maximum bool) (bitcoinwallet.PaymentQuote, error) {
+	if !f.unlocked {
+		return bitcoinwallet.PaymentQuote{}, os.ErrPermission
+	}
+	if maximum {
+		satoshis = 124_999_000
+	}
+	return bitcoinwallet.PaymentQuote{
+		Destination:        destination,
+		Amount:             bitcoinwallet.Amount{Satoshis: fmt.Sprint(satoshis), BTC: atomicDecimal(fmt.Sprint(satoshis), "100000000")},
+		Fee:                bitcoinwallet.Amount{Satoshis: "1000", BTC: "0.00001"},
+		Total:              bitcoinwallet.Amount{Satoshis: fmt.Sprint(satoshis + 1000), BTC: atomicDecimal(fmt.Sprint(satoshis+1000), "100000000")},
+		FeeRateSatPerVByte: 10,
+	}, nil
+}
+func (f *fakeBitcoin) SendPayment(destination string, satoshis, expectedFee int64) (bitcoinwallet.Payment, error) {
+	quote, err := f.QuotePayment(destination, satoshis, false)
+	if err != nil {
+		return bitcoinwallet.Payment{}, err
+	} else if expectedFee != 1000 {
+		return bitcoinwallet.Payment{}, errors.New("fee changed")
+	}
+	return bitcoinwallet.Payment{PaymentQuote: quote, TransactionID: "bitcoin-payment"}, nil
+}
 
 func TestSetupLockUnlockAndReceiveAddress(t *testing.T) {
 	relayURL := testRelayURL(t)
+	qdayDestination := "qday1" + strings.Repeat("q", 59)
 	var mu sync.Mutex
 	unlocked := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -157,6 +183,15 @@ func TestSetupLockUnlockAndReceiveAddress(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(walletd.Balance{Height: 123, Synced: true, UnitAtomic: "1000000000000000000000000", Spendable: walletd.Amount{Atomic: "5000000000000000000000000", QDAY: "5"}})
 		case "/v1/addresses":
 			_ = json.NewEncoder(w).Encode(walletd.Address{Index: 0, Address: "qday1ptest", Reference: "qday-swap-main-receive-v1", Kind: "deposit"})
+		case "/v1/withdrawals":
+			var request walletd.WithdrawalRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatal(err)
+			}
+			_ = json.NewEncoder(w).Encode(walletd.Withdrawal{
+				RequestID: request.RequestID, TransactionID: "qday-payment", Destination: request.Destination,
+				Amount: walletd.Amount{Atomic: request.AmountAtomic}, Fee: walletd.Amount{Atomic: request.FeeAtomic}, Status: "broadcast",
+			})
 		default:
 			http.NotFound(w, r)
 		}
@@ -187,9 +222,12 @@ func TestSetupLockUnlockAndReceiveAddress(t *testing.T) {
 	if result.State.Bitcoin == nil || result.State.Bitcoin.HeaderHeight != 900_000 || result.State.BitcoinBalance == nil || result.State.BitcoinBalance.Confirmed.BTC != "1.25" {
 		t.Fatalf("setup state does not include Bitcoin status: %#v", result.State)
 	}
-	phrase, err := service.RecoveryPhrase()
+	phrase, err := service.RecoveryPhrase("correct horse battery staple")
 	if err != nil || phrase != result.Phrase {
 		t.Fatalf("recovery phrase=%q err=%v", phrase, err)
+	}
+	if _, err := service.RecoveryPhrase("wrong wallet password"); err == nil {
+		t.Fatal("wrong password exported the recovery phrase")
 	}
 	address, err := service.QDAYReceiveAddress(ctx)
 	if err != nil || address.Address != "qday1ptest" {
@@ -199,10 +237,62 @@ func TestSetupLockUnlockAndReceiveAddress(t *testing.T) {
 	if err != nil || bitcoinAddress != "bc1qtest" {
 		t.Fatalf("Bitcoin address=%q err=%v", bitcoinAddress, err)
 	}
+	qdayQuote, err := service.QuoteWithdrawal(ctx, WithdrawalQuoteRequest{Asset: "QDAY", Destination: qdayDestination, Amount: "1.25"})
+	if err != nil {
+		t.Fatal(err)
+	} else if qdayQuote.Amount != "1.25" || qdayQuote.Fee != "0.001" || qdayQuote.Total != "1.251" {
+		t.Fatalf("QDAY withdrawal quote = %#v", qdayQuote)
+	}
+	qdayPayment, err := service.SendWithdrawal(ctx, SendWithdrawalRequest{
+		RequestID: qdayQuote.RequestID, Asset: qdayQuote.Asset, Destination: qdayQuote.Destination,
+		AmountAtomic: qdayQuote.AmountAtomic, FeeAtomic: qdayQuote.FeeAtomic, UnitAtomic: qdayQuote.UnitAtomic,
+	})
+	if err != nil {
+		t.Fatal(err)
+	} else if qdayPayment.TransactionID != "qday-payment" {
+		t.Fatalf("QDAY withdrawal = %#v", qdayPayment)
+	}
+	qdayMaximum, err := service.QuoteWithdrawal(ctx, WithdrawalQuoteRequest{Asset: "QDAY", Destination: qdayDestination, Maximum: true})
+	if err != nil {
+		t.Fatal(err)
+	} else if qdayMaximum.Amount != "4.999" || qdayMaximum.Total != "5" {
+		t.Fatalf("QDAY MAX quote = %#v", qdayMaximum)
+	}
+	if _, err := service.QuoteWithdrawal(ctx, WithdrawalQuoteRequest{Asset: "QDAY", Destination: qdayDestination, Amount: "5"}); err == nil {
+		t.Fatal("QDAY quote allowed amount without room for the network fee")
+	}
+	bitcoinQuote, err := service.QuoteWithdrawal(ctx, WithdrawalQuoteRequest{Asset: "BTC", Destination: "bc1qdestination", Maximum: true})
+	if err != nil {
+		t.Fatal(err)
+	} else if bitcoinQuote.AmountAtomic != "124999000" || bitcoinQuote.FeeAtomic != "1000" || bitcoinQuote.TotalAtomic != "125000000" {
+		t.Fatalf("Bitcoin MAX quote = %#v", bitcoinQuote)
+	}
+	bitcoinPayment, err := service.SendWithdrawal(ctx, SendWithdrawalRequest{
+		RequestID: bitcoinQuote.RequestID, Asset: bitcoinQuote.Asset, Destination: bitcoinQuote.Destination,
+		AmountAtomic: bitcoinQuote.AmountAtomic, FeeAtomic: bitcoinQuote.FeeAtomic, UnitAtomic: bitcoinQuote.UnitAtomic,
+	})
+	if err != nil {
+		t.Fatal(err)
+	} else if bitcoinPayment.TransactionID != "bitcoin-payment" {
+		t.Fatalf("Bitcoin withdrawal = %#v", bitcoinPayment)
+	}
+	retriedBitcoinPayment, err := service.SendWithdrawal(ctx, SendWithdrawalRequest{
+		RequestID: bitcoinQuote.RequestID, Asset: bitcoinQuote.Asset, Destination: bitcoinQuote.Destination,
+		AmountAtomic: bitcoinQuote.AmountAtomic, FeeAtomic: bitcoinQuote.FeeAtomic, UnitAtomic: bitcoinQuote.UnitAtomic,
+	})
+	if err != nil || retriedBitcoinPayment != bitcoinPayment {
+		t.Fatalf("idempotent Bitcoin retry = %#v, %v", retriedBitcoinPayment, err)
+	}
+	if _, err := service.SendWithdrawal(ctx, SendWithdrawalRequest{
+		RequestID: bitcoinQuote.RequestID, Asset: bitcoinQuote.Asset, Destination: "bc1qchanged",
+		AmountAtomic: bitcoinQuote.AmountAtomic, FeeAtomic: bitcoinQuote.FeeAtomic, UnitAtomic: bitcoinQuote.UnitAtomic,
+	}); err == nil {
+		t.Fatal("Bitcoin request ID was reused for another destination")
+	}
 	if err := service.Lock(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.RecoveryPhrase(); err == nil {
+	if _, err := service.RecoveryPhrase("correct horse battery staple"); err == nil {
 		t.Fatal("locked service returned recovery phrase")
 	}
 	if err := service.Unlock(ctx, "wrong password here"); err == nil {
@@ -210,6 +300,68 @@ func TestSetupLockUnlockAndReceiveAddress(t *testing.T) {
 	}
 	if err := service.Unlock(ctx, "correct horse battery staple"); err != nil {
 		t.Fatal(err)
+	}
+	if err := service.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestImportRecoveryReplacesWalletWithoutKeepingBackup(t *testing.T) {
+	ctx := context.Background()
+	relayURL := testRelayURL(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/wallet/unlock":
+			_, _ = w.Write([]byte(`{"unlocked":true}`))
+		case "/v1/wallet/lock":
+			_, _ = w.Write([]byte(`{"unlocked":false}`))
+		case "/v1/status":
+			_ = json.NewEncoder(w).Encode(walletd.Status{Network: "qday-mainnet", Height: 123, ScanHeight: 123, Synced: true, NetworkSynced: true, Unlocked: true, UnitAtomic: order.QDAYLegacyUnit})
+		case "/v1/balance":
+			_ = json.NewEncoder(w).Encode(walletd.Balance{Synced: true, UnitAtomic: order.QDAYLegacyUnit, Spendable: walletd.Amount{Atomic: order.QDAYLegacyUnit, QDAY: "1"}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	dataDir := filepath.Join(t.TempDir(), "qday-swap")
+	service, err := New(ctx, Config{DataDir: dataDir, WalletdBinary: "unused", Network: "mainnet", RelayURL: relayURL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.factory = func(path string) (qdayProcess, error) { return &fakeWalletd{dataDir: path, server: server}, nil }
+	bitcoin := &fakeBitcoin{}
+	service.bitcoinFactory = func(string) (bitcoinProcess, error) { return bitcoin, nil }
+	if _, err := service.Setup(ctx, "correct horse battery staple", ""); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := walletroot.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacementPhrase, err := replacement.Phrase()
+	clear(replacement[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := service.ImportRecovery(ctx, "correct horse battery staple", replacementPhrase)
+	if err != nil {
+		t.Fatal(err)
+	} else if !state.Configured || !state.Unlocked {
+		t.Fatalf("import state = %#v", state)
+	}
+	exported, err := service.RecoveryPhrase("correct horse battery staple")
+	if err != nil {
+		t.Fatal(err)
+	} else if exported != replacementPhrase {
+		t.Fatal("import did not replace the recovery phrase")
+	}
+	backups, err := filepath.Glob(filepath.Join(filepath.Dir(dataDir), ".qday-swap-replaced-*"))
+	if err != nil {
+		t.Fatal(err)
+	} else if len(backups) != 0 {
+		t.Fatalf("import retained wallet backups: %v", backups)
 	}
 	if err := service.Close(); err != nil {
 		t.Fatal(err)

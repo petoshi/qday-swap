@@ -2,8 +2,11 @@
 
 ## What the user gets
 
-The application has Market, Active swaps, History and Settings. Creating and
-accepting offers happens directly in the Market screen.
+The application has Orders, Swaps, History and Wallets. Creating and accepting
+offers happens directly in the Orders screen. Wallets shows exact QDAY and
+Bitcoin balances, receive addresses and ordinary sends from the same local
+keys. A send can use a partial amount or MAX; the final address, recipient
+amount, exact network fee and wallet total are reviewed before broadcast.
 A trade shows the asset pair, exact amounts, both network fees, confirmation
 progress and the exact time or height at which each refund becomes available.
 
@@ -34,6 +37,12 @@ The application uses that phrase as one recovery root:
 One phrase restores every supported wallet without reusing a private key across
 chains. Seeds and signing keys stay on the user's computer and are encrypted by
 the application password.
+
+The Wallets screen exports the phrase only after the password is entered. It
+can also replace both wallets from another 24-word phrase. Import is blocked
+while a swap or acceptance is active, initializes both replacements before
+touching the current data, and removes the replaced wallet data only after the
+new QDAY and Bitcoin wallets open successfully.
 
 Bitcoin uses the standard BIP84 Native SegWit path
 `m/84'/0'/account'/change/index`, producing `bc1q` receive addresses. A user

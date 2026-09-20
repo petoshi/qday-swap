@@ -38,9 +38,12 @@ type Application interface {
 	Setup(context.Context, string, string) (app.SetupResult, error)
 	Unlock(context.Context, string) error
 	Lock(context.Context) error
-	RecoveryPhrase() (string, error)
+	RecoveryPhrase(string) (string, error)
+	ImportRecovery(context.Context, string, string) (app.State, error)
 	QDAYReceiveAddress(context.Context) (walletd.Address, error)
 	BitcoinReceiveAddress() (string, error)
+	QuoteWithdrawal(context.Context, app.WithdrawalQuoteRequest) (app.WithdrawalQuote, error)
+	SendWithdrawal(context.Context, app.SendWithdrawalRequest) (app.WithdrawalResult, error)
 	Orders(context.Context, string, int) (relay.ResultPage, error)
 	MarketPrice(context.Context) (relay.MarketPrice, error)
 	MarketTrades(context.Context, int, int64) (relay.TradeHistory, error)
@@ -205,16 +208,34 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "shutting down"})
 		go s.shutdownOnce.Do(s.shutdown)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/recovery":
-		var request struct{}
+		var request struct {
+			Password string `json:"password"`
+		}
 		if !decode(w, r, &request) {
 			return
 		}
-		phrase, err := s.application.RecoveryPhrase()
+		phrase, err := s.application.RecoveryPhrase(request.Password)
+		request.Password = ""
 		if err != nil {
 			writeError(w, http.StatusLocked, err.Error())
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"phrase": phrase})
+	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/recovery/import":
+		var request struct {
+			Password string `json:"password"`
+			Phrase   string `json:"phrase"`
+		}
+		if !decode(w, r, &request) {
+			return
+		}
+		state, err := s.application.ImportRecovery(r.Context(), request.Password, request.Phrase)
+		request.Password, request.Phrase = "", ""
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, state)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/qday/address":
 		address, err := s.application.QDAYReceiveAddress(r.Context())
 		if err != nil {
@@ -229,6 +250,28 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"address": address})
+	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/wallets/quote":
+		var request app.WithdrawalQuoteRequest
+		if !decode(w, r, &request) {
+			return
+		}
+		quote, err := s.application.QuoteWithdrawal(r.Context(), request)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, quote)
+	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/wallets/send":
+		var request app.SendWithdrawalRequest
+		if !decode(w, r, &request) {
+			return
+		}
+		result, err := s.application.SendWithdrawal(r.Context(), request)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusCreated, result)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/orders":
 		page := 1
 		if raw := r.URL.Query().Get("page"); raw != "" {

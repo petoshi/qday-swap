@@ -36,3 +36,9 @@ The application runs a validating QDAY node and a Bitcoin Neutrino light
 client. The recovery phrase, private keys and signatures remain on your
 computer. The public relay carries signed orders and encrypted protocol
 messages; it cannot spend either asset.
+
+Use **Wallets** to view spendable balances, show either receive address, or
+send an ordinary QDAY or Bitcoin payment. The application calculates the fee
+before approval. **MAX** sends the complete available balance minus that fee.
+The same screen exports the recovery phrase after password verification or
+imports a different 24-word phrase when no swap is active.

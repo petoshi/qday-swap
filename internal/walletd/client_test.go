@@ -55,6 +55,44 @@ func TestClientPreservesAPIError(t *testing.T) {
 	}
 }
 
+func TestClientCreatesWithdrawalWithExactAmounts(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+testToken {
+			t.Fatal("missing bearer token")
+		} else if r.Method != http.MethodPost || r.URL.Path != "/v1/withdrawals" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		var request WithdrawalRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if request.RequestID != "wallet-test" || request.Destination != "qday1ptest" || request.AmountAtomic != "1230000000000000000000" || request.FeeAtomic != "1000000000000000000000" || request.ExpectedUnitAtomic != "1000000000000000000000000" {
+			t.Fatalf("withdrawal request = %#v", request)
+		}
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(Withdrawal{
+			RequestID: request.RequestID, TransactionID: "abcdef", Destination: request.Destination,
+			Amount: Amount{Atomic: request.AmountAtomic, QDAY: "0.00123"},
+			Fee:    Amount{Atomic: request.FeeAtomic, QDAY: "0.001"}, Status: "broadcast",
+		})
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, testToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withdrawal, err := client.CreateWithdrawal(context.Background(), WithdrawalRequest{
+		RequestID: "wallet-test", Destination: "qday1ptest",
+		AmountAtomic: "1230000000000000000000", FeeAtomic: "1000000000000000000000",
+		ExpectedUnitAtomic: "1000000000000000000000000",
+	})
+	if err != nil {
+		t.Fatal(err)
+	} else if withdrawal.TransactionID != "abcdef" || withdrawal.Amount.Atomic != "1230000000000000000000" {
+		t.Fatalf("withdrawal = %#v", withdrawal)
+	}
+}
+
 func TestClientRejectsRemoteAndMalformedEndpoints(t *testing.T) {
 	for _, endpoint := range []string{"https://127.0.0.1:19772", "http://example.com:19772", "http://127.0.0.1", "http://user@127.0.0.1:19772"} {
 		if _, err := NewClient(endpoint, testToken); err == nil {

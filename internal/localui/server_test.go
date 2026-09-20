@@ -22,13 +22,22 @@ func (fakeApplication) State(context.Context) app.State {
 func (fakeApplication) Setup(context.Context, string, string) (app.SetupResult, error) {
 	return app.SetupResult{}, nil
 }
-func (fakeApplication) Unlock(context.Context, string) error { return nil }
-func (fakeApplication) Lock(context.Context) error           { return nil }
-func (fakeApplication) RecoveryPhrase() (string, error)      { return "word", nil }
+func (fakeApplication) Unlock(context.Context, string) error  { return nil }
+func (fakeApplication) Lock(context.Context) error            { return nil }
+func (fakeApplication) RecoveryPhrase(string) (string, error) { return "word", nil }
+func (fakeApplication) ImportRecovery(context.Context, string, string) (app.State, error) {
+	return app.State{Configured: true, Unlocked: true}, nil
+}
 func (fakeApplication) QDAYReceiveAddress(context.Context) (walletd.Address, error) {
 	return walletd.Address{Address: "qday1ptest"}, nil
 }
 func (fakeApplication) BitcoinReceiveAddress() (string, error) { return "bc1qtest", nil }
+func (fakeApplication) QuoteWithdrawal(context.Context, app.WithdrawalQuoteRequest) (app.WithdrawalQuote, error) {
+	return app.WithdrawalQuote{RequestID: "wallet-test", Asset: "QDAY", Amount: "1", Fee: "0.001", Total: "1.001"}, nil
+}
+func (fakeApplication) SendWithdrawal(context.Context, app.SendWithdrawalRequest) (app.WithdrawalResult, error) {
+	return app.WithdrawalResult{Asset: "QDAY", TransactionID: "abcdef", Status: "broadcast"}, nil
+}
 func (fakeApplication) Orders(context.Context, string, int) (relay.ResultPage, error) {
 	return relay.ResultPage{Items: []relay.Record{}, Page: 1, PageSize: 20}, nil
 }
@@ -106,6 +115,39 @@ func TestBootstrapSessionHostAndOriginProtection(t *testing.T) {
 	server.ServeHTTP(response, quoteRequest)
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"btcAmount":"0.000125"`) {
 		t.Fatalf("quote status=%d body=%q", response.Code, response.Body.String())
+	}
+
+	walletQuoteRequest := httptest.NewRequest(http.MethodPost, "http://"+host+"/api/v1/wallets/quote", strings.NewReader(`{"asset":"QDAY","destination":"qday1ptest","amount":"1"}`))
+	walletQuoteRequest.Host = host
+	walletQuoteRequest.Header.Set("Content-Type", "application/json")
+	walletQuoteRequest.Header.Set("Origin", "http://"+host)
+	walletQuoteRequest.AddCookie(cookie)
+	response = httptest.NewRecorder()
+	server.ServeHTTP(response, walletQuoteRequest)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"requestID":"wallet-test"`) {
+		t.Fatalf("wallet quote status=%d body=%q", response.Code, response.Body.String())
+	}
+
+	walletSendRequest := httptest.NewRequest(http.MethodPost, "http://"+host+"/api/v1/wallets/send", strings.NewReader(`{"requestID":"wallet-test","asset":"QDAY","destination":"qday1ptest","amountAtomic":"1","feeAtomic":"1","unitAtomic":"1"}`))
+	walletSendRequest.Host = host
+	walletSendRequest.Header.Set("Content-Type", "application/json")
+	walletSendRequest.Header.Set("Origin", "http://"+host)
+	walletSendRequest.AddCookie(cookie)
+	response = httptest.NewRecorder()
+	server.ServeHTTP(response, walletSendRequest)
+	if response.Code != http.StatusCreated || !strings.Contains(response.Body.String(), `"transactionID":"abcdef"`) {
+		t.Fatalf("wallet send status=%d body=%q", response.Code, response.Body.String())
+	}
+
+	recoveryRequest := httptest.NewRequest(http.MethodPost, "http://"+host+"/api/v1/recovery", strings.NewReader(`{"password":"correct horse battery staple"}`))
+	recoveryRequest.Host = host
+	recoveryRequest.Header.Set("Content-Type", "application/json")
+	recoveryRequest.Header.Set("Origin", "http://"+host)
+	recoveryRequest.AddCookie(cookie)
+	response = httptest.NewRecorder()
+	server.ServeHTTP(response, recoveryRequest)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"phrase":"word"`) {
+		t.Fatalf("recovery status=%d body=%q", response.Code, response.Body.String())
 	}
 
 	badOrigin := httptest.NewRequest(http.MethodPost, "http://"+host+"/api/v1/lock", strings.NewReader(`{}`))

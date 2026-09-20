@@ -33,6 +33,12 @@ signing key, plaintext contract message or spend authority. A peer-to-peer
 discovery mesh can replace this first relay when the market is large enough
 without changing the signed records.
 
+The local **Wallets** screen shows QDAY and Bitcoin balances, receive addresses
+and ordinary withdrawals. Partial sends and MAX both calculate the exact
+network fee before the user approves the final transaction. Recovery export
+requires the wallet password; recovery import atomically replaces both local
+wallets and is refused while a swap is active.
+
 QDAY uses its native SHA-256 hashlock policy with Ed25519 and SLH-DSA. Each
 external adapter locks its asset against the same 32-byte secret using that
 chain's native script, escrow or contract mechanism.

@@ -62,6 +62,7 @@ type Client struct {
 	lightClient *chain.NeutrinoClient
 	service     *neutrino.ChainService
 	network     string
+	paymentMu   sync.Mutex
 }
 
 func (c *Client) Status() (Status, error) {
