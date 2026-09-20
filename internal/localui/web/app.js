@@ -1179,22 +1179,45 @@ function swapDetailsHTML(details) {
   const progress = swapProgress(swap);
   const complete = swap.phase === 'complete';
   const terminal = ['complete', 'refunded', 'expired'].includes(swap.phase);
-  return `<section class="swap-detail-head">
-    <a href="#${terminal ? 'history' : 'swaps'}" class="back-link">← ALL ${terminal ? 'HISTORY' : 'ACTIVE SWAPS'}</a>
+  return `<section class="swap-detail-head" data-swap-detail="${escapeHTML(swap.id)}">
+    <a href="#${terminal ? 'history' : 'swaps'}" class="back-link" data-swap-live="back">← ALL ${terminal ? 'HISTORY' : 'ACTIVE SWAPS'}</a>
     <div><span class="side ${view.side}">${view.label}</span><span class="swap-id">SWAP ${escapeHTML(short(swap.id, 12, 10))}</span></div>
     <h1>${escapeHTML(swapTradeSummary(swap))}</h1>
-    <p>${complete ? 'Both claims are confirmed on-chain.' : 'The application continues each safe step automatically whenever either trader returns online.'}</p>
+    <p data-swap-live="head-copy">${complete ? 'Both claims are confirmed on-chain.' : 'The application continues each safe step automatically whenever either trader returns online.'}</p>
   </section>
-  <section class="swap-status-banner ${swap.lastError ? 'error' : complete ? 'complete' : ''}"><i></i><div><span>CURRENT STATUS</span><strong>${escapeHTML(swapStatus(swap))}</strong><small>${escapeHTML(progress.note)}</small></div><b>${complete ? 'COMPLETE' : swap.lastError ? 'ATTENTION' : 'RUNNING'}</b></section>
-  <section class="swap-summary">
+  <section class="swap-status-banner ${swap.lastError ? 'error' : complete ? 'complete' : ''}" data-swap-live="status"><i></i><div><span>CURRENT STATUS</span><strong>${escapeHTML(swapStatus(swap))}</strong><small>${escapeHTML(progress.note)}</small></div><b>${complete ? 'COMPLETE' : swap.lastError ? 'ATTENTION' : 'RUNNING'}</b></section>
+  <section class="swap-summary" data-swap-live="summary">
     <div><span>YOU SEND</span><strong>${escapeHTML(view.send)}</strong><small>Funding network fee is added by that wallet.</small></div>
     <div><span>YOU RECEIVE</span><strong>${escapeHTML(view.receive)}</strong><small>The receiving chain deducts its claim fee.</small></div>
     <div><span>FIXED RATE</span><strong>${escapeHTML(price)} BTC / QDAY</strong><small>Signed amounts cannot change.</small></div>
     <div><span>SAFETY REFUNDS</span><strong>${agreement ? `QDAY ${commas(agreement.qdayRefundHeight)} · BTC ${commas(agreement.bitcoinRefundHeight)}` : 'PREPARING'}</strong><small>${agreement ? 'If a trader disappears, each funded side retains its timed refund path.' : 'Refund heights appear after exact terms are verified.'}</small></div>
   </section>
-  ${swap.lastError ? `<div class="alert"><strong>Swap needs attention</strong>${escapeHTML(swap.lastError)}</div>` : ''}
-  <section class="card swap-timeline-card"><div class="card-head"><h2>ON-CHAIN PROGRESS</h2><span>LIVE FROM BOTH NETWORKS</span></div><div class="swap-timeline">${timelineHTML(swap, details)}</div></section>
-  <details class="swap-technical"><summary>TECHNICAL DETAILS</summary><div><span>TRADE ID</span><code>${escapeHTML(swap.id)}</code><span>SECRET HASH</span><code>${escapeHTML(swap.secretHash || 'Preparing')}</code><span>QDAY HEIGHT</span><code>${escapeHTML(commas(details.qdayHeight || '—'))}</code><span>BITCOIN HEIGHT</span><code>${escapeHTML(commas(details.bitcoinHeight || '—'))}</code></div></details>`;
+  <div data-swap-live="alert"${swap.lastError ? ' class="alert"' : ' hidden'}>${swap.lastError ? `<strong>Swap needs attention</strong>${escapeHTML(swap.lastError)}` : ''}</div>
+  <section class="card swap-timeline-card"><div class="card-head"><h2>ON-CHAIN PROGRESS</h2><span>LIVE FROM BOTH NETWORKS</span></div><div class="swap-timeline" data-swap-live="timeline">${timelineHTML(swap, details)}</div></section>
+  <details class="swap-technical"><summary>TECHNICAL DETAILS</summary><div><span>TRADE ID</span><code>${escapeHTML(swap.id)}</code><span>SECRET HASH</span><code>${escapeHTML(swap.secretHash || 'Preparing')}</code><span>QDAY HEIGHT</span><code data-swap-live="qday-height">${escapeHTML(commas(details.qdayHeight || '—'))}</code><span>BITCOIN HEIGHT</span><code data-swap-live="bitcoin-height">${escapeHTML(commas(details.bitcoinHeight || '—'))}</code></div></details>`;
+}
+
+function updateSwapDetails(details) {
+  const swapID = details.swap.id;
+  const current = root.querySelector('.swap-detail-head[data-swap-detail]');
+  const html = swapDetailsHTML(details);
+  if (!current || current.dataset.swapDetail !== swapID) {
+    root.innerHTML = html;
+    return;
+  }
+
+  const template = document.createElement('template');
+  template.innerHTML = html;
+  const replacements = [...template.content.querySelectorAll('[data-swap-live]')];
+  for (const replacement of replacements) {
+    const key = replacement.dataset.swapLive;
+    const existing = root.querySelector(`[data-swap-live="${key}"]`);
+    if (!existing) {
+      root.innerHTML = html;
+      return;
+    }
+    if (existing.outerHTML !== replacement.outerHTML) existing.replaceWith(replacement.cloneNode(true));
+  }
 }
 
 async function loadSwapDetails(swapID, showLoading = false) {
@@ -1203,9 +1226,13 @@ async function loadSwapDetails(swapID, showLoading = false) {
   try {
     const details = await api(`/api/v1/swaps/${encodeURIComponent(swapID)}`);
     if (request !== swapDetailsRequest || route() !== 'swap' || routeSwapID() !== swapID) return;
-    root.innerHTML = swapDetailsHTML(details);
+    updateSwapDetails(details);
   } catch (error) {
     if (request !== swapDetailsRequest || route() !== 'swap') return;
+    if (!showLoading && root.querySelector('.swap-detail-head[data-swap-detail]')) {
+      showToast(`Could not update swap: ${error.message}`);
+      return;
+    }
     root.innerHTML = `<section class="page-head"><div><span class="eyebrow">LOCAL JOURNAL</span><h1>SWAP UNAVAILABLE.</h1><p>${escapeHTML(error.message)}</p></div><a class="secondary" href="#swaps">BACK TO SWAPS</a></section>`;
   }
 }
@@ -1216,7 +1243,8 @@ function renderSwapDetails() {
     root.innerHTML = `<section class="page-head"><div><span class="eyebrow">LOCAL JOURNAL</span><h1>SWAP NOT FOUND.</h1><p>This identity has no local record for that trade.</p></div><a class="secondary" href="#swaps">BACK TO SWAPS</a></section>`;
     return;
   }
-  loadSwapDetails(swapID, true);
+  const current = root.querySelector('.swap-detail-head[data-swap-detail]');
+  loadSwapDetails(swapID, !current || current.dataset.swapDetail !== swapID);
 }
 
 function renderEmpty(title, copy, action = '') {
