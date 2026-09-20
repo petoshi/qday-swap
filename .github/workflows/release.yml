@@ -253,10 +253,13 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          notes_file="$RUNNER_TEMP/release-notes.md"
+          git for-each-ref --format='%(contents)' "refs/tags/${RELEASE_TAG}" > "$notes_file"
+          test -s "$notes_file"
           cd artifacts
           sha256sum QDAY-Swap-* > SHA256SUMS
           gh release create "$RELEASE_TAG" QDAY-Swap-* SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
-            --notes-from-tag \
+            --notes-file "$notes_file" \
             --title "QDAY Swap ${RELEASE_TAG}: HYBRID POST QUANTUM ATOMIC SWAPS"
