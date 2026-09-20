@@ -273,6 +273,9 @@ func (q *engineQDAY) ClaimSwap(_ context.Context, swapID string, request walletd
 	if output == nil || output.ID != request.OutputID {
 		return walletd.SwapAction{}, errors.New("unknown QDAY swap output")
 	}
+	if output.Status == "claimed" && q.chain.rejectConfirmedClaimRebroadcast {
+		return walletd.SwapAction{}, errors.New("atomic-swap output is not confirmed and unspent")
+	}
 	digest := sha256.Sum256([]byte("qday-claim:" + swapID))
 	height := q.chain.height
 	output.Status, output.RevealedSecret, output.SpendTransaction, output.SpendHeight = "claimed", request.Secret, hex.EncodeToString(digest[:]), &height
@@ -710,6 +713,47 @@ func TestEngineDoesNotRebroadcastObservedProxyClaim(t *testing.T) {
 		t.Fatal(err)
 	} else if record.Phase != swapstate.PhaseComplete || record.LastError != "" {
 		t.Fatalf("confirmed Bitcoin claim did not complete swap: %s (%s)", record.Phase, record.LastError)
+	}
+}
+
+func TestEngineCompletesObservedClaimsAfterMakerReturns(t *testing.T) {
+	trade := negotiateEngineTrade(t, "BTC", "0.0001", "1")
+	trade.qdayChain.rejectConfirmedClaimRebroadcast = true
+
+	// The maker publishes both deposits and then goes offline. The taker later
+	// claims Bitcoin and broadcasts the maker's portable QDAY claim, completing
+	// both chains while the maker journal still points at the earlier phase.
+	trade.maker.driveSwaps(context.Background())
+	trade.taker.lastRelaySync = time.Time{}
+	if err := trade.taker.syncRelay(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	trade.taker.driveSwaps(context.Background())
+	takerRecord, err := trade.taker.journal.Swap(trade.swapID)
+	if err != nil {
+		t.Fatal(err)
+	} else if takerRecord.Phase != swapstate.PhaseComplete {
+		t.Fatalf("taker did not complete the swap: %s (%s)", takerRecord.Phase, takerRecord.LastError)
+	}
+
+	makerRecord, err := trade.maker.journal.Swap(trade.swapID)
+	if err != nil {
+		t.Fatal(err)
+	} else if makerRecord.Phase != swapstate.PhaseAsyncTakerClaiming {
+		t.Fatalf("offline maker phase = %s, want %s", makerRecord.Phase, swapstate.PhaseAsyncTakerClaiming)
+	}
+	if _, err := trade.maker.journal.SetLastError(trade.swapID, "walletd returned HTTP 400: atomic-swap output is not confirmed and unspent", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+
+	// On return, the maker must recognize both confirmed claims and finish the
+	// journal without attempting to spend the already claimed QDAY output again.
+	trade.maker.driveSwaps(context.Background())
+	makerRecord, err = trade.maker.journal.Swap(trade.swapID)
+	if err != nil {
+		t.Fatal(err)
+	} else if makerRecord.Phase != swapstate.PhaseComplete || makerRecord.LastError != "" {
+		t.Fatalf("returning maker did not reconcile completed claims: %s (%s)", makerRecord.Phase, makerRecord.LastError)
 	}
 }
 

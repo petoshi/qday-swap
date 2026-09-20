@@ -455,6 +455,24 @@ func (s *Service) driveAsyncSwap(ctx context.Context, wallets engineWallets, jou
 				}
 				continue
 			}
+			// Either participant can broadcast the maker claim from its portable
+			// template. After a restart it may therefore already be on-chain even
+			// though this local journal never advanced past maker_claiming. Observe
+			// it before checking or spending the funding output: a confirmed claim
+			// has already consumed that output, so trying to claim it again is both
+			// unnecessary and rejected by walletd.
+			makerFound, makerConfirmed, _, err := observeClaimForRecord(ctx, wallets, record, agreement, swapprotocol.PartyMaker)
+			if err != nil {
+				return err
+			} else if makerFound {
+				if !makerConfirmed || !takerConfirmed {
+					return nil
+				}
+				if _, err := journal.Advance(record.ID, record.Phase, swapstate.PhaseComplete, time.Now().UTC()); err != nil {
+					return err
+				}
+				continue
+			}
 			takerFundingConfirmed, err := partyFundingConfirmedForRecord(ctx, wallets, record, agreement, swapprotocol.PartyTaker)
 			if err != nil {
 				return err
@@ -471,8 +489,8 @@ func (s *Service) driveAsyncSwap(ctx context.Context, wallets engineWallets, jou
 			} else if err := broadcastProxyMakerClaim(ctx, wallets, journal, record, agreement); err != nil {
 				return err
 			}
-			found, confirmed, _, err := observeClaimForRecord(ctx, wallets, record, agreement, swapprotocol.PartyMaker)
-			if err != nil || !found || !confirmed {
+			makerFound, makerConfirmed, _, err = observeClaimForRecord(ctx, wallets, record, agreement, swapprotocol.PartyMaker)
+			if err != nil || !makerFound || !makerConfirmed {
 				return err
 			}
 			if !takerConfirmed {
