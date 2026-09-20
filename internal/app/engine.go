@@ -56,7 +56,7 @@ type qdayAsyncSwapClient interface {
 
 type bitcoinSwapClient interface {
 	Status() (bitcoinwallet.Status, error)
-	WatchContract(bitcoin.Contract) error
+	WatchContract(context.Context, bitcoin.Contract, uint32) error
 	PrepareFunding(bitcoin.Contract) (bitcoin.Funding, error)
 	Broadcast(string) (bitcoinwallet.Transaction, error)
 	Transaction(string) (bitcoinwallet.Transaction, error)
@@ -721,11 +721,18 @@ func registerContracts(ctx context.Context, wallets engineWallets, record swapst
 	if err != nil {
 		return err
 	}
-	if err := wallets.bitcoin.WatchContract(contract); err != nil {
+	if err := wallets.bitcoin.WatchContract(ctx, contract, bitcoinContractWatchHeight(agreement)); err != nil {
 		return fmt.Errorf("watch Bitcoin contract: %w", err)
 	}
 	_ = local // Local keys are included in walletd's deterministic registration.
 	return nil
+}
+
+func bitcoinContractWatchHeight(agreement swapprotocol.Agreement) uint32 {
+	if agreement.Maker.BitcoinHeight < agreement.Taker.BitcoinHeight {
+		return agreement.Maker.BitcoinHeight
+	}
+	return agreement.Taker.BitcoinHeight
 }
 
 func bitcoinContract(agreement swapprotocol.Agreement) (bitcoin.Contract, error) {
@@ -946,6 +953,15 @@ func (s *Service) driveExecution(ctx context.Context, wallets engineWallets, jou
 		agreement, err := agreementFromRecord(record)
 		if err != nil {
 			return err
+		}
+		if record.Phase != swapstate.PhaseComplete && record.Phase != swapstate.PhaseRefunded && record.Phase != swapstate.PhaseExpired {
+			contract, contractErr := bitcoinContract(agreement)
+			if contractErr != nil {
+				return contractErr
+			}
+			if watchErr := wallets.bitcoin.WatchContract(ctx, contract, bitcoinContractWatchHeight(agreement)); watchErr != nil {
+				return fmt.Errorf("restore Bitcoin contract watch: %w", watchErr)
+			}
 		}
 		// Publishing an exact signed offer and explicitly accepting one are the
 		// two user authorizations for an automatic swap. By this point both

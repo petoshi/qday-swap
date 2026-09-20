@@ -1,6 +1,8 @@
 package bitcoinwallet
 
 import (
+	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -9,11 +11,15 @@ import (
 	"github.com/btcsuite/btcd/address/v2"
 	"github.com/btcsuite/btcd/btcutil/v2"
 	"github.com/btcsuite/btcd/chainhash/v2"
+	"github.com/btcsuite/btcd/rpcclient"
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet"
 	"github.com/btcsuite/btcwallet/walletdb"
+	"github.com/btcsuite/btcwallet/wtxmgr"
+	"github.com/lightninglabs/neutrino"
+	"github.com/lightninglabs/neutrino/headerfs"
 	"github.com/petoshi/qday-swap/internal/bitcoin"
 )
 
@@ -23,9 +29,18 @@ const (
 	// size, and can be made user-selectable without changing the protocol.
 	defaultFundingFeeRate = btcutil.Amount(10_000) // 10 sat/vB
 	waddrmgrNamespace     = "waddrmgr"
+	wtxmgrNamespace       = "wtxmgr"
 )
 
 var ErrTransactionNotFound = errors.New("Bitcoin transaction not found")
+
+const contractRescanSafetyBlocks = int32(6)
+
+type contractWatch struct {
+	startHeight int32
+	done        chan struct{}
+	err         error
+}
 
 // Transaction is the chain state needed by the swap engine. Raw is always the
 // canonical signed wire transaction, including witness data.
@@ -43,9 +58,11 @@ func (c *Client) requireSwapWallet() error {
 	return nil
 }
 
-// WatchContract imports the public P2WSH witness script and immediately adds
-// its address to the active Neutrino rescan. It is idempotent across restarts.
-func (c *Client) WatchContract(contract bitcoin.Contract) error {
+// WatchContract imports the public P2WSH witness script, adds its address to
+// the active Neutrino watch set, and scans from the height signed into the swap
+// agreement. The short historical scan is required when one trader funds the
+// contract while the other trader's application is offline.
+func (c *Client) WatchContract(ctx context.Context, contract bitcoin.Contract, agreementHeight uint32) error {
 	if err := c.requireSwapWallet(); err != nil {
 		return err
 	}
@@ -53,7 +70,42 @@ func (c *Client) WatchContract(contract bitcoin.Contract) error {
 	if err != nil {
 		return err
 	}
-	stamp := c.wallet.SyncedTo()
+	witnessHash := sha256.Sum256(witnessScript)
+	contractAddress, err := address.NewAddressWitnessScriptHash(witnessHash[:], c.wallet.ChainParams())
+	if err != nil {
+		return fmt.Errorf("derive Bitcoin swap address: %w", err)
+	}
+
+	chainTip := c.wallet.SyncedTo()
+	if chainTip.Height < 0 {
+		return errors.New("Bitcoin wallet has not reached the genesis block")
+	}
+	startHeight := chainTip.Height
+	if agreementHeight <= uint32(chainTip.Height) {
+		startHeight = int32(agreementHeight)
+	}
+	if startHeight > contractRescanSafetyBlocks {
+		startHeight -= contractRescanSafetyBlocks
+	} else {
+		startHeight = 0
+	}
+	watchID := hex.EncodeToString(witnessHash[:])
+	c.watchMu.Lock()
+	if existing := c.watches[watchID]; existing != nil && existing.startHeight <= startHeight {
+		c.watchMu.Unlock()
+		return waitForContractWatch(ctx, existing)
+	}
+	c.watchMu.Unlock()
+
+	blockHash, err := c.lightClient.GetBlockHash(int64(startHeight))
+	if err != nil {
+		return fmt.Errorf("find Bitcoin swap rescan block %d: %w", startHeight, err)
+	}
+	blockHeader, err := c.lightClient.GetBlockHeader(blockHash)
+	if err != nil {
+		return fmt.Errorf("read Bitcoin swap rescan block %d: %w", startHeight, err)
+	}
+	stamp := waddrmgr.BlockStamp{Hash: *blockHash, Height: startHeight, Timestamp: blockHeader.Timestamp}
 	err = walletdb.Update(c.wallet.Database(), func(tx walletdb.ReadWriteTx) error {
 		namespace := tx.ReadWriteBucket([]byte(waddrmgrNamespace))
 		if namespace == nil {
@@ -72,15 +124,126 @@ func (c *Client) WatchContract(contract bitcoin.Contract) error {
 	if err != nil {
 		return fmt.Errorf("watch Bitcoin swap contract: %w", err)
 	}
-	witnessHash := sha256.Sum256(witnessScript)
-	contractAddress, err := address.NewAddressWitnessScriptHash(witnessHash[:], c.wallet.ChainParams())
-	if err != nil {
-		return fmt.Errorf("derive Bitcoin swap address: %w", err)
-	}
 	if err := c.lightClient.NotifyReceived([]address.Address{contractAddress}); err != nil {
 		return fmt.Errorf("watch Bitcoin swap address: %w", err)
 	}
-	return nil
+
+	state := &contractWatch{startHeight: startHeight, done: make(chan struct{})}
+	c.watchMu.Lock()
+	if c.watches == nil {
+		c.watches = make(map[string]*contractWatch)
+	}
+	if existing := c.watches[watchID]; existing != nil && existing.startHeight <= startHeight {
+		c.watchMu.Unlock()
+		return waitForContractWatch(ctx, existing)
+	}
+	c.watches[watchID] = state
+	c.watchMu.Unlock()
+
+	go func() {
+		state.err = c.rescanContract(ctx, contractAddress, contract, stamp)
+		c.watchMu.Lock()
+		if state.err != nil && c.watches[watchID] == state {
+			delete(c.watches, watchID)
+		}
+		close(state.done)
+		c.watchMu.Unlock()
+	}()
+	return waitForContractWatch(ctx, state)
+}
+
+func (c *Client) rescanContract(ctx context.Context, contractAddress address.Address, contract bitcoin.Contract, start waddrmgr.BlockStamp) error {
+	end, err := c.service.BestBlock()
+	if err != nil {
+		return fmt.Errorf("read Bitcoin swap rescan tip: %w", err)
+	}
+	if end.Height <= start.Height {
+		return nil
+	}
+	pkScript, err := contract.PkScript()
+	if err != nil {
+		return err
+	}
+	var callbackErr error
+	quit := make(chan struct{})
+	rescan := neutrino.NewRescan(
+		&neutrino.RescanChainSource{ChainService: c.service},
+		neutrino.NotificationHandlers(rpcclient.NotificationHandlers{
+			OnFilteredBlockConnected: func(height int32, header *wire.BlockHeader, transactions []*btcutil.Tx) {
+				if callbackErr != nil {
+					return
+				}
+				block := wtxmgr.BlockMeta{
+					Block: wtxmgr.Block{Hash: header.BlockHash(), Height: height},
+					Time:  header.Timestamp,
+				}
+				for _, transaction := range transactions {
+					if err := c.storeContractTransaction(transaction.MsgTx(), block, pkScript); err != nil {
+						callbackErr = err
+						return
+					}
+				}
+			},
+		}),
+		neutrino.StartBlock(&headerfs.BlockStamp{Hash: start.Hash, Height: start.Height}),
+		neutrino.EndBlock(end),
+		neutrino.WatchAddrs(contractAddress),
+		neutrino.QuitChan(quit),
+	)
+	result := rescan.Start()
+	select {
+	case err := <-result:
+		if err != nil {
+			return err
+		}
+		if callbackErr != nil {
+			return callbackErr
+		}
+		return nil
+	case <-ctx.Done():
+		close(quit)
+		<-result
+		rescan.WaitForShutdown()
+		return ctx.Err()
+	}
+}
+
+func (c *Client) storeContractTransaction(transaction *wire.MsgTx, block wtxmgr.BlockMeta, contractScript []byte) error {
+	record, err := wtxmgr.NewTxRecordFromMsgTx(transaction, block.Time)
+	if err != nil {
+		return err
+	}
+	return walletdb.Update(c.wallet.Database(), func(tx walletdb.ReadWriteTx) error {
+		namespace := tx.ReadWriteBucket([]byte(wtxmgrNamespace))
+		if namespace == nil {
+			return errors.New("Bitcoin transaction manager database is unavailable")
+		}
+		exists, err := c.wallet.TxStore.InsertTxCheckIfExists(namespace, record, &block)
+		if err != nil || exists {
+			return err
+		}
+		for outputIndex, output := range record.MsgTx.TxOut {
+			if !bytes.Equal(output.PkScript, contractScript) {
+				continue
+			}
+			if err := c.wallet.TxStore.AddCredit(namespace, record, &block, uint32(outputIndex), false); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func waitForContractWatch(ctx context.Context, state *contractWatch) error {
+	select {
+	case <-state.done:
+		if state.err != nil {
+			return fmt.Errorf("rescan Bitcoin swap contract from block %d: %w", state.startHeight, state.err)
+		}
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("rescan Bitcoin swap contract from block %d: %w", state.startHeight, ctx.Err())
+	}
 }
 
 // PrepareFunding creates and signs the exact contract funding transaction.

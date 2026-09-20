@@ -80,6 +80,8 @@ type Client struct {
 	service     *neutrino.ChainService
 	network     string
 	paymentMu   sync.Mutex
+	watchMu     sync.Mutex
+	watches     map[string]*contractWatch
 }
 
 func (c *Client) Status() (Status, error) {

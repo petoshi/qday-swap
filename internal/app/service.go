@@ -963,7 +963,7 @@ func (s *Service) AcceptOffer(ctx context.Context, orderID string) (swapstate.Ne
 	bitcoinContract, err := bitcoinContract(agreement)
 	if err != nil {
 		return swapstate.Negotiation{}, err
-	} else if err := bitcoinAsync.WatchContract(bitcoinContract); err != nil {
+	} else if err := bitcoinAsync.WatchContract(ctx, bitcoinContract, bitcoinContractWatchHeight(agreement)); err != nil {
 		return swapstate.Negotiation{}, fmt.Errorf("watch asynchronous Bitcoin contract: %w", err)
 	}
 	var funding trade.FundingPackage

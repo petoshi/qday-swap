@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net"
@@ -18,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/btcsuite/btcd/address/v2"
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/petoshi/qday-swap/internal/bitcoin"
 	"github.com/petoshi/qday-swap/internal/walletroot"
@@ -176,6 +178,15 @@ func (n *regtestNode) receivedSatoshis(address string, confirmations int) int64 
 	return int64(math.Round(received * 100_000_000))
 }
 
+func (n *regtestNode) sendToAddress(address string, btc float64) string {
+	n.t.Helper()
+	var transactionID string
+	if err := n.call(true, &transactionID, "sendtoaddress", address, btc); err != nil {
+		n.t.Fatal(err)
+	}
+	return transactionID
+}
+
 func (n *regtestNode) close() {
 	if n.cmd != nil && n.cmd.Process != nil {
 		_ = n.call(false, nil, "stop")
@@ -256,11 +267,51 @@ func TestNeutrinoSwapFundingClaimRestartAndReorg(t *testing.T) {
 	secret := sha256.Sum256([]byte("neutrino swap integration secret"))
 	secretHash := sha256.Sum256(secret[:])
 	status, _ := client.Status()
+
+	// Reproduce an offline counterparty: the contract payment confirms before
+	// this wallet imports the P2WSH script. Registering the contract later must
+	// scan from the signed agreement height and recover the confirmed payment.
+	historicalSecretHash := sha256.Sum256([]byte("funded while counterparty was offline"))
+	historicalContract, err := bitcoin.NewContract(500_000, historicalSecretHash, recipientKey.PubKey().SerializeCompressed(), refundKey.PubKey().SerializeCompressed(), uint32(status.WalletHeight+20))
+	if err != nil {
+		t.Fatal(err)
+	}
+	historicalWitnessScript, err := historicalContract.WitnessScript()
+	if err != nil {
+		t.Fatal(err)
+	}
+	historicalWitnessHash := sha256.Sum256(historicalWitnessScript)
+	historicalAddress, err := address.NewAddressWitnessScriptHash(historicalWitnessHash[:], client.wallet.ChainParams())
+	if err != nil {
+		t.Fatal(err)
+	}
+	historicalStartHeight := uint32(status.WalletHeight)
+	historicalTransactionID := node.sendToAddress(historicalAddress.String(), 0.005)
+	node.mine(1, node.miningAddress())
+	waitFor(t, regtestWalletSyncTimeout, "wallet tip after offline contract funding", func() bool {
+		current, statusErr := client.Status()
+		return statusErr == nil && current.WalletHeight > status.WalletHeight
+	})
+	if _, lookupErr := client.Transaction(historicalTransactionID); !errors.Is(lookupErr, ErrTransactionNotFound) {
+		t.Fatalf("unwatched historical contract transaction was unexpectedly known: %v", lookupErr)
+	}
+	watchContext, watchCancel := context.WithTimeout(ctx, regtestWalletSyncTimeout)
+	if err := client.WatchContract(watchContext, historicalContract, historicalStartHeight); err != nil {
+		watchCancel()
+		t.Fatal(err)
+	}
+	watchCancel()
+	waitFor(t, regtestWalletSyncTimeout, "historical contract transaction recovery", func() bool {
+		transaction, lookupErr := client.Transaction(historicalTransactionID)
+		return lookupErr == nil && transaction.Confirmations >= 1
+	})
+
+	status, _ = client.Status()
 	contract, err := bitcoin.NewContract(1_000_000, secretHash, recipientKey.PubKey().SerializeCompressed(), refundKey.PubKey().SerializeCompressed(), uint32(status.WalletHeight+20))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := client.WatchContract(contract); err != nil {
+	if err := client.WatchContract(ctx, contract, uint32(status.WalletHeight)); err != nil {
 		t.Fatal(err)
 	}
 	funding, err := client.PrepareFunding(contract)

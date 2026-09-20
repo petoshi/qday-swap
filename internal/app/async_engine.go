@@ -96,7 +96,7 @@ func registerAsyncContracts(ctx context.Context, wallets engineWallets, record s
 	if err != nil {
 		return err
 	}
-	if err := wallets.bitcoin.WatchContract(contract); err != nil {
+	if err := wallets.bitcoin.WatchContract(ctx, contract, bitcoinContractWatchHeight(agreement)); err != nil {
 		return fmt.Errorf("watch asynchronous Bitcoin contract: %w", err)
 	}
 	return nil
@@ -260,6 +260,15 @@ func (s *Service) driveAsyncSwap(ctx context.Context, wallets engineWallets, jou
 			return err
 		} else if err := agreement.ValidateAsync(record.Order, record.Acceptance); err != nil {
 			return err
+		}
+		if record.Phase != swapstate.PhaseComplete && record.Phase != swapstate.PhaseRefunded && record.Phase != swapstate.PhaseExpired {
+			contract, contractErr := bitcoinContract(agreement)
+			if contractErr != nil {
+				return contractErr
+			}
+			if watchErr := wallets.bitcoin.WatchContract(ctx, contract, bitcoinContractWatchHeight(agreement)); watchErr != nil {
+				return fmt.Errorf("restore asynchronous Bitcoin contract watch: %w", watchErr)
+			}
 		}
 		if record.Phase != swapstate.PhaseComplete && record.Phase != swapstate.PhaseRefunded && record.Phase != swapstate.PhaseExpired {
 			refunding, err := s.maybeStartRefund(ctx, wallets, journal, record, agreement)

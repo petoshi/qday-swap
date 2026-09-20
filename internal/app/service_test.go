@@ -162,7 +162,7 @@ func (f *fakeBitcoin) SendPayment(destination string, satoshis, expectedFee int6
 	return bitcoinwallet.Payment{PaymentQuote: quote, TransactionID: "bitcoin-payment"}, nil
 }
 
-func (f *fakeBitcoin) WatchContract(bitcoin.Contract) error { return nil }
+func (f *fakeBitcoin) WatchContract(context.Context, bitcoin.Contract, uint32) error { return nil }
 
 func (f *fakeBitcoin) PrepareFunding(contract bitcoin.Contract) (bitcoin.Funding, error) {
 	pkScript, err := contract.PkScript()

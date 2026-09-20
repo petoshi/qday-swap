@@ -319,7 +319,7 @@ func (b *engineBitcoin) Lock()               { b.unlocked = false }
 func (b *engineBitcoin) ReceiveAddress() (string, error) {
 	return "bc1qtest", nil
 }
-func (b *engineBitcoin) WatchContract(contract bitcoin.Contract) error {
+func (b *engineBitcoin) WatchContract(_ context.Context, contract bitcoin.Contract, _ uint32) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.watched = append(b.watched, contract)
