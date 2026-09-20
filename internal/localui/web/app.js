@@ -920,7 +920,7 @@ function renderWallets() {
       <header><div><span class="eyebrow">01 / RECOVERY PHRASE</span><h2>RESTORE BOTH WALLETS.</h2></div><p>These 24 words restore QDAY, Native SegWit Bitcoin and your swap identity.</p></header>
       <div class="wallet-actions">
         <article><h3>EXPORT.</h3><p>Enter the wallet password, then reveal and copy all 24 words.</p><button class="secondary" id="export-recovery">EXPORT 24 WORDS</button></article>
-        <article><h3>IMPORT.</h3><p>Replace both local wallets and the local swap identity with another 24-word phrase.</p><button class="secondary" id="import-recovery">IMPORT NEW WALLET</button></article>
+        <article><h3>IMPORT.</h3><p>Replace both local wallets and the local swap identity with another 24-word phrase. Import scans both chains from genesis. QDAY usually finishes quickly; Bitcoin can take up to 30 minutes.</p><button class="secondary" id="import-recovery">IMPORT NEW WALLET</button></article>
       </div>
     </section>
     <section class="wallet-section asset-wallet">
@@ -1048,6 +1048,7 @@ function exportRecoveryModal() {
 function importRecoveryModal() {
   openModal(`<div class="modal-head"><span class="eyebrow">REPLACE LOCAL WALLETS</span><h2>IMPORT 24 WORDS.</h2></div><div class="modal-body">
     <p>This replaces the current QDAY wallet, Bitcoin wallet, swap identity and local swap history. The old wallet data is deleted after the new wallets open successfully.</p>
+    <p><strong>IMPORT RESCAN.</strong> Both chains are scanned from genesis. QDAY usually finishes quickly; Bitcoin can take up to 30 minutes.</p>
     <form id="import-recovery-form">
       <label class="field"><span>Recovery phrase</span><textarea name="phrase" required autocomplete="off" spellcheck="false" placeholder="Enter all 24 words in order"></textarea></label>
       <label class="field"><span>New wallet password</span><input name="password" type="password" minlength="12" required autocomplete="new-password"><small>At least 12 characters. This encrypts the imported wallets on this computer.</small></label>
