@@ -25,6 +25,7 @@ import (
 
 const (
 	engineInterval                    = 5 * time.Second
+	engineFailureDisplayAttempts      = 3
 	messageLifetime                   = 30 * 24 * time.Hour
 	minimumQDAYFundingWindowBlocks    = uint64(360)
 	minimumBitcoinFundingWindowBlocks = uint32(36)
@@ -75,7 +76,47 @@ type engineWallets struct {
 	root    walletroot.Root
 }
 
+type engineFailure struct {
+	message  string
+	attempts int
+}
+
 func (w *engineWallets) clear() { clear(w.root[:]) }
+
+// recordEngineResult keeps short-lived retry errors out of the user-facing
+// journal. Chain state can change between consecutive engine calls, so a
+// failed automatic attempt is only actionable when the same failure survives
+// several retries. A successful retry clears both the pending failure and any
+// previously displayed error immediately.
+func (s *Service) recordEngineResult(journal *swapstate.Journal, record swapstate.Swap, driveErr error) {
+	if driveErr == nil {
+		delete(s.engineFailures, record.ID)
+		if record.LastError != "" {
+			_, _ = journal.SetLastError(record.ID, "", time.Now().UTC())
+		}
+		return
+	}
+
+	message := driveErr.Error()
+	if record.LastError == message {
+		return
+	}
+	if record.LastError != "" {
+		_, _ = journal.SetLastError(record.ID, "", time.Now().UTC())
+	}
+	if s.engineFailures == nil {
+		s.engineFailures = make(map[string]engineFailure)
+	}
+	failure := s.engineFailures[record.ID]
+	if failure.message != message {
+		failure = engineFailure{message: message}
+	}
+	failure.attempts++
+	s.engineFailures[record.ID] = failure
+	if failure.attempts >= engineFailureDisplayAttempts {
+		_, _ = journal.SetLastError(record.ID, message, time.Now().UTC())
+	}
+}
 
 func (s *Service) startWorker() {
 	workerCtx, cancel := context.WithCancel(s.ctx)
@@ -405,11 +446,7 @@ func (s *Service) driveSwaps(ctx context.Context) {
 		return
 	}
 	for _, record := range records {
-		if err := s.driveSwap(ctx, wallets, journal, record); err != nil {
-			_, _ = journal.SetLastError(record.ID, err.Error(), time.Now().UTC())
-		} else if record.LastError != "" {
-			_, _ = journal.SetLastError(record.ID, "", time.Now().UTC())
-		}
+		s.recordEngineResult(journal, record, s.driveSwap(ctx, wallets, journal, record))
 	}
 }
 

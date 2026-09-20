@@ -144,6 +144,7 @@ type Service struct {
 	journal        *swapstate.Journal
 	root           *walletroot.Root
 	lastError      string
+	engineFailures map[string]engineFailure
 	withdrawals    map[string]withdrawalRecord
 }
 

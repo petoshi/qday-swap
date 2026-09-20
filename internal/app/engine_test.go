@@ -541,6 +541,38 @@ func runEngineTrade(t *testing.T, giveAsset, giveAmount, receiveAmount, makerQDA
 
 }
 
+func TestEngineOnlyReportsPersistentFailures(t *testing.T) {
+	trade := negotiateEngineTrade(t, "BTC", "0.0001", "1")
+	record, err := trade.maker.journal.Swap(trade.swapID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retryErr := errors.New("chain changed while signing; retry")
+	for attempt := 1; attempt <= engineFailureDisplayAttempts; attempt++ {
+		trade.maker.recordEngineResult(trade.maker.journal, record, retryErr)
+		current, err := trade.maker.journal.Swap(trade.swapID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if attempt < engineFailureDisplayAttempts && current.LastError != "" {
+			t.Fatalf("transient failure was shown after attempt %d: %q", attempt, current.LastError)
+		} else if attempt == engineFailureDisplayAttempts && current.LastError != retryErr.Error() {
+			t.Fatalf("persistent failure = %q, want %q", current.LastError, retryErr)
+		}
+	}
+	record, err = trade.maker.journal.Swap(trade.swapID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trade.maker.recordEngineResult(trade.maker.journal, record, nil)
+	record, err = trade.maker.journal.Swap(trade.swapID)
+	if err != nil {
+		t.Fatal(err)
+	} else if record.LastError != "" {
+		t.Fatalf("successful retry left error %q", record.LastError)
+	}
+}
+
 func TestEngineExecutesSignedTradeWithoutSecondApproval(t *testing.T) {
 	trade := negotiateEngineTrade(t, "QDAY", "1", "0.0001")
 	trade.maker.config.RequireSwapApproval = false
