@@ -14,7 +14,10 @@ import (
 	"github.com/petoshi/qday-swap/internal/walletd"
 )
 
-type fakeApplication struct{}
+type fakeApplication struct {
+	detailID         *string
+	notificationRead *string
+}
 
 func (fakeApplication) State(context.Context) app.State {
 	return app.State{Configured: true, Network: "mainnet"}
@@ -66,13 +69,27 @@ func (fakeApplication) ApproveSwap(string) (swapstate.Swap, error) {
 	return swapstate.Swap{Approved: true}, nil
 }
 func (fakeApplication) Negotiations() (app.Negotiations, error) {
-	return app.Negotiations{Pending: []swapstate.Negotiation{}, Incoming: []swapstate.Negotiation{}, Swaps: []swapstate.Swap{}}, nil
+	return app.Negotiations{Pending: []swapstate.Negotiation{}, Incoming: []swapstate.Negotiation{}, Swaps: []swapstate.Swap{}, NotificationReads: map[string]string{}}, nil
+}
+func (f fakeApplication) SwapDetails(_ context.Context, id string) (app.SwapDetails, error) {
+	if f.detailID != nil {
+		*f.detailID = id
+	}
+	return app.SwapDetails{Swap: swapstate.Swap{ID: id}, Transactions: []app.SwapTransaction{}}, nil
+}
+func (f fakeApplication) AcknowledgeSwapNotification(id, milestone string) error {
+	if f.notificationRead != nil {
+		*f.notificationRead = id + ":" + milestone
+	}
+	return nil
 }
 
 func TestBootstrapSessionHostAndOriginProtection(t *testing.T) {
 	const host = "127.0.0.1:42424"
+	var detailID, notificationRead string
+	application := fakeApplication{detailID: &detailID, notificationRead: &notificationRead}
 	shutdown := make(chan struct{}, 1)
-	server, err := New(fakeApplication{}, host, func() { shutdown <- struct{}{} })
+	server, err := New(application, host, func() { shutdown <- struct{}{} })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,6 +165,27 @@ func TestBootstrapSessionHostAndOriginProtection(t *testing.T) {
 	server.ServeHTTP(response, recoveryRequest)
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"phrase":"word"`) {
 		t.Fatalf("recovery status=%d body=%q", response.Code, response.Body.String())
+	}
+
+	swapID := strings.Repeat("a", 64)
+	detailRequest := httptest.NewRequest(http.MethodGet, "http://"+host+"/api/v1/swaps/"+swapID, nil)
+	detailRequest.Host = host
+	detailRequest.AddCookie(cookie)
+	response = httptest.NewRecorder()
+	server.ServeHTTP(response, detailRequest)
+	if response.Code != http.StatusOK || detailID != swapID || !strings.Contains(response.Body.String(), `"id":"`+swapID+`"`) {
+		t.Fatalf("swap detail status=%d id=%q body=%q", response.Code, detailID, response.Body.String())
+	}
+
+	notificationRequest := httptest.NewRequest(http.MethodPost, "http://"+host+"/api/v1/swaps/"+swapID+"/notification/read", strings.NewReader(`{"milestone":"both-funded"}`))
+	notificationRequest.Host = host
+	notificationRequest.Header.Set("Content-Type", "application/json")
+	notificationRequest.Header.Set("Origin", "http://"+host)
+	notificationRequest.AddCookie(cookie)
+	response = httptest.NewRecorder()
+	server.ServeHTTP(response, notificationRequest)
+	if response.Code != http.StatusOK || notificationRead != swapID+":both-funded" {
+		t.Fatalf("notification status=%d read=%q body=%q", response.Code, notificationRead, response.Body.String())
 	}
 
 	badOrigin := httptest.NewRequest(http.MethodPost, "http://"+host+"/api/v1/lock", strings.NewReader(`{}`))

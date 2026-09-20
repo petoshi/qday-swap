@@ -210,9 +210,31 @@ type OfferQuote struct {
 }
 
 type Negotiations struct {
-	Pending  []swapstate.Negotiation `json:"pending"`
-	Incoming []swapstate.Negotiation `json:"incoming"`
-	Swaps    []swapstate.Swap        `json:"swaps"`
+	Pending           []swapstate.Negotiation `json:"pending"`
+	Incoming          []swapstate.Negotiation `json:"incoming"`
+	Swaps             []swapstate.Swap        `json:"swaps"`
+	NotificationReads map[string]string       `json:"notificationReads"`
+}
+
+// SwapTransaction is the read-only chain evidence shown by the local
+// interface. It contains no wallet key material and cannot authorize a spend.
+type SwapTransaction struct {
+	Kind          string `json:"kind"`
+	Party         string `json:"party"`
+	Asset         string `json:"asset"`
+	TransactionID string `json:"transactionID"`
+	Status        string `json:"status"`
+	Confirmations uint64 `json:"confirmations"`
+	BlockHeight   uint64 `json:"blockHeight,omitempty"`
+	AmountAtomic  string `json:"amountAtomic,omitempty"`
+	FeeAtomic     string `json:"feeAtomic,omitempty"`
+}
+
+type SwapDetails struct {
+	Swap          swapstate.Swap    `json:"swap"`
+	Transactions  []SwapTransaction `json:"transactions"`
+	QDAYHeight    uint64            `json:"qdayHeight,omitempty"`
+	BitcoinHeight uint64            `json:"bitcoinHeight,omitempty"`
 }
 
 type SetupResult struct {
@@ -1092,7 +1114,21 @@ func (s *Service) Negotiations() (Negotiations, error) {
 		return Negotiations{}, err
 	}
 	swaps, err := journal.List()
-	return Negotiations{Pending: pending, Incoming: incoming, Swaps: swaps}, err
+	if err != nil {
+		return Negotiations{}, err
+	}
+	reads, err := journal.NotificationReads()
+	return Negotiations{Pending: pending, Incoming: incoming, Swaps: swaps, NotificationReads: reads}, err
+}
+
+func (s *Service) AcknowledgeSwapNotification(swapID, milestone string) error {
+	s.mu.RLock()
+	journal := s.journal
+	s.mu.RUnlock()
+	if journal == nil {
+		return errors.New("swap journal is unavailable")
+	}
+	return journal.SetNotificationRead(swapID, milestone)
 }
 
 func (s *Service) identities() (ed25519.PrivateKey, [32]byte, func(), error) {
@@ -1547,7 +1583,11 @@ func (s *Service) State(ctx context.Context) State {
 	if negotiations, err := s.Negotiations(); err == nil {
 		state.PendingTrades = len(negotiations.Pending)
 		state.IncomingTrades = len(negotiations.Incoming)
-		state.ActiveSwaps = len(negotiations.Swaps)
+		for _, record := range negotiations.Swaps {
+			if !terminalSwapPhase(record.Phase) {
+				state.ActiveSwaps++
+			}
+		}
 	} else if state.Configured {
 		state.RelayError = joinError(state.RelayError, err)
 	}

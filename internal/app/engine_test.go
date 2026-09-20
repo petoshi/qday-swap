@@ -620,6 +620,40 @@ func TestEngineCompletesWhenParticipantsReturnSequentially(t *testing.T) {
 	}
 }
 
+func TestSwapDetailsShowBothFundingAndClaimTransactions(t *testing.T) {
+	trade := negotiateEngineTrade(t, "QDAY", "1", "0.0001")
+	trade.maker.driveSwaps(context.Background())
+	trade.taker.lastRelaySync = time.Time{}
+	if err := trade.taker.syncRelay(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	trade.taker.driveSwaps(context.Background())
+
+	details, err := trade.taker.SwapDetails(context.Background(), trade.swapID)
+	if err != nil {
+		t.Fatal(err)
+	} else if details.Swap.Phase != swapstate.PhaseComplete {
+		t.Fatalf("detail phase = %s", details.Swap.Phase)
+	}
+	found := make(map[string]SwapTransaction)
+	for _, transaction := range details.Transactions {
+		found[transaction.Kind+":"+transaction.Party+":"+transaction.Asset] = transaction
+	}
+	for _, key := range []string{
+		"funding:taker:BTC",
+		"funding:maker:QDAY",
+		"claim:taker:QDAY",
+		"claim:maker:BTC",
+	} {
+		transaction, ok := found[key]
+		if !ok {
+			t.Fatalf("missing %s in %#v", key, details.Transactions)
+		} else if transaction.TransactionID == "" || transaction.Status != "confirmed" || transaction.Confirmations == 0 {
+			t.Fatalf("incomplete %s evidence: %#v", key, transaction)
+		}
+	}
+}
+
 func TestEngineRefundsEitherMakerAssetAndRecoversAfterReorg(t *testing.T) {
 	for _, test := range []struct {
 		name, giveAsset, giveAmount, receiveAmount string

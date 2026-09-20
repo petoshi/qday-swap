@@ -54,6 +54,8 @@ type Application interface {
 	MatchAcceptance(context.Context, string) (swapstate.Swap, error)
 	ApproveSwap(string) (swapstate.Swap, error)
 	Negotiations() (app.Negotiations, error)
+	SwapDetails(context.Context, string) (app.SwapDetails, error)
+	AcknowledgeSwapNotification(string, string) error
 }
 
 type Server struct {
@@ -371,6 +373,25 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, negotiations)
+	case r.Method == http.MethodGet && routeID(r.URL.Path, "/api/v1/swaps/", "") != "":
+		details, err := s.application.SwapDetails(r.Context(), routeID(r.URL.Path, "/api/v1/swaps/", ""))
+		if err != nil {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, details)
+	case r.Method == http.MethodPost && routeID(r.URL.Path, "/api/v1/swaps/", "/notification/read") != "":
+		var request struct {
+			Milestone string `json:"milestone"`
+		}
+		if !decode(w, r, &request) {
+			return
+		}
+		if err := s.application.AcknowledgeSwapNotification(routeID(r.URL.Path, "/api/v1/swaps/", "/notification/read"), request.Milestone); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "read"})
 	case r.Method == http.MethodPost && routeID(r.URL.Path, "/api/v1/acceptances/", "/match") != "":
 		var request struct{}
 		if !decode(w, r, &request) {

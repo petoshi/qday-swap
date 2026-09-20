@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"strconv"
 	"strings"
 	"time"
 
@@ -115,6 +116,278 @@ func (s *Service) engineWalletSnapshot() (engineWallets, *swapstate.Journal, err
 		return engineWallets{}, nil, errors.New("Bitcoin wallet does not support atomic swaps")
 	}
 	return engineWallets{qday: qday, bitcoin: bitcoinClient, root: *s.root}, s.journal, nil
+}
+
+// SwapDetails builds the role-aware, read-only chain evidence used by the
+// local progress screen. It never exposes wallet key material or asks either
+// wallet to sign or broadcast a transaction.
+func (s *Service) SwapDetails(ctx context.Context, swapID string) (SwapDetails, error) {
+	wallets, journal, err := s.engineWalletSnapshot()
+	if err != nil {
+		return SwapDetails{}, err
+	}
+	defer wallets.clear()
+	record, err := journal.Swap(swapID)
+	if err != nil {
+		return SwapDetails{}, err
+	}
+	details := SwapDetails{Swap: record, Transactions: []SwapTransaction{}}
+	if status, statusErr := wallets.qday.Status(ctx); statusErr == nil {
+		details.QDAYHeight = status.Height
+	}
+	if status, statusErr := wallets.bitcoin.Status(); statusErr == nil && status.WalletHeight > 0 {
+		details.BitcoinHeight = uint64(status.WalletHeight)
+	}
+
+	actions, err := journal.Actions(record.ID)
+	if err != nil {
+		return SwapDetails{}, err
+	}
+	var qdayView walletd.Swap
+	qdayAvailable := false
+	if view, viewErr := wallets.qday.Swap(ctx, localQDAYSwapID(record)); viewErr == nil {
+		qdayView, qdayAvailable = view, true
+		if view.Height > details.QDAYHeight {
+			details.QDAYHeight = view.Height
+		}
+	}
+
+	agreement, agreementErr := agreementFromRecord(record)
+	for _, party := range []string{swapprotocol.PartyTaker, swapprotocol.PartyMaker} {
+		notice, ok, noticeErr := fundingFromRecord(record, party)
+		if noticeErr != nil {
+			return SwapDetails{}, noticeErr
+		} else if !ok {
+			continue
+		}
+		transaction := SwapTransaction{
+			Kind: "funding", Party: party, Asset: notice.Asset, TransactionID: notice.TransactionID,
+			Status: "broadcast",
+		}
+		if agreementErr == nil {
+			if notice.Asset == "QDAY" {
+				transaction.AmountAtomic = agreement.QDAYAmountAtomic
+			} else {
+				transaction.AmountAtomic = strconv.FormatInt(agreement.BitcoinAmountSatoshi, 10)
+			}
+		}
+		if party == swapprotocol.PartyTaker && record.Version == trade.AsyncProtocolVersion && !record.TakerFundingSubmitted {
+			transaction.Status = "prepared"
+		}
+		if notice.Asset == "QDAY" && qdayAvailable {
+			for _, output := range qdayView.Outputs {
+				if output.FundingTransaction != notice.TransactionID {
+					continue
+				}
+				transaction.AmountAtomic = output.Value.Atomic
+				transaction.Confirmations = output.Confirmations
+				if output.FundingHeight != nil {
+					transaction.BlockHeight = *output.FundingHeight
+				}
+				transaction.Status = chainTransactionStatus(output.Confirmations)
+				break
+			}
+		} else if notice.Asset == "BTC" && transaction.Status != "prepared" {
+			if chainTransaction, lookupErr := wallets.bitcoin.Transaction(notice.TransactionID); lookupErr == nil {
+				transaction.Confirmations = positiveConfirmations(chainTransaction.Confirmations)
+				if chainTransaction.Height > 0 {
+					transaction.BlockHeight = uint64(chainTransaction.Height)
+				}
+				transaction.Status = chainTransactionStatus(transaction.Confirmations)
+			}
+		}
+		addSwapTransaction(&details.Transactions, transaction)
+	}
+
+	if qdayAvailable {
+		for _, output := range qdayView.Outputs {
+			if output.SpendTransaction == "" {
+				continue
+			}
+			funder := fundingParty(record, "QDAY", output.FundingTransaction)
+			if funder == "" {
+				continue
+			}
+			kind, party := "claim", oppositeParty(funder)
+			if output.Status == "refunded" {
+				kind, party = "refund", funder
+			}
+			transaction := SwapTransaction{
+				Kind: kind, Party: party, Asset: "QDAY", TransactionID: output.SpendTransaction,
+				Status: "broadcast",
+			}
+			if output.SpendHeight != nil {
+				transaction.BlockHeight = *output.SpendHeight
+				if qdayView.Height >= *output.SpendHeight {
+					transaction.Confirmations = qdayView.Height - *output.SpendHeight + 1
+				}
+				transaction.Status = "confirmed"
+			}
+			for _, action := range qdayView.Actions {
+				if action.TransactionID == transaction.TransactionID {
+					transaction.AmountAtomic = action.Amount.Atomic
+					transaction.FeeAtomic = action.Fee.Atomic
+					if action.Confirmations > transaction.Confirmations {
+						transaction.Confirmations = action.Confirmations
+					}
+					if action.BlockHeight != nil {
+						transaction.BlockHeight = *action.BlockHeight
+					}
+					transaction.Status = chainTransactionStatus(transaction.Confirmations)
+					break
+				}
+			}
+			addSwapTransaction(&details.Transactions, transaction)
+		}
+	}
+
+	if agreementErr == nil {
+		contract, contractErr := bitcoinContract(agreement)
+		for _, party := range []string{swapprotocol.PartyTaker, swapprotocol.PartyMaker} {
+			if contractErr != nil {
+				break
+			}
+			notice, ok, noticeErr := fundingFromRecord(record, party)
+			if noticeErr != nil {
+				return SwapDetails{}, noticeErr
+			} else if !ok || notice.Asset != "BTC" || notice.RawTransaction == "" {
+				continue
+			}
+			funding, fundingErr := contract.FundingFromRaw(notice.RawTransaction)
+			if fundingErr != nil {
+				continue
+			}
+			spend, spendErr := wallets.bitcoin.FindSpend(funding)
+			if spendErr != nil {
+				continue
+			}
+			kind, spender := "claim", oppositeParty(party)
+			if _, extractErr := contract.ExtractSecret(spend.Raw, funding); extractErr != nil {
+				if refund, refundErr := contract.IsRefund(spend.Raw, funding); refundErr != nil || !refund {
+					continue
+				}
+				kind, spender = "refund", party
+			}
+			transaction := SwapTransaction{
+				Kind: kind, Party: spender, Asset: "BTC", TransactionID: spend.ID,
+				Status:        chainTransactionStatus(positiveConfirmations(spend.Confirmations)),
+				Confirmations: positiveConfirmations(spend.Confirmations),
+			}
+			if spend.Height > 0 {
+				transaction.BlockHeight = uint64(spend.Height)
+			}
+			if decoded, decodeErr := bitcoin.DecodeTransaction(spend.Raw); decodeErr == nil {
+				var outputTotal int64
+				for _, output := range decoded.TxOut {
+					outputTotal += output.Value
+				}
+				transaction.AmountAtomic = strconv.FormatInt(outputTotal, 10)
+				if funding.Amount >= outputTotal {
+					transaction.FeeAtomic = strconv.FormatInt(funding.Amount-outputTotal, 10)
+				}
+			}
+			addSwapTransaction(&details.Transactions, transaction)
+		}
+	}
+
+	// Prepared actions make an upcoming on-chain step visible before it reaches
+	// either mempool. Observed chain transactions above always win.
+	for _, action := range actions {
+		kind, party := actionKindParty(action.Kind)
+		if kind == "" || party == "" {
+			continue
+		}
+		transaction := SwapTransaction{
+			Kind: kind, Party: party, Asset: strings.ToUpper(action.Chain), TransactionID: action.TransactionID,
+			Status: string(action.Status), BlockHeight: action.BlockHeight,
+		}
+		if action.Status == swapstate.ActionConfirmed {
+			transaction.Confirmations = 1
+		}
+		addSwapTransaction(&details.Transactions, transaction)
+	}
+	return details, nil
+}
+
+func chainTransactionStatus(confirmations uint64) string {
+	if confirmations > 0 {
+		return "confirmed"
+	}
+	return "broadcast"
+}
+
+func positiveConfirmations(confirmations int32) uint64 {
+	if confirmations > 0 {
+		return uint64(confirmations)
+	}
+	return 0
+}
+
+func fundingParty(record swapstate.Swap, asset, transactionID string) string {
+	for _, party := range []string{swapprotocol.PartyMaker, swapprotocol.PartyTaker} {
+		notice, ok, err := fundingFromRecord(record, party)
+		if err == nil && ok && notice.Asset == asset && notice.TransactionID == transactionID {
+			return party
+		}
+	}
+	return ""
+}
+
+func actionKindParty(kind string) (string, string) {
+	party := swapprotocol.PartyMaker
+	if strings.HasPrefix(kind, swapprotocol.PartyTaker+"-") {
+		party = swapprotocol.PartyTaker
+	} else if !strings.HasPrefix(kind, swapprotocol.PartyMaker+"-") {
+		return "", ""
+	}
+	if strings.Contains(kind, "funding") {
+		return "funding", party
+	} else if strings.Contains(kind, "claim") {
+		return "claim", party
+	} else if strings.Contains(kind, "refund") {
+		return "refund", party
+	}
+	return "", ""
+}
+
+func addSwapTransaction(transactions *[]SwapTransaction, next SwapTransaction) {
+	if next.TransactionID == "" {
+		return
+	}
+	for index, current := range *transactions {
+		if current.Kind != next.Kind || current.Party != next.Party || current.Asset != next.Asset {
+			continue
+		}
+		nextRank, currentRank := swapTransactionRank(next.Status), swapTransactionRank(current.Status)
+		if nextRank > currentRank || (nextRank == currentRank && next.Confirmations > current.Confirmations) {
+			(*transactions)[index] = next
+		} else {
+			if current.AmountAtomic == "" && next.AmountAtomic != "" {
+				(*transactions)[index].AmountAtomic = next.AmountAtomic
+			}
+			if current.FeeAtomic == "" && next.FeeAtomic != "" {
+				(*transactions)[index].FeeAtomic = next.FeeAtomic
+			}
+			if current.BlockHeight == 0 && next.BlockHeight != 0 {
+				(*transactions)[index].BlockHeight = next.BlockHeight
+			}
+		}
+		return
+	}
+	*transactions = append(*transactions, next)
+}
+
+func swapTransactionRank(status string) int {
+	switch status {
+	case "confirmed":
+		return 3
+	case "broadcast":
+		return 2
+	case "prepared":
+		return 1
+	default:
+		return 0
+	}
 }
 
 func (s *Service) driveSwaps(ctx context.Context) {

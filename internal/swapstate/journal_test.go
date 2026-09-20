@@ -218,6 +218,41 @@ func TestNegotiationsAndRelayCursorSurviveRestart(t *testing.T) {
 	}
 }
 
+func TestNotificationReadsSurviveRestart(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	signedOrder, acceptance, match := matchedFixture(t, now)
+	path := filepath.Join(t.TempDir(), "swaps.db")
+	journal, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, _, err := journal.Create(RoleMaker, signedOrder, acceptance, match, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.SetNotificationRead(record.ID, "first-funded"); err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.SetNotificationRead(record.ID, "not valid"); err == nil {
+		t.Fatal("invalid notification milestone was accepted")
+	}
+	if err := journal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	journal, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer journal.Close()
+	reads, err := journal.NotificationReads()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reads[record.ID] != "first-funded" {
+		t.Fatalf("notification read = %q", reads[record.ID])
+	}
+}
+
 func TestSwapTermsApprovalAndSecretAreDurable(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 	signedOrder, acceptance, match := matchedFixture(t, now)

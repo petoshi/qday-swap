@@ -4,6 +4,7 @@
 package swapstate
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -27,6 +28,7 @@ var (
 	relayMessagesBucket       = []byte("relay-messages")
 	metadataBucket            = []byte("metadata")
 	relayCursorKey            = []byte("relay-mailbox-cursor")
+	notificationReadPrefix    = []byte("notification-read:")
 
 	ErrNotFound       = errors.New("swap not found")
 	ErrPhaseChanged   = errors.New("swap phase changed")
@@ -350,6 +352,49 @@ func (j *Journal) SetRelayCursor(cursor uint64) error {
 		var encoded [8]byte
 		binary.BigEndian.PutUint64(encoded[:], cursor)
 		return bucket.Put(relayCursorKey, encoded[:])
+	})
+}
+
+// NotificationReads returns the last user-visible milestone opened for each
+// swap. Keeping this cursor beside the swap journal makes unread state survive
+// application and browser restarts without exposing it to the public relay.
+func (j *Journal) NotificationReads() (map[string]string, error) {
+	reads := make(map[string]string)
+	err := j.db.View(func(tx *bbolt.Tx) error {
+		return tx.Bucket(metadataBucket).ForEach(func(key, value []byte) error {
+			if !bytes.HasPrefix(key, notificationReadPrefix) {
+				return nil
+			}
+			id := string(bytes.TrimPrefix(key, notificationReadPrefix))
+			if id != "" && len(value) != 0 {
+				reads[id] = string(value)
+			}
+			return nil
+		})
+	})
+	return reads, err
+}
+
+// SetNotificationRead records a UI milestone as read. Milestones are compact
+// stable identifiers chosen by the local UI; transaction data and secrets are
+// never stored here.
+func (j *Journal) SetNotificationRead(swapID, milestone string) error {
+	if len(swapID) != 64 {
+		return errors.New("notification swap ID is invalid")
+	} else if len(milestone) == 0 || len(milestone) > 64 {
+		return errors.New("notification milestone is invalid")
+	}
+	for _, character := range milestone {
+		if (character < 'a' || character > 'z') && (character < '0' || character > '9') && character != '-' {
+			return errors.New("notification milestone is invalid")
+		}
+	}
+	if _, err := j.Swap(swapID); err != nil {
+		return err
+	}
+	key := append(append([]byte{}, notificationReadPrefix...), []byte(swapID)...)
+	return j.db.Update(func(tx *bbolt.Tx) error {
+		return tx.Bucket(metadataBucket).Put(key, []byte(milestone))
 	})
 }
 

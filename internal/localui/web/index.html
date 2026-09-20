@@ -22,7 +22,14 @@
       </div>
       <div class="runtime-actions">
         <div class="node-pill waiting" id="node-pill" hidden><i></i><span>STARTING</span></div>
-        <button class="exit-button" id="exit-app" type="button" title="Stop QDAY Swap and both local wallet services">
+        <div class="notification-center" id="notification-center" hidden>
+          <button class="notification-button" id="notification-button" type="button" aria-label="Swap notifications" aria-expanded="false">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4"/></svg>
+            <span id="notification-count" hidden>0</span>
+          </button>
+          <section class="notification-panel hidden" id="notification-panel" aria-label="Unread swap notifications"></section>
+        </div>
+        <button class="exit-button" id="exit-app" type="button" title="Stop QDAY Swap and both local wallet services" aria-label="Exit QDAY Swap">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2v10m6.36-6.36a9 9 0 1 1-12.72 0"/></svg>
           <span>EXIT QDAY SWAP</span>
         </button>

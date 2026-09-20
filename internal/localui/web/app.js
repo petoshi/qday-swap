@@ -7,6 +7,10 @@ const headerSwaps = document.querySelector('#header-swaps');
 const headerBitcoinUSD = document.querySelector('#header-btc-usd');
 const headerQDAYUSD = document.querySelector('#header-qday-usd');
 const exitButton = document.querySelector('#exit-app');
+const notificationCenter = document.querySelector('#notification-center');
+const notificationButton = document.querySelector('#notification-button');
+const notificationCount = document.querySelector('#notification-count');
+const notificationPanel = document.querySelector('#notification-panel');
 const modalBackdrop = document.querySelector('#modal-backdrop');
 const modal = document.querySelector('#modal');
 const toast = document.querySelector('#toast');
@@ -14,7 +18,7 @@ const toast = document.querySelector('#toast');
 let state;
 let orders = {items: [], page: 1, total: 0, totalPages: 0};
 let marketTrades = {items: [], total: 0};
-let negotiations = {pending: [], incoming: [], swaps: []};
+let negotiations = {pending: [], incoming: [], swaps: [], notificationReads: {}};
 let marketError = '';
 let setupMode = 'new';
 let toastTimer;
@@ -32,8 +36,8 @@ let selectedOrderID = '';
 let chartRange = 'ALL';
 let destroyChart = () => {};
 let applicationStopped = false;
-const seenSwapPhases = new Map();
-const queuedSwapUpdates = [];
+let notificationPanelOpen = false;
+let swapDetailsRequest = 0;
 
 const escapeHTML = value => String(value ?? '').replace(/[&<>'"]/g, character => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
@@ -58,45 +62,18 @@ function showToast(message) {
   toastTimer = setTimeout(() => toast.classList.remove('show'), 1800);
 }
 
-function closeModal(showQueuedSwap = true) {
+function closeModal() {
   clearTimeout(withdrawalQuoteTimer);
   withdrawalQuoteSequence += 1;
   pendingWithdrawalQuote = null;
   modal.textContent = '';
   modalBackdrop.classList.add('hidden');
-  if (showQueuedSwap) setTimeout(showNextSwapUpdate, 0);
 }
 
 function openModal(content) {
   modal.innerHTML = content;
   modalBackdrop.classList.remove('hidden');
   modal.querySelector('button, input')?.focus();
-}
-
-function queueSwapUpdates(swaps) {
-  for (const swap of swaps || []) {
-    const previous = seenSwapPhases.get(swap.id);
-    seenSwapPhases.set(swap.id, swap.phase);
-    if (previous === swap.phase) continue;
-    if (previous === undefined && ['complete', 'refunded', 'expired'].includes(swap.phase)) continue;
-    if (!queuedSwapUpdates.some(item => item.id === swap.id && item.phase === swap.phase)) queuedSwapUpdates.push(swap);
-  }
-  showNextSwapUpdate();
-}
-
-function showNextSwapUpdate() {
-  if (!state?.unlocked || !modalBackdrop.classList.contains('hidden') || !queuedSwapUpdates.length) return;
-  const swap = queuedSwapUpdates.shift();
-  const view = swapView(swap);
-  openModal(`<div class="modal-head"><span class="eyebrow">SWAP PROGRESS</span><h2>${escapeHTML(swapStatus(swap))}.</h2></div><div class="modal-body">
-    <div class="final-quote">
-      <div><span>YOU SEND</span><strong>${escapeHTML(view.send)}</strong></div>
-      <div><span>YOU RECEIVE</span><strong>${escapeHTML(view.receive)}</strong></div>
-    </div>
-    <p>${escapeHTML(swapStatusNote(swap))}</p>
-    ${swap.lastError ? `<p class="form-error dark">${escapeHTML(swap.lastError)}</p>` : ''}
-    <div class="modal-actions"><button class="secondary" id="close-modal">OK</button><button class="primary" data-open-swap-progress="${escapeHTML(swap.id)}">OPEN SWAP</button></div>
-  </div>`);
 }
 
 function commas(value) {
@@ -155,6 +132,91 @@ function formatUnitsExact(atomic, unit) {
 function amountText(amount, qdayUnit) {
   const unit = amount.asset === 'BTC' ? '100000000' : qdayUnit;
   return `${formatUnits(amount.atomic, unit, amount.asset === 'BTC' ? 8 : 4)} ${amount.asset}`;
+}
+
+function swapTradeSummary(swap) {
+  const terms = swap.order.order;
+  const qday = terms.give.asset === 'QDAY' ? terms.give : terms.receive;
+  const bitcoin = terms.give.asset === 'BTC' ? terms.give : terms.receive;
+  const buying = swapView(swap).side === 'buy';
+  return `${buying ? 'Bought' : 'Sold'} ${amountText(qday, terms.qdayUnitAtomic)} for ${amountText(bitcoin, terms.qdayUnitAtomic)}`;
+}
+
+function swapMilestone(swap) {
+  if (swap.lastError) return {key: `${swap.phase.replaceAll('_', '-')}-attention`, title: 'Swap needs attention'};
+  if (swap.phase === 'complete') return {key: 'complete', title: 'Swap complete'};
+  if (swap.phase === 'refunded') return {key: 'refunded', title: 'Deposit refunded'};
+  if (swap.phase === 'expired') return {key: 'expired', title: 'Swap expired safely'};
+  if (swap.phase === 'waiting_for_refund' || swap.phase === 'refunding') return {key: 'refunding', title: 'Refund in progress'};
+  const asynchronous = swap.version >= 2;
+  const stages = asynchronous ? {
+    matched: ['matched', 'Order matched'],
+    async_taker_funding: ['started', 'Swap started'],
+    async_taker_funded: ['first-funded', 'First deposit confirmed'],
+    async_maker_funding: ['first-funded', 'First deposit confirmed'],
+    async_maker_funded: ['both-funded', 'Both deposits confirmed'],
+    async_taker_claiming: ['both-funded', 'Both deposits confirmed'],
+    async_taker_claimed: ['first-claimed', 'First claim confirmed'],
+    async_maker_claiming: ['first-claimed', 'First claim confirmed']
+  } : {
+    matched: ['matched', 'Order matched'],
+    terms_proposed: ['matched', 'Order matched'],
+    terms_agreed: ['started', 'Swap started'],
+    maker_funding: ['started', 'Swap started'],
+    maker_funded: ['first-funded', 'First deposit confirmed'],
+    taker_funding: ['first-funded', 'First deposit confirmed'],
+    taker_funded: ['both-funded', 'Both deposits confirmed'],
+    maker_claiming: ['both-funded', 'Both deposits confirmed'],
+    maker_claimed: ['first-claimed', 'First claim confirmed'],
+    taker_claiming: ['first-claimed', 'First claim confirmed']
+  };
+  const stage = stages[swap.phase] || ['matched', 'Swap updated'];
+  return {key: stage[0], title: stage[1]};
+}
+
+function unreadNotifications() {
+  const reads = negotiations.notificationReads || {};
+  return (negotiations.swaps || []).map(swap => ({swap, milestone: swapMilestone(swap)}))
+    .filter(item => reads[item.swap.id] !== item.milestone.key)
+    .sort((left, right) => right.swap.updatedAt - left.swap.updatedAt);
+}
+
+function renderNotificationCenter() {
+  const available = Boolean(state?.configured && state?.unlocked);
+  notificationCenter.hidden = !available;
+  if (!available) {
+    notificationPanelOpen = false;
+    notificationPanel.classList.add('hidden');
+    notificationButton.setAttribute('aria-expanded', 'false');
+    return;
+  }
+  const unread = unreadNotifications();
+  notificationCount.textContent = String(unread.length);
+  notificationCount.hidden = unread.length === 0;
+  notificationButton.classList.toggle('unread', unread.length > 0);
+  notificationButton.title = unread.length ? `${unread.length} unread swap ${unread.length === 1 ? 'update' : 'updates'}` : 'No unread swap updates';
+  notificationPanel.innerHTML = `<header><div><span>NOTIFICATIONS</span><strong>${unread.length ? `${unread.length} UNREAD` : 'ALL CAUGHT UP'}</strong></div></header>${unread.length
+    ? `<div class="notification-list">${unread.map(({swap, milestone}) => `<button type="button" data-notification-swap="${escapeHTML(swap.id)}" data-notification-milestone="${escapeHTML(milestone.key)}"><i></i><span><strong>${escapeHTML(milestone.title)}</strong><small>${escapeHTML(swapTradeSummary(swap))}</small><time>${escapeHTML(new Date(swap.updatedAt * 1000).toLocaleString())} · ${escapeHTML(short(swap.id, 8, 6))}</time></span><b>OPEN →</b></button>`).join('')}</div>`
+    : '<div class="notification-empty">No unread swap updates.</div>'}`;
+  notificationPanel.classList.toggle('hidden', !notificationPanelOpen);
+  notificationButton.setAttribute('aria-expanded', String(notificationPanelOpen));
+}
+
+async function openSwapProgress(swapID, milestone = '') {
+  const swap = (negotiations.swaps || []).find(item => item.id === swapID);
+  const currentMilestone = milestone || (swap ? swapMilestone(swap).key : 'opened');
+  if (swap && (negotiations.notificationReads || {})[swapID] !== currentMilestone) {
+    try {
+      await post(`/api/v1/swaps/${encodeURIComponent(swapID)}/notification/read`, {milestone: currentMilestone});
+      negotiations.notificationReads ||= {};
+      negotiations.notificationReads[swapID] = currentMilestone;
+    } catch (error) {
+      showToast(error.message);
+    }
+  }
+  notificationPanelOpen = false;
+  renderNotificationCenter();
+  location.hash = `swap/${swapID}`;
 }
 
 function orderPrice(terms) {
@@ -283,13 +345,21 @@ function short(value, left = 8, right = 6) {
 }
 
 function route() {
-  const current = (location.hash.slice(1).split('?')[0] || 'market').replace(/[^a-z]/g, '');
+  const path = location.hash.slice(1).split('?')[0] || 'market';
+  if (/^swap\/[0-9a-f]{64}$/.test(path)) return 'swap';
+  const current = path.replace(/[^a-z]/g, '');
   return current === 'settings' ? 'wallets' : current;
+}
+
+function routeSwapID() {
+  const match = location.hash.slice(1).split('?')[0].match(/^swap\/([0-9a-f]{64})$/);
+  return match ? match[1] : '';
 }
 
 function updateChrome() {
   nav.hidden = !state?.configured || !state?.unlocked;
-  nav.querySelectorAll('a').forEach(link => link.classList.toggle('active', link.dataset.route === route()));
+  const activeRoute = route() === 'swap' ? 'swaps' : route();
+  nav.querySelectorAll('a').forEach(link => link.classList.toggle('active', link.dataset.route === activeRoute));
   nodePill.hidden = !state?.configured || !state?.unlocked;
   nodePill.classList.remove('waiting', 'error');
   const label = nodePill.querySelector('span');
@@ -322,6 +392,7 @@ function updateChrome() {
       ? `ONLINE · ${openOrders} ${openOrders === 1 ? 'ORDER' : 'ORDERS'} ACTIVE · PEERS: ${state.qday.connections} QDAY · ${state.bitcoin.peers} BITCOIN`
       : `PEERS: ${state.qday.connections} QDAY · ${state.bitcoin.peers} BITCOIN`;
   }
+  renderNotificationCenter();
 }
 
 function renderSetup() {
@@ -923,10 +994,12 @@ function swapTable(swaps) {
   if (!swaps.length) return `<section class="card"><div class="empty"><strong>NOTHING HERE YET.</strong><p>Matched swaps will appear here before either wallet broadcasts a contract.</p></div></section>`;
   return `<section class="card"><div class="card-head"><h2>Swaps</h2><span>${swaps.length}</span></div><div class="swap-list">${swaps.map(swap => {
     const view = swapView(swap);
+    const milestone = swapMilestone(swap);
+    const progress = swapProgress(swap);
     return `<article class="swap-row ${swap.lastError ? 'has-error' : ''}">
-      <div class="swap-main"><span class="side ${view.side}">${view.label}</span><strong>${escapeHTML(view.receive)}</strong><small>You send ${escapeHTML(view.send)}</small></div>
-      <div class="swap-progress"><b>${escapeHTML(swapStatus(swap))}</b><small>${escapeHTML(swapStatusNote(swap))}</small>${swap.lastError ? `<em>${escapeHTML(swap.lastError)}</em>` : ''}</div>
-      <div class="swap-actions"><button class="secondary" data-view-swap="${escapeHTML(swap.id)}">DETAILS</button></div>
+      <div class="swap-main"><span class="side ${view.side}">${view.label}</span><strong>${escapeHTML(swapTradeSummary(swap))}</strong><small>Swap ${escapeHTML(short(swap.id, 10, 8))}</small></div>
+      <div class="swap-progress"><b>${escapeHTML(milestone.title)}</b><div class="mini-progress" aria-label="${escapeHTML(`${progress.completed} of ${progress.total} stages complete`)}">${Array.from({length: progress.total}, (_, index) => `<i class="${index < progress.completed ? 'done' : index === progress.completed && progress.completed < progress.total ? 'active' : ''}"></i>`).join('')}</div><small>${escapeHTML(progress.note)}</small>${swap.lastError ? `<em>${escapeHTML(swap.lastError)}</em>` : ''}</div>
+      <div class="swap-actions"><button class="primary" data-view-swap="${escapeHTML(swap.id)}">VIEW PROGRESS</button></div>
     </article>`;
   }).join('')}</div></section>`;
 }
@@ -944,31 +1017,7 @@ function swapView(swap) {
 }
 
 function swapStatus(swap) {
-  const localMaker = swap.role === 'maker';
-  return ({
-    matched: 'Preparing secure swap',
-    terms_proposed: 'Verifying exact terms',
-    terms_agreed: 'Waiting for the other trader',
-    maker_funding: localMaker ? 'Sending your deposit' : 'Waiting for maker deposit',
-    maker_funded: localMaker ? 'Your deposit is secured' : 'Preparing your deposit',
-    taker_funding: localMaker ? 'Waiting for taker deposit' : 'Sending your deposit',
-    taker_funded: 'Both deposits secured',
-    maker_claiming: localMaker ? 'Claiming your coins' : 'Other trader is claiming',
-    maker_claimed: localMaker ? 'Waiting for final claim' : 'Your coins are ready to claim',
-    taker_claiming: localMaker ? 'Other trader is claiming' : 'Claiming your coins',
-    async_taker_funding: localMaker ? 'Securing taker deposit' : 'Publishing your prepared deposit',
-    async_taker_funded: 'Taker deposit secured',
-    async_maker_funding: localMaker ? 'Sending your deposit' : 'Waiting for maker deposit',
-    async_maker_funded: 'Both deposits secured',
-    async_taker_claiming: localMaker ? 'Waiting for taker claim' : 'Completing both claims',
-    async_taker_claimed: 'Secret revealed on-chain',
-    async_maker_claiming: localMaker ? 'Claiming your coins' : 'Completing maker claim',
-    complete: 'Swap complete',
-    waiting_for_refund: 'Refund window reached',
-    refunding: 'Returning your deposit',
-    refunded: 'Deposit refunded',
-    expired: 'Swap expired safely'
-  })[swap.phase] || swap.phase.replaceAll('_', ' ');
+  return swapMilestone(swap).title;
 }
 
 function swapStatusNote(swap) {
@@ -983,25 +1032,191 @@ function parseAgreement(swap) {
   try { return JSON.parse(swap.agreementJSON || ''); } catch (_) { return null; }
 }
 
-function swapDetailsModal(swap) {
+function partyTradingRole(swap, party) {
+  const makerSellsQDAY = swap.order.order.give.asset === 'QDAY';
+  if (party === 'maker') return makerSellsQDAY ? 'Seller' : 'Buyer';
+  return makerSellsQDAY ? 'Buyer' : 'Seller';
+}
+
+function partySubject(swap, party) {
+  return swap.role === party ? 'You' : partyTradingRole(swap, party);
+}
+
+function partyPossessive(swap, party) {
+  const subject = partySubject(swap, party);
+  return subject === 'You' ? 'Your' : `${subject}'s`;
+}
+
+function assetName(asset) {
+  return asset === 'BTC' ? 'Bitcoin' : 'QDAY';
+}
+
+function swapProgress(swap) {
+  const asynchronous = swap.version >= 2;
+  const completed = asynchronous ? ({
+    matched: 1,
+    async_taker_funding: 1,
+    async_taker_funded: 2,
+    async_maker_funding: 2,
+    async_maker_funded: 3,
+    async_taker_claiming: 3,
+    async_taker_claimed: 4,
+    async_maker_claiming: 4,
+    complete: 5,
+    refunded: 5,
+    expired: 5
+  })[swap.phase] : ({
+    matched: 1,
+    terms_proposed: 1,
+    terms_agreed: 1,
+    maker_funding: 1,
+    maker_funded: 2,
+    taker_funding: 2,
+    taker_funded: 3,
+    maker_claiming: 3,
+    maker_claimed: 4,
+    taker_claiming: 4,
+    complete: 5,
+    refunded: 5,
+    expired: 5
+  })[swap.phase];
+  const safeCompleted = Number.isFinite(completed) ? completed : 1;
+  return {
+    completed: safeCompleted,
+    total: 5,
+    note: safeCompleted >= 5 ? swapStatusNote(swap) : `Stage ${safeCompleted + 1} of 5 continues automatically.`
+  };
+}
+
+function transactionFor(transactions, kind, party) {
+  return (transactions || []).find(transaction => transaction.kind === kind && transaction.party === party);
+}
+
+function transactionURL(transaction) {
+  if (!transaction?.transactionID || transaction.status === 'prepared') return '';
+  return transaction.asset === 'BTC'
+    ? `https://mempool.space/tx/${encodeURIComponent(transaction.transactionID)}`
+    : `https://explorer.pqday.com/transaction/${encodeURIComponent(transaction.transactionID)}`;
+}
+
+function transactionAmount(transaction, qdayUnit) {
+  if (!transaction?.amountAtomic) return '';
+  const unit = transaction.asset === 'BTC' ? '100000000' : qdayUnit;
+  return `${formatUnits(transaction.amountAtomic, unit, transaction.asset === 'BTC' ? 8 : 4)} ${transaction.asset}`;
+}
+
+function transactionState(transaction, active) {
+  if (!transaction) return active ? 'Waiting for the automatic next step.' : 'Starts automatically after the previous step.';
+  if (transaction.status === 'confirmed') {
+    const confirmations = Number(transaction.confirmations || 0);
+    const block = transaction.blockHeight ? ` · block ${commas(transaction.blockHeight)}` : '';
+    return `Confirmed${confirmations ? ` · ${confirmations} ${confirmations === 1 ? 'confirmation' : 'confirmations'}` : ''}${block}`;
+  }
+  if (transaction.status === 'broadcast') return 'Broadcast to the network · awaiting confirmation.';
+  return 'Signed locally · waiting to be broadcast automatically.';
+}
+
+function timelineLabel(swap, step, transaction) {
+  if (step.kind === 'matched') return 'Order matched and exact amounts signed';
+  const amount = transactionAmount(transaction, swap.order.order.qdayUnitAtomic);
+  if (step.kind === 'funding') return `${partyPossessive(swap, step.party)} ${assetName(step.asset)} deposit${amount ? ` · ${amount}` : ''}`;
+  if (step.kind === 'refund') return `${partyPossessive(swap, step.party)} ${assetName(step.asset)} deposit returned${amount ? ` · ${amount}` : ''}`;
+  const subject = partySubject(swap, step.party);
+  return `${subject} ${subject === 'You' ? 'receive' : 'receives'} ${amount || assetName(step.asset)}`;
+}
+
+function swapTimeline(swap, transactions) {
+  const terms = swap.order.order;
+  const makerAsset = terms.give.asset;
+  const takerAsset = terms.receive.asset;
+  const chainSteps = swap.version >= 2 ? [
+    {kind: 'funding', party: 'taker', asset: takerAsset},
+    {kind: 'funding', party: 'maker', asset: makerAsset},
+    {kind: 'claim', party: 'taker', asset: makerAsset},
+    {kind: 'claim', party: 'maker', asset: takerAsset}
+  ] : [
+    {kind: 'funding', party: 'maker', asset: makerAsset},
+    {kind: 'funding', party: 'taker', asset: takerAsset},
+    {kind: 'claim', party: 'maker', asset: takerAsset},
+    {kind: 'claim', party: 'taker', asset: makerAsset}
+  ];
+  const fallbackCompleted = Math.max(0, swapProgress(swap).completed - 1);
+  let waitingFound = false;
+  const steps = [{kind: 'matched', complete: true, active: false, label: 'Order matched and exact amounts signed', state: `Trade ${short(swap.id, 12, 10)}`}];
+  chainSteps.forEach((step, index) => {
+    const transaction = transactionFor(transactions, step.kind, step.party);
+    const complete = transaction?.status === 'confirmed' || index < fallbackCompleted;
+    const active = !complete && !waitingFound;
+    if (!complete) waitingFound = true;
+    steps.push({...step, transaction, complete, active, label: timelineLabel(swap, step, transaction), state: transactionState(transaction, active)});
+  });
+  const refund = (transactions || []).find(transaction => transaction.kind === 'refund');
+  if (refund) {
+    const step = {kind: 'refund', party: refund.party, asset: refund.asset};
+    steps.push({...step, transaction: refund, complete: refund.status === 'confirmed', active: refund.status !== 'confirmed', label: timelineLabel(swap, step, refund), state: transactionState(refund, refund.status !== 'confirmed')});
+  }
+  return steps;
+}
+
+function timelineHTML(swap, details) {
+  return swapTimeline(swap, details.transactions).map((step, index) => {
+    const url = transactionURL(step.transaction);
+    const stateClass = step.complete ? 'complete' : step.active ? 'active' : 'upcoming';
+    return `<article class="timeline-step ${stateClass}">
+      <div class="timeline-marker">${step.complete ? '<span>✓</span>' : step.active ? '<i></i>' : `<span>${index + 1}</span>`}</div>
+      <div class="timeline-copy"><span>STAGE ${String(index + 1).padStart(2, '0')}</span><h3>${escapeHTML(step.label)}</h3><p>${escapeHTML(step.state)}</p>${step.transaction?.transactionID ? `<code>${escapeHTML(step.transaction.transactionID)}</code>` : ''}</div>
+      <div class="timeline-action">${url ? `<a class="secondary" href="${url}" target="_blank" rel="noreferrer">VIEW ON ${step.transaction.asset === 'BTC' ? 'MEMPOOL.SPACE' : 'QDAY EXPLORER'} ↗</a>` : step.active ? '<b>IN PROGRESS</b>' : ''}</div>
+    </article>`;
+  }).join('');
+}
+
+function swapDetailsHTML(details) {
+  const swap = details.swap;
   const terms = swap.order.order;
   const view = swapView(swap);
   const agreement = parseAgreement(swap);
   const price = orderPrice(terms);
-  const refund = agreement
-    ? `<div><span>SAFETY REFUNDS</span><strong>QDAY block ${commas(agreement.qdayRefundHeight)}<br>Bitcoin block ${commas(agreement.bitcoinRefundHeight)}</strong><small>If the other trader disappears, your funded contract returns after its chain deadline.</small></div>`
-    : `<div><span>SAFETY REFUNDS</span><strong>Preparing…</strong><small>Both absolute refund heights are verified before funding.</small></div>`;
-  openModal(`<div class="modal-head"><span class="eyebrow">ATOMIC SWAP</span><h2>${escapeHTML(swapStatus(swap))}</h2></div><div class="modal-body">
-    <div class="final-quote swap-review-grid">
-      <div><span>YOU SEND</span><strong>${escapeHTML(view.send)}</strong><small>Plus that chain's normal network fee</small></div>
-      <div><span>YOU RECEIVE</span><strong>${escapeHTML(view.receive)}</strong><small>Claim fee is deducted by the receiving chain</small></div>
-      <div><span>FIXED RATE</span><strong>${escapeHTML(price)} BTC / QDAY</strong><small>The signed amounts cannot change.</small></div>
-      ${refund}
-    </div>
-    <div class="swap-safety"><b>NONCUSTODIAL.</b><span>Your app signs locally. Neither the relay nor the other trader can take both deposits. You may close QDAY Swap; exact prepared transactions, claim templates and progress remain in the local journal and resume when either side returns.</span></div>
-    ${swap.lastError ? `<p class="form-error dark">${escapeHTML(swap.lastError)}</p>` : ''}
-    <div class="modal-actions"><button class="primary" id="close-modal">CLOSE</button></div>
-  </div>`);
+  const progress = swapProgress(swap);
+  const complete = swap.phase === 'complete';
+  const terminal = ['complete', 'refunded', 'expired'].includes(swap.phase);
+  return `<section class="swap-detail-head">
+    <a href="#${terminal ? 'history' : 'swaps'}" class="back-link">← ALL ${terminal ? 'HISTORY' : 'ACTIVE SWAPS'}</a>
+    <div><span class="side ${view.side}">${view.label}</span><span class="swap-id">SWAP ${escapeHTML(short(swap.id, 12, 10))}</span></div>
+    <h1>${escapeHTML(swapTradeSummary(swap))}</h1>
+    <p>${complete ? 'Both claims are confirmed on-chain.' : 'The application continues each safe step automatically whenever either trader returns online.'}</p>
+  </section>
+  <section class="swap-status-banner ${swap.lastError ? 'error' : complete ? 'complete' : ''}"><i></i><div><span>CURRENT STATUS</span><strong>${escapeHTML(swapStatus(swap))}</strong><small>${escapeHTML(progress.note)}</small></div><b>${complete ? 'COMPLETE' : swap.lastError ? 'ATTENTION' : 'RUNNING'}</b></section>
+  <section class="swap-summary">
+    <div><span>YOU SEND</span><strong>${escapeHTML(view.send)}</strong><small>Funding network fee is added by that wallet.</small></div>
+    <div><span>YOU RECEIVE</span><strong>${escapeHTML(view.receive)}</strong><small>The receiving chain deducts its claim fee.</small></div>
+    <div><span>FIXED RATE</span><strong>${escapeHTML(price)} BTC / QDAY</strong><small>Signed amounts cannot change.</small></div>
+    <div><span>SAFETY REFUNDS</span><strong>${agreement ? `QDAY ${commas(agreement.qdayRefundHeight)} · BTC ${commas(agreement.bitcoinRefundHeight)}` : 'PREPARING'}</strong><small>${agreement ? 'If a trader disappears, each funded side retains its timed refund path.' : 'Refund heights appear after exact terms are verified.'}</small></div>
+  </section>
+  ${swap.lastError ? `<div class="alert"><strong>Swap needs attention</strong>${escapeHTML(swap.lastError)}</div>` : ''}
+  <section class="card swap-timeline-card"><div class="card-head"><h2>ON-CHAIN PROGRESS</h2><span>LIVE FROM BOTH NETWORKS</span></div><div class="swap-timeline">${timelineHTML(swap, details)}</div></section>
+  <details class="swap-technical"><summary>TECHNICAL DETAILS</summary><div><span>TRADE ID</span><code>${escapeHTML(swap.id)}</code><span>SECRET HASH</span><code>${escapeHTML(swap.secretHash || 'Preparing')}</code><span>QDAY HEIGHT</span><code>${escapeHTML(commas(details.qdayHeight || '—'))}</code><span>BITCOIN HEIGHT</span><code>${escapeHTML(commas(details.bitcoinHeight || '—'))}</code></div></details>`;
+}
+
+async function loadSwapDetails(swapID, showLoading = false) {
+  const request = ++swapDetailsRequest;
+  if (showLoading) root.innerHTML = `<section class="loading"><p><b>$</b> loading on-chain swap progress<span class="terminal-cursor">_</span></p></section>`;
+  try {
+    const details = await api(`/api/v1/swaps/${encodeURIComponent(swapID)}`);
+    if (request !== swapDetailsRequest || route() !== 'swap' || routeSwapID() !== swapID) return;
+    root.innerHTML = swapDetailsHTML(details);
+  } catch (error) {
+    if (request !== swapDetailsRequest || route() !== 'swap') return;
+    root.innerHTML = `<section class="page-head"><div><span class="eyebrow">LOCAL JOURNAL</span><h1>SWAP UNAVAILABLE.</h1><p>${escapeHTML(error.message)}</p></div><a class="secondary" href="#swaps">BACK TO SWAPS</a></section>`;
+  }
+}
+
+function renderSwapDetails() {
+  const swapID = routeSwapID();
+  if (!swapID || !(negotiations.swaps || []).some(swap => swap.id === swapID)) {
+    root.innerHTML = `<section class="page-head"><div><span class="eyebrow">LOCAL JOURNAL</span><h1>SWAP NOT FOUND.</h1><p>This identity has no local record for that trade.</p></div><a class="secondary" href="#swaps">BACK TO SWAPS</a></section>`;
+    return;
+  }
+  loadSwapDetails(swapID, true);
 }
 
 function renderEmpty(title, copy, action = '') {
@@ -1055,6 +1270,7 @@ function currentFingerprint() {
   if (current === 'create') return JSON.stringify({current, funds: state.funds, side: offerSide});
   if (current === 'wallets') return JSON.stringify({current, error: state.error, qday: state.qday, bitcoin: state.bitcoin, balance: state.balance, bitcoinBalance: state.bitcoinBalance, funds: state.funds});
   if (current === 'swaps' || current === 'history') return JSON.stringify({current, negotiations, relayError: state.relayError});
+  if (current === 'swap') return JSON.stringify({current, id: routeSwapID(), negotiations, qdayHeight: state.qday?.height, bitcoinHeight: state.bitcoin?.walletHeight, relayError: state.relayError});
   return JSON.stringify({
     current: 'market', orders, marketTrades, offerSide, selectedOrderID,
     balance: state.balance, bitcoinBalance: state.bitcoinBalance, funds: state.funds,
@@ -1078,6 +1294,7 @@ function render() {
         case 'create': renderCreate(); break;
         case 'swaps': renderSwaps(); break;
         case 'history': renderSwaps(true); break;
+        case 'swap': renderSwapDetails(); break;
         case 'wallets': renderWallets(); break;
         default: renderMarket();
       }
@@ -1099,7 +1316,6 @@ async function refreshState() {
       else marketError = orderResult.reason.message;
       if (negotiationResult.status === 'fulfilled') {
         negotiations = negotiationResult.value;
-        queueSwapUpdates(negotiations.swaps);
       }
       else marketError = marketError || negotiationResult.reason.message;
       if (tradeResult.status === 'fulfilled') marketTrades = tradeResult.value;
@@ -1120,6 +1336,8 @@ function showStopped() {
   destroyChart = () => {};
   closeModal();
   nav.hidden = true;
+  notificationCenter.hidden = true;
+  notificationPanelOpen = false;
   nodePill.classList.remove('waiting', 'error');
   nodePill.classList.add('error');
   nodePill.querySelector('span').textContent = 'STOPPED';
@@ -1311,8 +1529,6 @@ function withdrawalSent(result) {
 document.addEventListener('click', async event => {
   if (event.target.closest('#exit-app')) {
     if (applicationStopped || exitButton.disabled) return;
-    const openOrders = state?.funds?.openOrders || 0;
-    if (openOrders && !confirm(`QDAY Swap has ${openOrders} open ${openOrders === 1 ? 'order' : 'orders'}. Exiting makes them unavailable until you run and unlock QDAY Swap again. Exit anyway?`)) return;
     exitButton.disabled = true;
     exitButton.querySelector('span').textContent = 'STOPPING…';
     try {
@@ -1323,6 +1539,16 @@ document.addEventListener('click', async event => {
       exitButton.querySelector('span').textContent = 'EXIT QDAY SWAP';
       showToast(error.message);
     }
+    return;
+  }
+  if (event.target.closest('#notification-button')) {
+    notificationPanelOpen = !notificationPanelOpen;
+    renderNotificationCenter();
+    return;
+  }
+  const notification = event.target.closest('[data-notification-swap]');
+  if (notification) {
+    await openSwapProgress(notification.dataset.notificationSwap, notification.dataset.notificationMilestone);
     return;
   }
   if (event.target.closest('#close-modal')) {
@@ -1434,8 +1660,6 @@ document.addEventListener('click', async event => {
     return;
   }
   if (event.target.closest('#lock-wallet')) {
-    const openOrders = state?.funds?.openOrders || 0;
-    if (openOrders && !confirm(`Locking pauses ${openOrders} open ${openOrders === 1 ? 'order' : 'orders'} until you unlock QDAY Swap again. Lock anyway?`)) return;
     try { state = await post('/api/v1/lock'); renderFingerprint = ''; render(); } catch (error) { showToast(error.message); }
     return;
   }
@@ -1504,19 +1728,8 @@ document.addEventListener('click', async event => {
   }
   const viewSwap = event.target.closest('[data-view-swap]');
   if (viewSwap) {
-    const swap = negotiations.swaps.find(item => item.id === viewSwap.dataset.viewSwap);
-    if (!swap) { showToast('Swap is no longer available'); return; }
-    swapDetailsModal(swap);
-    return;
-  }
-  const progressSwap = event.target.closest('[data-open-swap-progress]');
-  if (progressSwap) {
-    closeModal(false);
-    location.hash = 'swaps';
-    renderFingerprint = '';
-    render();
-    const swap = negotiations.swaps.find(item => item.id === progressSwap.dataset.openSwapProgress);
-    if (swap) setTimeout(() => swapDetailsModal(swap), 0);
+    if (!negotiations.swaps.find(item => item.id === viewSwap.dataset.viewSwap)) { showToast('Swap is no longer available'); return; }
+    await openSwapProgress(viewSwap.dataset.viewSwap);
     return;
   }
 });
@@ -1656,7 +1869,17 @@ document.addEventListener('submit', async event => {
   }
 });
 
-window.addEventListener('hashchange', () => { renderFingerprint = ''; if (state) render(); });
+window.addEventListener('hashchange', () => {
+  notificationPanelOpen = false;
+  renderFingerprint = '';
+  if (state) render();
+});
+document.addEventListener('click', event => {
+  if (notificationPanelOpen && !event.target.closest('#notification-center')) {
+    notificationPanelOpen = false;
+    renderNotificationCenter();
+  }
+});
 modalBackdrop.addEventListener('click', event => { if (event.target === modalBackdrop) closeModal(); });
 refreshPriceLoop();
 refreshState();
