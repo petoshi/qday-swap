@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -309,6 +310,7 @@ func TestSetupLockUnlockAndReceiveAddress(t *testing.T) {
 func TestImportRecoveryReplacesWalletWithoutKeepingBackup(t *testing.T) {
 	ctx := context.Background()
 	relayURL := testRelayURL(t)
+	var addressRequests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
@@ -319,7 +321,14 @@ func TestImportRecoveryReplacesWalletWithoutKeepingBackup(t *testing.T) {
 		case "/v1/status":
 			_ = json.NewEncoder(w).Encode(walletd.Status{Network: "qday-mainnet", Height: 123, ScanHeight: 123, Synced: true, NetworkSynced: true, Unlocked: true, UnitAtomic: order.QDAYLegacyUnit})
 		case "/v1/balance":
-			_ = json.NewEncoder(w).Encode(walletd.Balance{Synced: true, UnitAtomic: order.QDAYLegacyUnit, Spendable: walletd.Amount{Atomic: order.QDAYLegacyUnit, QDAY: "1"}})
+			balance := walletd.Balance{Synced: true, UnitAtomic: order.QDAYLegacyUnit}
+			if addressRequests.Load() != 0 {
+				balance.Spendable = walletd.Amount{Atomic: order.QDAYLegacyUnit, QDAY: "1"}
+			}
+			_ = json.NewEncoder(w).Encode(balance)
+		case "/v1/addresses":
+			addressRequests.Add(1)
+			_ = json.NewEncoder(w).Encode(walletd.Address{Index: 0, Address: "qday1ptest", Reference: mainQDAYReceiveReference, Kind: "deposit"})
 		default:
 			http.NotFound(w, r)
 		}
@@ -335,7 +344,10 @@ func TestImportRecoveryReplacesWalletWithoutKeepingBackup(t *testing.T) {
 	service.bitcoinFactory = func(string) (bitcoinProcess, error) { return bitcoin, nil }
 	if _, err := service.Setup(ctx, "correct horse battery staple", ""); err != nil {
 		t.Fatal(err)
+	} else if got := addressRequests.Load(); got != 1 {
+		t.Fatalf("setup registered main QDAY address %d times, want 1", got)
 	}
+	addressRequests.Store(0)
 	replacement, err := walletroot.New()
 	if err != nil {
 		t.Fatal(err)
@@ -350,6 +362,10 @@ func TestImportRecoveryReplacesWalletWithoutKeepingBackup(t *testing.T) {
 		t.Fatal(err)
 	} else if !state.Configured || !state.Unlocked {
 		t.Fatalf("import state = %#v", state)
+	} else if got := addressRequests.Load(); got != 1 {
+		t.Fatalf("import registered main QDAY address %d times, want 1", got)
+	} else if state.Balance == nil || state.Balance.Spendable.QDAY != "1" {
+		t.Fatalf("import state did not refresh the registered QDAY balance: %#v", state)
 	}
 	exported, err := service.RecoveryPhrase("correct horse battery staple")
 	if err != nil {
@@ -385,6 +401,8 @@ func TestTwoApplicationsPublishAcceptAndMatchOffer(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(walletd.Status{Network: "qday-mainnet", Height: 12_000, ScanHeight: 12_000, Synced: true, NetworkSynced: true, Connections: 4, Unlocked: true, UnitAtomic: order.QDAYLegacyUnit})
 		case "/v1/balance":
 			_ = json.NewEncoder(w).Encode(walletd.Balance{Height: 12_000, Synced: true, UnitAtomic: order.QDAYLegacyUnit, Spendable: walletd.Amount{Atomic: "5000000000000000000000000", QDAY: "5"}})
+		case "/v1/addresses":
+			_ = json.NewEncoder(w).Encode(walletd.Address{Index: 0, Address: "qday1ptest", Reference: mainQDAYReceiveReference, Kind: "deposit"})
 		default:
 			http.NotFound(w, r)
 		}

@@ -554,7 +554,7 @@ func (s *Service) ImportRecovery(ctx context.Context, password, phrase string) (
 	if err := s.openLocked(); err != nil {
 		return rollback(fmt.Errorf("open imported wallet: %w", err))
 	}
-	if err := s.client.Unlock(commitCtx, password); err != nil {
+	if err := unlockQDAYWallet(commitCtx, s.client, password); err != nil {
 		return rollback(fmt.Errorf("unlock imported QDAY wallet: %w", err))
 	}
 	if err := s.bitcoinClient.Unlock(password); err != nil {

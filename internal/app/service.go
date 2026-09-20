@@ -28,6 +28,8 @@ import (
 	"github.com/petoshi/qday-swap/internal/walletroot"
 )
 
+const mainQDAYReceiveReference = "qday-swap-main-receive-v1"
+
 type Config struct {
 	DataDir         string
 	WalletdBinary   string
@@ -134,6 +136,17 @@ type Service struct {
 	root           *walletroot.Root
 	lastError      string
 	withdrawals    map[string]withdrawalRecord
+}
+
+func unlockQDAYWallet(ctx context.Context, client qdayClient, password string) error {
+	if err := client.Unlock(ctx, password); err != nil {
+		return err
+	}
+	if _, err := client.CreateAddress(ctx, mainQDAYReceiveReference); err != nil {
+		_ = client.Lock(ctx)
+		return fmt.Errorf("initialize QDAY receive address: %w", err)
+	}
+	return nil
 }
 
 type State struct {
@@ -401,7 +414,7 @@ func (s *Service) Setup(ctx context.Context, password, phrase string) (SetupResu
 	s.root = &root
 	err = s.openLocked()
 	if err == nil {
-		err = s.client.Unlock(ctx, password)
+		err = unlockQDAYWallet(ctx, s.client, password)
 	}
 	if err == nil {
 		err = s.bitcoinClient.Unlock(password)
@@ -438,7 +451,7 @@ func (s *Service) Unlock(ctx context.Context, password string) error {
 	if err != nil {
 		return err
 	}
-	if err := s.client.Unlock(ctx, password); err != nil {
+	if err := unlockQDAYWallet(ctx, s.client, password); err != nil {
 		clear(root[:])
 		return err
 	}
@@ -484,7 +497,7 @@ func (s *Service) QDAYReceiveAddress(ctx context.Context) (walletd.Address, erro
 	} else if !unlocked {
 		return walletd.Address{}, errors.New("wallet is locked")
 	}
-	return client.CreateAddress(ctx, "qday-swap-main-receive-v1")
+	return client.CreateAddress(ctx, mainQDAYReceiveReference)
 }
 
 func (s *Service) BitcoinReceiveAddress() (string, error) {
