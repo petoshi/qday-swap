@@ -446,7 +446,7 @@ func (s *Service) driveAsyncSwap(ctx context.Context, wallets engineWallets, jou
 			continue
 
 		case swapstate.PhaseAsyncMakerClaiming:
-			takerFound, _, _, err := observeClaimForRecord(ctx, wallets, record, agreement, swapprotocol.PartyTaker)
+			takerFound, takerConfirmed, _, err := observeClaimForRecord(ctx, wallets, record, agreement, swapprotocol.PartyTaker)
 			if err != nil {
 				return err
 			} else if !takerFound {
@@ -474,6 +474,9 @@ func (s *Service) driveAsyncSwap(ctx context.Context, wallets engineWallets, jou
 			found, confirmed, _, err := observeClaimForRecord(ctx, wallets, record, agreement, swapprotocol.PartyMaker)
 			if err != nil || !found || !confirmed {
 				return err
+			}
+			if !takerConfirmed {
+				return nil
 			}
 			if _, err := journal.Advance(record.ID, record.Phase, swapstate.PhaseComplete, time.Now().UTC()); err != nil {
 				return err

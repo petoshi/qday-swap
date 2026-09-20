@@ -308,6 +308,7 @@ type engineBitcoin struct {
 	marker            byte
 	chain             *engineBitcoinChain
 	failNextBroadcast bool
+	unconfirmedClaims bool
 }
 
 func (b *engineBitcoin) Status() (bitcoinwallet.Status, error) {
@@ -354,12 +355,17 @@ func (b *engineBitcoin) Broadcast(raw string) (bitcoinwallet.Transaction, error)
 		b.mu.Unlock()
 		return bitcoinwallet.Transaction{}, errors.New("simulated broadcast interruption")
 	}
+	unconfirmedClaims := b.unconfirmedClaims
 	b.mu.Unlock()
 	tx, err := bitcoin.DecodeTransaction(raw)
 	if err != nil {
 		return bitcoinwallet.Transaction{}, err
 	}
-	transaction := bitcoinwallet.Transaction{ID: tx.TxID(), Raw: raw, Confirmations: 1, Height: b.chain.height}
+	confirmations, height := int32(1), b.chain.height
+	if unconfirmedClaims && len(tx.TxIn) != 0 && len(tx.TxIn[0].Witness) != 0 {
+		confirmations, height = 0, 0
+	}
+	transaction := bitcoinwallet.Transaction{ID: tx.TxID(), Raw: raw, Confirmations: confirmations, Height: height}
 	b.chain.mu.Lock()
 	if existing, ok := b.chain.txs[transaction.ID]; ok {
 		transaction = existing
@@ -669,19 +675,41 @@ func TestEngineDoesNotRebroadcastObservedProxyClaim(t *testing.T) {
 	if err := trade.taker.syncRelay(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	trade.takerBitcoin.unconfirmedClaims = true
 	trade.taker.driveSwaps(context.Background())
 
 	record, err := trade.taker.journal.Swap(trade.swapID)
 	if err != nil {
 		t.Fatal(err)
-	} else if record.Phase != swapstate.PhaseComplete || record.LastError != "" {
-		t.Fatalf("returning taker did not complete: %s (%s)", record.Phase, record.LastError)
+	} else if record.Phase != swapstate.PhaseAsyncMakerClaiming || record.LastError != "" {
+		action, _ := trade.taker.journal.Action(trade.swapID + ":taker-claim")
+		trade.bitcoinChain.mu.Lock()
+		transaction := trade.bitcoinChain.txs[action.TransactionID]
+		trade.bitcoinChain.mu.Unlock()
+		t.Fatalf("returning taker did not wait for Bitcoin claim confirmation: %s (%s), claim=%+v", record.Phase, record.LastError, transaction)
 	}
 	trade.qdayChain.mu.Lock()
 	broadcasts := trade.qdayChain.claimBroadcasts
 	trade.qdayChain.mu.Unlock()
 	if broadcasts != 1 {
 		t.Fatalf("QDAY proxy claim broadcasts = %d, want 1", broadcasts)
+	}
+
+	claim, err := trade.taker.journal.Action(trade.swapID + ":taker-claim")
+	if err != nil {
+		t.Fatal(err)
+	}
+	trade.bitcoinChain.mu.Lock()
+	transaction := trade.bitcoinChain.txs[claim.TransactionID]
+	transaction.Confirmations, transaction.Height = 1, trade.bitcoinChain.height
+	trade.bitcoinChain.txs[claim.TransactionID] = transaction
+	trade.bitcoinChain.mu.Unlock()
+	trade.taker.driveSwaps(context.Background())
+	record, err = trade.taker.journal.Swap(trade.swapID)
+	if err != nil {
+		t.Fatal(err)
+	} else if record.Phase != swapstate.PhaseComplete || record.LastError != "" {
+		t.Fatalf("confirmed Bitcoin claim did not complete swap: %s (%s)", record.Phase, record.LastError)
 	}
 }
 

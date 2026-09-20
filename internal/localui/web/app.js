@@ -156,8 +156,8 @@ function swapMilestone(swap) {
     async_maker_funding: ['first-funded', 'First deposit confirmed'],
     async_maker_funded: ['both-funded', 'Both deposits confirmed'],
     async_taker_claiming: ['both-funded', 'Both deposits confirmed'],
-    async_taker_claimed: ['first-claimed', 'First claim confirmed'],
-    async_maker_claiming: ['first-claimed', 'First claim confirmed']
+    async_taker_claimed: ['first-claimed', 'Final transfers in progress'],
+    async_maker_claiming: ['first-claimed', 'Final transfers in progress']
   } : {
     matched: ['matched', 'Order matched'],
     terms_proposed: ['matched', 'Order matched'],
@@ -1145,7 +1145,7 @@ function swapTimeline(swap, transactions) {
   const steps = [{kind: 'matched', complete: true, active: false, label: 'Order matched and exact amounts signed', state: `Trade ${short(swap.id, 12, 10)}`}];
   chainSteps.forEach((step, index) => {
     const transaction = transactionFor(transactions, step.kind, step.party);
-    const complete = transaction?.status === 'confirmed' || index < fallbackCompleted;
+    const complete = transaction ? transaction.status === 'confirmed' : index < fallbackCompleted;
     const active = !complete && !waitingFound;
     if (!complete) waitingFound = true;
     steps.push({...step, transaction, complete, active, label: timelineLabel(swap, step, transaction), state: transactionState(transaction, active)});
