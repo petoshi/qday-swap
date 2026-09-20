@@ -214,7 +214,7 @@ function updateChrome() {
     nodePill.classList.add('waiting');
     label.textContent = state.bitcoin ? `BTC SYNC ${commas(state.bitcoin.walletHeight)} / ${commas(state.bitcoin.headerHeight)}` : 'BTC STARTING';
   } else {
-    label.textContent = `PEERS: ${state.qday.connections} QDAY · ${state.bitcoin.peers} BTC`;
+    label.textContent = `PEERS: ${state.qday.connections} QDAY · ${state.bitcoin.peers} BITCOIN`;
   }
 }
 

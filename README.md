@@ -2,14 +2,9 @@
 
 ## DOWNLOAD QDAY SWAP. FUCK KYC.
 
-QDAY Swap v1.0.0 is available for
-[Windows x86-64](https://github.com/petoshi/qday-swap/releases/download/v1.0.0/QDAY-Swap-windows-amd64.zip),
-[Linux x86-64](https://github.com/petoshi/qday-swap/releases/download/v1.0.0/QDAY-Swap-linux-amd64.tar.gz),
-[Linux ARM64](https://github.com/petoshi/qday-swap/releases/download/v1.0.0/QDAY-Swap-linux-arm64.tar.gz)
-and [macOS universal](https://github.com/petoshi/qday-swap/releases/download/v1.0.0/QDAY-Swap-macos-universal.zip).
-Every archive includes the local application and its required QDAY node. Verify
-the archive with `SHA256SUMS`, extract the complete package and start QDAY Swap.
-The interface opens at localhost in your browser.
+The public binary build is temporarily offline while the next build is tested.
+The source remains public. Windows, Linux x86-64, Linux ARM64 and macOS packages
+will return together after the test build passes.
 
 See [the installation guide](docs/INSTALL.md) for the exact command on each OS.
 
@@ -59,7 +54,7 @@ External adapters use a validating light client where the chain supports one:
 A single unverified explorer or RPC response is never enough to advance a swap
 state. Users may optionally connect their own full node for any supported asset.
 
-The v1.0.0 release includes the local wallet application, QDAY/BTC state
+The current source includes the local wallet application, QDAY/BTC state
 machine, durable recovery journal, embedded Bitcoin light client and public
 relay. Automated regtest coverage exercises funding, claims, refunds, restarts
 and chain reorganizations. Begin with low-value trades while independent

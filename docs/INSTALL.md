@@ -1,9 +1,10 @@
-# Install QDAY Swap v1.0.0
+# Install QDAY Swap
 
-Download the archive for your operating system from the
-[v1.0.0 release](https://github.com/petoshi/qday-swap/releases/tag/v1.0.0) and
-verify it against the release `SHA256SUMS` file. Extract the complete archive;
-`qday-swap` and `qday-walletd` must stay together.
+The public binary build is temporarily offline while the next build is tested.
+When it returns, download the archive from the
+[release page](https://github.com/petoshi/qday-swap/releases), verify it against
+the release `SHA256SUMS` file and extract the complete archive. `qday-swap` and
+`qday-walletd` must stay together.
 
 ## Windows x86-64
 

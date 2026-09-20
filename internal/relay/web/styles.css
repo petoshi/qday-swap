@@ -52,6 +52,7 @@ button { color: inherit; }
 .downloads > span { margin-right: 3px; color: #525a53; font-size: 8px; letter-spacing: .12em; }
 .downloads a { padding: 6px 9px; border: 1px solid var(--line-bright); color: #b9c1ba; font-size: 9px; }
 .downloads a:hover { border-color: var(--green-dim); color: var(--green); background: #071108; }
+.downloads .build-pending { margin: 0; padding: 6px 9px; border: 1px solid #5b4b29; color: var(--amber); }
 
 main { width: min(100%, 1540px); min-height: calc(100vh - 210px); margin: 0 auto; padding: 20px 28px 70px; }
 .loading-page { display: grid; min-height: 420px; place-items: center; color: var(--muted); }
@@ -180,6 +181,11 @@ main { width: min(100%, 1540px); min-height: calc(100vh - 210px); margin: 0 auto
 .download-card small { margin-top: 2px; color: var(--muted); font-size: 9px; }
 .download-card b { align-self: start; color: var(--green-dim); font-size: 9px; font-weight: 500; }
 .download-card:hover b { color: var(--green); }
+.download-card.pending { cursor: default; opacity: .55; }
+.download-card.pending:hover { border-color: var(--line-bright); background: var(--panel); }
+.download-card.pending:hover .os-icon { fill: #a9b1aa; }
+.download-card.pending:hover b { color: var(--amber); }
+.download-card.pending b { color: var(--amber); }
 .linux-icon .tux-body { fill: #a9b1aa; }
 .linux-icon .tux-belly, .linux-icon .tux-eye { fill: #e9ede9; }
 .linux-icon .tux-pupil { fill: #111; }
