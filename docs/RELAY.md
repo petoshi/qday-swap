@@ -44,6 +44,7 @@ GET  /api/v1/orders/{orderID}
 POST /api/v1/orders
 POST /api/v1/orders/{orderID}/cancel
 POST /api/v1/orders/{orderID}/accept
+POST /api/v1/orders/{orderID}/acceptances/{acceptanceID}/cancel
 POST /api/v1/orders/{orderID}/match
 POST /api/v1/messages
 POST /api/v1/mailbox/poll
@@ -101,7 +102,11 @@ package. The acceptance can remain valid until the signed order deadline and
 cannot outlive the order. It does not close the public offer by itself, so one
 offline taker cannot reserve the order against everyone else. Several
 acceptances may queue. The maker application signs the first valid acceptance it
-receives and leaves a manual retry only if relay delivery fails. The match
+receives. Until that atomic selection, a taker may revoke its exact acceptance
+with a separate domain-separated signature. The relay records cancellation
+tombstones even when an earlier acceptance request has not arrived yet, so a
+timed-out request cannot later revive a cancelled trade. Cancellation and match
+run in one database transaction; exactly one of them can win. The match
 binds the order ID, acceptance ID, trade ID and both identities. The store
 changes the order from `open` to `matched` atomically, so two concurrent takers
 cannot both acquire the same offer.
@@ -141,6 +146,12 @@ publishing an exact offer or accepting one is the user's funding authorization.
 The taker's exact first-leg funding is part of the signed acceptance. The maker
 may relay it, fund the second leg and leave an encrypted claim template; the
 taker may later complete both claims without the maker returning. Prepared
-transactions, encrypted envelopes and mailbox cursors survive restarts, and
-unilateral refund paths remain valid if neither side returns in time. The later discovery
-mesh can transport the same records without changing their canonical format.
+transactions, encrypted envelopes and mailbox cursors survive restarts, and the
+client automatically retries an acceptance saved locally before a relay
+timeout. A pending taker may cancel before maker selection; after the relay
+acknowledges the signed cancellation, the client releases the prepared funding
+reservation. If the relay is unavailable, the exact cancellation remains in the
+local journal and retries every few seconds while the application is open, then
+continues after any restart. Unilateral refund paths remain valid if neither
+side returns in time. The later discovery mesh can transport the same records
+without changing their canonical format.

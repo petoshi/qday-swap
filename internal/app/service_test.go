@@ -105,6 +105,19 @@ func (r *failOnceAcceptRelay) Accept(ctx context.Context, orderID string, accept
 	return r.relayAPI.Accept(ctx, orderID, acceptance)
 }
 
+type failOnceCancelAcceptanceRelay struct {
+	relayAPI
+	failed bool
+}
+
+func (r *failOnceCancelAcceptanceRelay) CancelAcceptance(ctx context.Context, orderID, acceptanceID string, cancellation trade.SignedAcceptanceCancellation) (relay.AcceptanceCancellationRecord, error) {
+	if !r.failed {
+		r.failed = true
+		return relay.AcceptanceCancellationRecord{}, errors.New("simulated cancellation relay timeout")
+	}
+	return r.relayAPI.CancelAcceptance(ctx, orderID, acceptanceID, cancellation)
+}
+
 func (f *fakeBitcoin) Initialize(_ context.Context, _ walletroot.Root, password string, _ time.Time) error {
 	if password != "correct horse battery staple" {
 		return os.ErrPermission
@@ -568,20 +581,71 @@ func TestTwoApplicationsPublishAcceptAndMatchOffer(t *testing.T) {
 	flakyAcceptRelay := &failOnceAcceptRelay{relayAPI: taker.relay}
 	taker.relay = flakyAcceptRelay
 	firstPending, err := taker.AcceptOffer(context.Background(), offer.Signed.ID)
-	if err == nil || !strings.Contains(err.Error(), "simulated relay timeout") {
-		t.Fatalf("first accept error = %v", err)
-	}
-	pending, err := taker.AcceptOffer(context.Background(), offer.Signed.ID)
 	if err != nil {
 		t.Fatal(err)
-	} else if pending.Acceptance.ID != firstPending.Acceptance.ID {
-		t.Fatalf("accept retry changed signed payload: first=%q retry=%q", firstPending.Acceptance.ID, pending.Acceptance.ID)
-	} else if pending.Order.ID != offer.Signed.ID {
-		t.Fatalf("pending order = %q", pending.Order.ID)
+	} else if firstPending.RelaySubmitted || !strings.Contains(firstPending.RelayError, "simulated relay timeout") || firstPending.RelayRetryAt == 0 {
+		t.Fatalf("acceptance retry was not recorded: %#v", firstPending)
+	}
+	taker.lastRelaySync = time.Time{}
+	if err := taker.syncRelay(context.Background()); err != nil {
+		t.Fatalf("automatic acceptance retry: %v", err)
+	}
+	negotiations, err := taker.Negotiations()
+	if err != nil || len(negotiations.Pending) != 1 {
+		t.Fatalf("pending negotiations after automatic retry=%#v err=%v", negotiations.Pending, err)
+	}
+	pending := negotiations.Pending[0]
+	if pending.Acceptance.ID != firstPending.Acceptance.ID {
+		t.Fatalf("automatic accept retry changed signed payload: first=%q retry=%q", firstPending.Acceptance.ID, pending.Acceptance.ID)
+	} else if pending.Order.ID != offer.Signed.ID || !pending.RelaySubmitted {
+		t.Fatalf("pending acceptance was not acknowledged by relay: %#v", pending)
 	}
 	state = taker.State(context.Background())
 	if state.Funds == nil || state.Funds.OpenOrders != 0 || state.Funds.Bitcoin.Reserved != "0.0001" || state.Funds.Bitcoin.Available != "1.2499" {
 		t.Fatalf("taker pending acceptance reservation = %#v", state.Funds)
+	}
+	flakyCancellationRelay := &failOnceCancelAcceptanceRelay{relayAPI: taker.relay}
+	taker.relay = flakyCancellationRelay
+	cancellationResult, err := taker.CancelAcceptance(context.Background(), pending.Acceptance.ID)
+	if err != nil {
+		t.Fatal(err)
+	} else if cancellationResult.Status != "cancelling" || cancellationResult.RelayAcknowledged {
+		t.Fatalf("first acceptance cancellation result = %#v", cancellationResult)
+	}
+	negotiations, err = taker.Negotiations()
+	if err != nil || len(negotiations.Pending) != 1 || negotiations.Pending[0].Cancellation == nil ||
+		!strings.Contains(negotiations.Pending[0].CancellationError, "simulated cancellation relay timeout") || negotiations.Pending[0].CancellationRetryAt == 0 {
+		t.Fatalf("durable pending cancellation=%#v err=%v", negotiations.Pending, err)
+	}
+	state = taker.State(context.Background())
+	if state.Funds == nil || state.Funds.Bitcoin.Reserved != "0.0001" || state.Funds.Bitcoin.Available != "1.2499" {
+		t.Fatalf("funds released before relay acknowledged cancellation = %#v", state.Funds)
+	}
+	taker.lastRelaySync = time.Time{}
+	if err := taker.syncRelay(context.Background()); err != nil {
+		t.Fatalf("automatic cancellation retry: %v", err)
+	}
+	negotiations, err = taker.Negotiations()
+	if err != nil || len(negotiations.Pending) != 0 {
+		t.Fatalf("pending negotiations after cancellation=%#v err=%v", negotiations.Pending, err)
+	}
+	state = taker.State(context.Background())
+	if state.Funds == nil || state.Funds.Bitcoin.Reserved != "0" || state.Funds.Bitcoin.Available != "1.25" {
+		t.Fatalf("relay-acknowledged cancellation did not release funds = %#v", state.Funds)
+	}
+	maker.lastRelaySync = time.Time{}
+	if err := maker.syncRelay(context.Background()); err != nil {
+		t.Fatalf("maker cancellation reconciliation: %v", err)
+	}
+	negotiations, err = maker.Negotiations()
+	if err != nil || len(negotiations.Incoming) != 0 || len(negotiations.Swaps) != 0 {
+		t.Fatalf("cancelled acceptance remained with maker: %#v err=%v", negotiations, err)
+	}
+	pending, err = taker.AcceptOffer(context.Background(), offer.Signed.ID)
+	if err != nil {
+		t.Fatal(err)
+	} else if pending.Acceptance.ID == firstPending.Acceptance.ID || !pending.RelaySubmitted {
+		t.Fatalf("new acceptance after cancellation = %#v", pending)
 	}
 	flakyRelay := &failOnceMatchRelay{relayAPI: maker.relay}
 	maker.relay = flakyRelay
@@ -590,11 +654,14 @@ func TestTwoApplicationsPublishAcceptAndMatchOffer(t *testing.T) {
 	if !strings.Contains(state.RelayError, "simulated relay timeout") || state.IncomingTrades != 1 || state.ActiveSwaps != 1 {
 		t.Fatalf("maker state after relay timeout = %#v", state)
 	}
-	negotiations, err := maker.Negotiations()
+	negotiations, err = maker.Negotiations()
 	if err != nil || len(negotiations.Incoming) != 1 || len(negotiations.Swaps) != 1 {
 		t.Fatalf("maker negotiations=%#v err=%v", negotiations, err)
 	}
 	firstMatch := negotiations.Swaps[0]
+	if !firstMatch.RelayMatchPending || firstMatch.Phase != swapstate.PhaseMatched {
+		t.Fatalf("unconfirmed relay match became executable: %#v", firstMatch)
+	}
 	// Cross a timestamp boundary so recreating the signed match would produce a
 	// different ID and make the durable journal reject the retry.
 	time.Sleep(time.Until(time.Unix(time.Now().Unix()+1, 0)) + 20*time.Millisecond)
@@ -612,8 +679,26 @@ func TestTwoApplicationsPublishAcceptAndMatchOffer(t *testing.T) {
 	matched := negotiations.Swaps[0]
 	if matched.Match.ID != firstMatch.Match.ID {
 		t.Fatalf("match retry changed signed payload: first=%q retry=%q", firstMatch.Match.ID, matched.Match.ID)
-	} else if matched.Phase != swapstate.PhaseAsyncTakerFunding || matched.Role != swapstate.RoleMaker {
+	} else if matched.Phase != swapstate.PhaseAsyncTakerFunding || matched.Role != swapstate.RoleMaker || matched.RelayMatchPending {
 		t.Fatalf("maker swap = %#v", matched)
+	}
+	// A taker may return after the acceptance deadline even though the maker
+	// committed the match before it. Reconciliation must preserve the prepared
+	// funding until the taker consumes the durable relay match.
+	if err := taker.reconcileNegotiations(
+		context.Background(), taker.journal,
+		time.Unix(pending.Acceptance.Acceptance.ExpiresAt+1, 0),
+	); err != nil {
+		t.Fatalf("reconcile matched acceptance after deadline: %v", err)
+	}
+	if negotiations, err = taker.Negotiations(); err != nil || len(negotiations.Pending) != 1 {
+		t.Fatalf("matched acceptance was released after its deadline: %#v err=%v", negotiations.Pending, err)
+	}
+	cancellationResult, err = taker.CancelAcceptance(context.Background(), pending.Acceptance.ID)
+	if err != nil {
+		t.Fatalf("cancel already matched acceptance: %v", err)
+	} else if cancellationResult.Status != "matched" || cancellationResult.RelayAcknowledged {
+		t.Fatalf("already matched cancellation result = %#v", cancellationResult)
 	}
 	taker.lastRelaySync = time.Time{}
 	state = taker.State(context.Background())

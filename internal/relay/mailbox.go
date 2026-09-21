@@ -15,8 +15,16 @@ import (
 const MaxPendingAcceptancesPerOrder = 100
 
 type AcceptanceRecord struct {
-	Signed     trade.SignedAcceptance `json:"signed"`
-	ReceivedAt int64                  `json:"receivedAt"`
+	Signed       trade.SignedAcceptance              `json:"signed"`
+	ReceivedAt   int64                               `json:"receivedAt"`
+	CancelledAt  int64                               `json:"cancelledAt,omitempty"`
+	Cancellation *trade.SignedAcceptanceCancellation `json:"cancellation,omitempty"`
+}
+
+type AcceptanceCancellationRecord struct {
+	Signed          trade.SignedAcceptanceCancellation `json:"signed"`
+	ReceivedAt      int64                              `json:"receivedAt"`
+	AcceptanceKnown bool                               `json:"acceptanceKnown"`
 }
 
 type MailboxKind string
@@ -60,7 +68,29 @@ func (s *Store) SubmitAcceptance(orderID string, acceptance trade.SignedAcceptan
 
 		bucket := tx.Bucket(acceptancesBucket)
 		if existing := bucket.Get([]byte(acceptance.ID)); existing != nil {
-			return json.Unmarshal(existing, &result)
+			if err := json.Unmarshal(existing, &result); err != nil {
+				return err
+			}
+			if result.CancelledAt != 0 {
+				return ErrAcceptanceCancelled
+			}
+			return nil
+		}
+		cancellations := tx.Bucket(acceptanceCancellationsBucket)
+		cancelKey := acceptanceCancellationKey(acceptance.ID, acceptance.Acceptance.TakerPublicKey)
+		if encoded := cancellations.Get(cancelKey); encoded != nil {
+			var cancellation AcceptanceCancellationRecord
+			if err := json.Unmarshal(encoded, &cancellation); err != nil {
+				return err
+			}
+			if err := cancellation.Signed.VerifyAcceptance(acceptance, now); err == nil {
+				return ErrAcceptanceCancelled
+			}
+			// A cancellation under the correct composite key should always bind
+			// this acceptance. Drop malformed legacy data rather than blocking it.
+			if err := cancellations.Delete(cancelKey); err != nil {
+				return err
+			}
 		}
 		pending := 0
 		if err := bucket.ForEach(func(_, value []byte) error {
@@ -69,7 +99,7 @@ func (s *Store) SubmitAcceptance(orderID string, acceptance trade.SignedAcceptan
 				return err
 			}
 			payload := candidate.Signed.Acceptance
-			if payload.OrderID != orderID || payload.ExpiresAt <= now.Unix() {
+			if payload.OrderID != orderID || payload.ExpiresAt <= now.Unix() || candidate.CancelledAt != 0 {
 				return nil
 			}
 			pending++
@@ -102,6 +132,93 @@ func (s *Store) SubmitAcceptance(orderID string, acceptance trade.SignedAcceptan
 	return result, created, err
 }
 
+// CancelAcceptance atomically revokes an acceptance unless the relay has
+// already committed it to a match. Unknown acceptances are tombstoned as well,
+// which closes the race where an earlier timed-out submit arrives late.
+func (s *Store) CancelAcceptance(orderID, acceptanceID string, cancellation trade.SignedAcceptanceCancellation, now time.Time) (AcceptanceCancellationRecord, bool, error) {
+	var result AcceptanceCancellationRecord
+	created := false
+	if err := cancellation.Verify(now); err != nil {
+		return result, false, err
+	}
+	payload := cancellation.Cancellation
+	if payload.OrderID != orderID || payload.AcceptanceID != acceptanceID {
+		return result, false, errors.New("acceptance cancellation path does not match signed data")
+	}
+	err := s.db.Update(func(tx *bbolt.Tx) error {
+		orderRecord, err := orderRecordIn(tx, orderID, now)
+		if err != nil {
+			return err
+		}
+		if payload.Network != orderRecord.Signed.Order.Network {
+			return errors.New("acceptance cancellation belongs to a different network")
+		}
+		if payload.TakerPublicKey == orderRecord.Signed.Order.MakerPublicKey {
+			return errors.New("maker cannot cancel a taker acceptance")
+		}
+		if orderRecord.Status == StatusMatched && orderRecord.Acceptance != nil && orderRecord.Acceptance.ID == acceptanceID {
+			return ErrAcceptanceMatched
+		}
+
+		cancellations := tx.Bucket(acceptanceCancellationsBucket)
+		key := acceptanceCancellationKey(acceptanceID, payload.TakerPublicKey)
+		if existing := cancellations.Get(key); existing != nil {
+			return json.Unmarshal(existing, &result)
+		}
+		cancellationCount := 0
+		if err := cancellations.ForEach(func(_, value []byte) error {
+			var candidate AcceptanceCancellationRecord
+			if err := json.Unmarshal(value, &candidate); err != nil {
+				return err
+			}
+			if candidate.Signed.Cancellation.OrderID == orderID {
+				cancellationCount++
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		if cancellationCount >= MaxAcceptanceCancellationsPerOrder {
+			return ErrAcceptanceCancellationLimit
+		}
+
+		var acceptance AcceptanceRecord
+		acceptanceBucket := tx.Bucket(acceptancesBucket)
+		if encoded := acceptanceBucket.Get([]byte(acceptanceID)); encoded != nil {
+			if err := json.Unmarshal(encoded, &acceptance); err != nil {
+				return err
+			}
+			if err := cancellation.VerifyAcceptance(acceptance.Signed, now); err != nil {
+				return err
+			}
+			result.AcceptanceKnown = true
+		}
+		result.Signed = cancellation
+		result.ReceivedAt = now.Unix()
+		encodedCancellation, err := json.Marshal(result)
+		if err != nil {
+			return err
+		}
+		if err := cancellations.Put(key, encodedCancellation); err != nil {
+			return err
+		}
+		if result.AcceptanceKnown {
+			acceptance.CancelledAt = now.Unix()
+			acceptance.Cancellation = &cancellation
+			encodedAcceptance, err := json.Marshal(acceptance)
+			if err != nil {
+				return err
+			}
+			if err := acceptanceBucket.Put([]byte(acceptanceID), encodedAcceptance); err != nil {
+				return err
+			}
+		}
+		created = true
+		return nil
+	})
+	return result, created, err
+}
+
 func (s *Store) ConfirmMatch(orderID string, match trade.SignedMatch, now time.Time) (Record, bool, error) {
 	var result Record
 	changed := false
@@ -124,6 +241,13 @@ func (s *Store) ConfirmMatch(orderID string, match trade.SignedMatch, now time.T
 		var acceptance AcceptanceRecord
 		if err := json.Unmarshal(encodedAcceptance, &acceptance); err != nil {
 			return err
+		}
+		if acceptance.CancelledAt != 0 {
+			return ErrAcceptanceCancelled
+		}
+		cancelKey := acceptanceCancellationKey(acceptance.Signed.ID, acceptance.Signed.Acceptance.TakerPublicKey)
+		if tx.Bucket(acceptanceCancellationsBucket).Get(cancelKey) != nil {
+			return ErrAcceptanceCancelled
 		}
 		// The relay enforces the acceptance deadline using its own clock. A
 		// maker-controlled signed timestamp cannot extend a taker's consent.
@@ -313,4 +437,8 @@ func (item MailboxItem) validateShape() error {
 		return fmt.Errorf("mailbox item must contain exactly one signed record")
 	}
 	return nil
+}
+
+func acceptanceCancellationKey(acceptanceID, takerPublicKey string) []byte {
+	return []byte(acceptanceID + "\x00" + takerPublicKey)
 }

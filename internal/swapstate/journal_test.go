@@ -16,7 +16,7 @@ import (
 	"golang.org/x/crypto/nacl/box"
 )
 
-func matchedFixture(t *testing.T, now time.Time) (order.Signed, trade.SignedAcceptance, trade.SignedMatch) {
+func matchedFixture(t *testing.T, now time.Time) (order.Signed, trade.SignedAcceptance, trade.SignedMatch, ed25519.PrivateKey) {
 	t.Helper()
 	makerPublic, makerPrivate, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -52,12 +52,12 @@ func matchedFixture(t *testing.T, now time.Time) (order.Signed, trade.SignedAcce
 	if err != nil {
 		t.Fatal(err)
 	}
-	return signedOrder, acceptance, match
+	return signedOrder, acceptance, match, takerPrivate
 }
 
 func TestJournalSurvivesRestartAndSerializesWorkers(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
-	signedOrder, acceptance, match := matchedFixture(t, now)
+	signedOrder, acceptance, match, _ := matchedFixture(t, now)
 	path := filepath.Join(t.TempDir(), "swaps.db")
 	journal, err := Open(path)
 	if err != nil {
@@ -112,7 +112,7 @@ func TestJournalSurvivesRestartAndSerializesWorkers(t *testing.T) {
 
 func TestActionsAreDurableIdempotentAndReorgAware(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
-	signedOrder, acceptance, match := matchedFixture(t, now)
+	signedOrder, acceptance, match, _ := matchedFixture(t, now)
 	journal, err := Open(filepath.Join(t.TempDir(), "swaps.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -150,7 +150,7 @@ func TestActionsAreDurableIdempotentAndReorgAware(t *testing.T) {
 
 func TestPhaseGraphAndMonotonicMailboxCursor(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
-	signedOrder, acceptance, match := matchedFixture(t, now)
+	signedOrder, acceptance, match, _ := matchedFixture(t, now)
 	journal, err := Open(filepath.Join(t.TempDir(), "swaps.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -173,7 +173,7 @@ func TestPhaseGraphAndMonotonicMailboxCursor(t *testing.T) {
 
 func TestNegotiationsAndRelayCursorSurviveRestart(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
-	signedOrder, acceptance, match := matchedFixture(t, now)
+	signedOrder, acceptance, match, takerPrivate := matchedFixture(t, now)
 	path := filepath.Join(t.TempDir(), "swaps.db")
 	journal, err := Open(path)
 	if err != nil {
@@ -184,6 +184,16 @@ func TestNegotiationsAndRelayCursorSurviveRestart(t *testing.T) {
 	}
 	if _, created, err := journal.SavePendingAcceptance(signedOrder, acceptance, now); err != nil || created {
 		t.Fatalf("idempotent pending created=%v err=%v", created, err)
+	}
+	cancellation, err := trade.NewAcceptanceCancellation(acceptance, takerPrivate, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record, err := journal.SavePendingAcceptanceCancellation(acceptance.ID, cancellation, now.Add(time.Second)); err != nil || record.Cancellation == nil {
+		t.Fatalf("save pending cancellation=%#v err=%v", record, err)
+	}
+	if record, err := journal.RecordPendingAcceptanceCancellationFailure(acceptance.ID, "relay unavailable", now.Add(6*time.Second), now.Add(time.Second)); err != nil || record.CancellationRetryAt == 0 {
+		t.Fatalf("save cancellation retry=%#v err=%v", record, err)
 	}
 	if _, created, err := journal.SaveIncomingAcceptance(signedOrder, acceptance, now); err != nil || !created {
 		t.Fatalf("save incoming created=%v err=%v", created, err)
@@ -207,7 +217,7 @@ func TestNegotiationsAndRelayCursorSurviveRestart(t *testing.T) {
 	if cursor, err := journal.RelayCursor(); err != nil || cursor != 12 {
 		t.Fatalf("cursor=%d err=%v", cursor, err)
 	}
-	if records, err := journal.PendingAcceptances(); err != nil || len(records) != 1 {
+	if records, err := journal.PendingAcceptances(); err != nil || len(records) != 1 || records[0].Cancellation == nil || records[0].CancellationError != "relay unavailable" {
 		t.Fatalf("pending=%#v err=%v", records, err)
 	}
 	if err := journal.RemovePendingAcceptance(acceptance.ID); err != nil {
@@ -220,7 +230,7 @@ func TestNegotiationsAndRelayCursorSurviveRestart(t *testing.T) {
 
 func TestNotificationReadsSurviveRestart(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
-	signedOrder, acceptance, match := matchedFixture(t, now)
+	signedOrder, acceptance, match, _ := matchedFixture(t, now)
 	path := filepath.Join(t.TempDir(), "swaps.db")
 	journal, err := Open(path)
 	if err != nil {
@@ -255,7 +265,7 @@ func TestNotificationReadsSurviveRestart(t *testing.T) {
 
 func TestSwapTermsApprovalAndSecretAreDurable(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
-	signedOrder, acceptance, match := matchedFixture(t, now)
+	signedOrder, acceptance, match, _ := matchedFixture(t, now)
 	journal, err := Open(filepath.Join(t.TempDir(), "swaps.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -300,7 +310,7 @@ func TestSwapTermsApprovalAndSecretAreDurable(t *testing.T) {
 
 func TestAsyncTakerFundingSubmissionIsDurableAndReorgAware(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
-	signedOrder, acceptance, match := matchedFixture(t, now)
+	signedOrder, acceptance, match, _ := matchedFixture(t, now)
 	path := filepath.Join(t.TempDir(), "swaps.db")
 	journal, err := Open(path)
 	if err != nil {
@@ -348,7 +358,7 @@ func TestAsyncTakerFundingSubmissionIsDurableAndReorgAware(t *testing.T) {
 
 func TestOutboundMessageEnvelopeIsAtomicAndImmutable(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
-	signedOrder, acceptance, match := matchedFixture(t, now)
+	signedOrder, acceptance, match, _ := matchedFixture(t, now)
 	path := filepath.Join(t.TempDir(), "swaps.db")
 	journal, err := Open(path)
 	if err != nil {

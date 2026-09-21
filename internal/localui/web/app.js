@@ -62,6 +62,17 @@ function showToast(message) {
   toastTimer = setTimeout(() => toast.classList.remove('show'), 1800);
 }
 
+function updateRelayCountdowns() {
+  const now = Math.floor(Date.now() / 1000);
+  document.querySelectorAll('[data-relay-retry-at]').forEach(label => {
+    const firstRetry = Number(label.dataset.relayRetryAt || 0);
+    if (!firstRetry) return;
+    let remaining = firstRetry - now;
+    if (remaining <= 0) remaining = 5 - ((now - firstRetry) % 5);
+    label.textContent = `RELAY UNAVAILABLE · RETRY IN ${remaining}s`;
+  });
+}
+
 function closeModal() {
   clearTimeout(withdrawalQuoteTimer);
   withdrawalQuoteSequence += 1;
@@ -967,7 +978,7 @@ function acceptanceReview(record) {
       <div><span>PRICE</span><strong>${escapeHTML(priceBTC)} BTC per QDAY</strong><small>${bitcoinUSD ? `≈ ${escapeHTML(dollars(Number(priceBTC) * bitcoinUSD))} per QDAY` : 'USD reference unavailable'}</small></div>
       <div><span>OFFER EXPIRES</span><strong>${escapeHTML(new Date(terms.expiresAt * 1000).toLocaleString())}</strong><small>Amounts are fixed by the maker signature.</small></div>
     </div>
-    <p>Accepting signs and reserves the exact first-leg funding transaction. It does not block the order by itself: other buyers may also queue, and the maker's app selects the first valid acceptance. After selection, either app can relay your prepared funding and both sides may finish in later sessions.</p>
+    <p>Accepting signs and reserves the exact first-leg funding transaction. Other traders may also queue, and the maker's app selects the first valid acceptance automatically when it returns online. You can cancel before the maker selects it. After selection, either app can continue the swap across later sessions.</p>
     <div class="modal-actions"><button class="secondary" id="close-modal">BACK</button><button class="primary" id="confirm-accept-order" data-order-id="${escapeHTML(record.signed.id)}">${buying ? 'ACCEPT AND BUY' : 'ACCEPT AND SELL'}</button></div>
   </div>`);
 }
@@ -975,6 +986,40 @@ function acceptanceReview(record) {
 function negotiationTerms(record) {
   const terms = record.order.order;
   return `${amountText(terms.give, terms.qdayUnitAtomic)} → ${amountText(terms.receive, terms.qdayUnitAtomic)}`;
+}
+
+function pendingAcceptanceRow(item) {
+  const id = escapeHTML(item.acceptance.id);
+  const orderID = escapeHTML(item.order.id);
+  let message;
+  let status;
+  let retryAt = 0;
+  let hasError = false;
+  let actions;
+
+  if (item.cancellation) {
+    hasError = Boolean(item.cancellationError);
+    retryAt = Number(item.cancellationRetryAt || 0);
+    message = hasError
+      ? `Relay unavailable: ${escapeHTML(item.cancellationError)} Funds remain reserved until cancellation is confirmed.`
+      : 'Sending the saved cancellation to the relay. Funds remain reserved until it is confirmed.';
+    status = hasError ? 'RELAY UNAVAILABLE' : 'CANCELLING';
+    actions = `<button class="secondary" data-cancel-acceptance="${id}" data-retry-cancellation="true">RETRY NOW</button>`;
+  } else if (!item.relaySubmitted) {
+    hasError = Boolean(item.relayError);
+    retryAt = Number(item.relayRetryAt || 0);
+    message = hasError
+      ? `Relay unavailable: ${escapeHTML(item.relayError)} The exact acceptance is saved and retries automatically.`
+      : 'Submitting the saved acceptance to the relay automatically. Funds remain reserved while it retries.';
+    status = hasError ? 'RELAY UNAVAILABLE' : 'SUBMITTING';
+    actions = `${hasError ? `<button class="secondary" data-retry-acceptance="${orderID}">RETRY NOW</button>` : ''}<button class="secondary" data-cancel-acceptance="${id}">CANCEL</button>`;
+  } else {
+    message = `Queued on relay. The maker selects it automatically when online. Expires ${escapeHTML(new Date(item.acceptance.acceptance.expiresAt * 1000).toLocaleString())}`;
+    status = 'WAITING FOR MAKER';
+    actions = `<button class="secondary" data-cancel-acceptance="${id}">CANCEL</button>`;
+  }
+
+  return `<article><div><strong>${escapeHTML(negotiationTerms(item))}</strong><small>${message}</small></div><span class="waiting-label${hasError ? ' error' : ''}" ${retryAt ? `data-relay-retry-at="${retryAt}"` : ''}>${status}</span>${actions}</article>`;
 }
 
 function renderSwaps(historyOnly = false) {
@@ -986,8 +1031,10 @@ function renderSwaps(historyOnly = false) {
   }
   root.innerHTML = `<section class="page-head"><div><span class="eyebrow">LOCAL JOURNAL</span><h1>ACTIVE SWAPS.</h1><p>Acceptances, matches and contract progress survive restarts.</p></div></section>
     ${negotiations.incoming.length ? `<section class="card"><div class="card-head"><h2>Match retry required</h2><span>${negotiations.incoming.length}</span></div><div class="negotiation-list">${negotiations.incoming.map(item => `<article><div><strong>${escapeHTML(negotiationTerms(item))}</strong><small>Automatic matching could not reach the relay.</small></div><button class="primary" data-match-acceptance="${escapeHTML(item.acceptance.id)}">RETRY MATCH</button></article>`).join('')}</div></section>` : ''}
-    ${negotiations.pending.length ? `<section class="card"><div class="card-head"><h2>Waiting for maker</h2><span>${negotiations.pending.length}</span></div><div class="negotiation-list">${negotiations.pending.map(item => `<article><div><strong>${escapeHTML(negotiationTerms(item))}</strong><small>Acceptance expires ${escapeHTML(new Date(item.acceptance.acceptance.expiresAt * 1000).toLocaleString())}</small></div><span class="waiting-label">PENDING</span></article>`).join('')}</div></section>` : ''}
+    ${negotiations.pending.length ? `<section class="card"><div class="card-head"><h2>Pending acceptances</h2><span>${negotiations.pending.length}</span></div><div class="negotiation-list">${negotiations.pending.map(pendingAcceptanceRow).join('')}</div></section>` : ''}
     ${swapTable(swaps)}`;
+
+  updateRelayCountdowns();
 }
 
 function swapTable(swaps) {
@@ -1748,6 +1795,39 @@ document.addEventListener('click', async event => {
     cancel.disabled = true;
     try { await post(`/api/v1/orders/${cancel.dataset.cancelOrder}/cancel`); renderFingerprint = ''; await refreshState(); } catch (error) { showToast(error.message); cancel.disabled = false; }
   }
+  const cancelAcceptance = event.target.closest('[data-cancel-acceptance]');
+  if (cancelAcceptance) {
+    if (!cancelAcceptance.dataset.retryCancellation && !confirm('Cancel this acceptance and release its reserved funds?')) return;
+    cancelAcceptance.disabled = true;
+    try {
+      const result = await post(`/api/v1/acceptances/${cancelAcceptance.dataset.cancelAcceptance}/cancel`);
+      renderFingerprint = '';
+      await refreshState();
+      if (result.relayAcknowledged) showToast('Acceptance cancelled. Reserved funds are available again.');
+      else if (result.status === 'matched') showToast('The maker already selected this acceptance. The swap will continue automatically.');
+      else showToast('Relay unavailable. Cancellation will retry automatically.');
+    } catch (error) {
+      showToast(error.message);
+      renderFingerprint = '';
+      await refreshState();
+    }
+    return;
+  }
+  const retryAcceptance = event.target.closest('[data-retry-acceptance]');
+  if (retryAcceptance) {
+    retryAcceptance.disabled = true;
+    try {
+      const result = await post(`/api/v1/orders/${retryAcceptance.dataset.retryAcceptance}/accept`);
+      renderFingerprint = '';
+      await refreshState();
+      showToast(result.relaySubmitted ? 'Acceptance reached the relay.' : 'Relay unavailable. Retrying automatically.');
+    } catch (error) {
+      showToast(error.message);
+      renderFingerprint = '';
+      await refreshState();
+    }
+    return;
+  }
   const match = event.target.closest('[data-match-acceptance]');
   if (match) {
     if (!confirm('Match this taker and close the public offer?')) return;
@@ -1909,5 +1989,6 @@ document.addEventListener('click', event => {
   }
 });
 modalBackdrop.addEventListener('click', event => { if (event.target === modalBackdrop) closeModal(); });
+setInterval(updateRelayCountdowns, 1000);
 refreshPriceLoop();
 refreshState();

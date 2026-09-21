@@ -132,6 +132,13 @@ func (c *Client) Accept(ctx context.Context, orderID string, acceptance trade.Si
 	return result, err
 }
 
+func (c *Client) CancelAcceptance(ctx context.Context, orderID, acceptanceID string, cancellation trade.SignedAcceptanceCancellation) (relay.AcceptanceCancellationRecord, error) {
+	var result relay.AcceptanceCancellationRecord
+	path := "/api/v1/orders/" + orderID + "/acceptances/" + acceptanceID + "/cancel"
+	err := c.do(ctx, http.MethodPost, path, cancellation, &result)
+	return result, err
+}
+
 func (c *Client) Match(ctx context.Context, orderID string, match trade.SignedMatch) (relay.Record, error) {
 	var result relay.Record
 	err := c.do(ctx, http.MethodPost, "/api/v1/orders/"+orderID+"/match", match, &result)

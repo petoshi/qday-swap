@@ -201,6 +201,69 @@ func TestOnlyOneConcurrentAcceptanceCanBeMatched(t *testing.T) {
 	}
 }
 
+func TestAcceptanceCancellationPreventsLateSubmitAndMatch(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	fixture := newRelayTradeFixture(t, now)
+	store := openTestStore(t)
+	if _, _, err := store.Publish(fixture.order, now); err != nil {
+		t.Fatal(err)
+	}
+	cancellation, err := trade.NewAcceptanceCancellation(fixture.acceptance, fixture.takerPrivate, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, created, err := store.CancelAcceptance(fixture.order.ID, fixture.acceptance.ID, cancellation, now.Add(time.Second))
+	if err != nil || !created || record.AcceptanceKnown {
+		t.Fatalf("tombstone cancellation: record=%#v created=%v err=%v", record, created, err)
+	}
+	if _, _, err := store.SubmitAcceptance(fixture.order.ID, fixture.acceptance, now.Add(2*time.Second)); !errors.Is(err, ErrAcceptanceCancelled) {
+		t.Fatalf("late acceptance error = %v", err)
+	}
+	if _, _, err := store.ConfirmMatch(fixture.order.ID, fixture.match, now.Add(2*time.Second)); err == nil {
+		t.Fatal("matched an acceptance rejected by its cancellation tombstone")
+	}
+}
+
+func TestAcceptanceCancelAndMatchAreAtomic(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	fixture := newRelayTradeFixture(t, now)
+	store := openTestStore(t)
+	if _, _, err := store.Publish(fixture.order, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.SubmitAcceptance(fixture.order.ID, fixture.acceptance, now); err != nil {
+		t.Fatal(err)
+	}
+	cancellation, err := trade.NewAcceptanceCancellation(fixture.acceptance, fixture.takerPrivate, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	results := make(chan error, 2)
+	go func() {
+		_, _, err := store.CancelAcceptance(fixture.order.ID, fixture.acceptance.ID, cancellation, now.Add(time.Second))
+		results <- err
+	}()
+	go func() {
+		_, _, err := store.ConfirmMatch(fixture.order.ID, fixture.match, now.Add(time.Second))
+		results <- err
+	}()
+	first, second := <-results, <-results
+	if first == nil && second == nil {
+		t.Fatal("cancellation and match both succeeded")
+	}
+	if first != nil && second != nil {
+		t.Fatalf("cancellation and match both failed: first=%v second=%v", first, second)
+	}
+	loser := first
+	if loser == nil {
+		loser = second
+	}
+	if !errors.Is(loser, ErrAcceptanceCancelled) && !errors.Is(loser, ErrAcceptanceMatched) {
+		t.Fatalf("unexpected losing operation error = %v", loser)
+	}
+}
+
 func TestSignedMatchCannotExtendAcceptanceTimeout(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 	fixture := newRelayTradeFixture(t, now)

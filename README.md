@@ -10,10 +10,10 @@ use the same application and protocol.
 
 | Platform | Download |
 | --- | --- |
-| Windows x64 | [QDAY Swap for Windows](https://github.com/petoshi/qday-swap/releases/download/v1.0.0/QDAY-Swap-windows-amd64.zip) |
-| Linux x64 | [QDAY Swap for Linux x64](https://github.com/petoshi/qday-swap/releases/download/v1.0.0/QDAY-Swap-linux-amd64.tar.gz) |
-| Linux ARM64 | [QDAY Swap for Linux ARM64](https://github.com/petoshi/qday-swap/releases/download/v1.0.0/QDAY-Swap-linux-arm64.tar.gz) |
-| macOS | [QDAY Swap for macOS](https://github.com/petoshi/qday-swap/releases/download/v1.0.0/QDAY-Swap-macos-universal.zip) |
+| Windows x64 | [QDAY Swap for Windows](https://github.com/petoshi/qday-swap/releases/download/v1.0.1/QDAY-Swap-windows-amd64.zip) |
+| Linux x64 | [QDAY Swap for Linux x64](https://github.com/petoshi/qday-swap/releases/download/v1.0.1/QDAY-Swap-linux-amd64.tar.gz) |
+| Linux ARM64 | [QDAY Swap for Linux ARM64](https://github.com/petoshi/qday-swap/releases/download/v1.0.1/QDAY-Swap-linux-arm64.tar.gz) |
+| macOS | [QDAY Swap for macOS](https://github.com/petoshi/qday-swap/releases/download/v1.0.1/QDAY-Swap-macos-universal.zip) |
 
 See [the installation guide](docs/INSTALL.md) for the exact command on each OS.
 
@@ -45,6 +45,12 @@ transactions and claim templates let the parties continue in separate sessions;
 every unfinished funded leg still has its unilateral on-chain refund. A peer-to-peer
 discovery mesh can replace this first relay when the market is large enough
 without changing the signed records.
+
+If relay delivery is interrupted, the application keeps the exact signed
+acceptance in its local journal and retries automatically. A taker can cancel a
+pending acceptance before the maker selects it. The relay resolves cancellation
+and selection atomically, and locally reserved funds are released only after the
+signed cancellation is acknowledged.
 
 The local **Wallets** screen shows QDAY and Bitcoin balances, receive addresses
 and ordinary withdrawals. Partial sends and MAX both calculate the exact

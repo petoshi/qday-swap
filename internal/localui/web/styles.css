@@ -263,6 +263,7 @@ main { width: min(100%,1540px); min-height: calc(100vh - 210px); margin: 0 auto;
 .offers tbody tr:last-child td { border-bottom: 0; }
 .offers tbody tr:hover { background: #091109; }
 .side, .phase, .waiting-label { display: inline-flex; padding: 3px 6px; border: 1px solid var(--line-bright); color: #9ca49d; font-size: 10px; }
+.waiting-label.error { border-color: #65312d; color: var(--red); }
 .side.buy { border-color: #245d33; color: var(--green); }
 .side.sell { border-color: #703429; color: #ff977d; }
 .mine { display: block; margin-top: 4px; color: var(--green-dim); font-size: 9px; }

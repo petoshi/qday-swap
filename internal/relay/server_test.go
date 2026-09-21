@@ -311,3 +311,47 @@ func TestNegotiationAndEncryptedMailboxAPI(t *testing.T) {
 		t.Fatalf("tampered poll status=%d body=%#v", response.StatusCode, decoded)
 	}
 }
+
+func TestAcceptanceCancellationAPIBlocksLateMatch(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	server, _ := testHTTPServer(t, now)
+	fixture := newRelayTradeFixture(t, now)
+
+	response, _ := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/v1/orders", fixture.order)
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("publish status=%d", response.StatusCode)
+	}
+	response, _ = requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/v1/orders/"+fixture.order.ID+"/accept", fixture.acceptance)
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("accept status=%d", response.StatusCode)
+	}
+	cancellation, err := trade.NewAcceptanceCancellation(fixture.acceptance, fixture.takerPrivate, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelURL := server.URL + "/api/v1/orders/" + fixture.order.ID + "/acceptances/" + fixture.acceptance.ID + "/cancel"
+	response, decoded := requestJSON(t, server.Client(), http.MethodPost, cancelURL, cancellation)
+	if response.StatusCode != http.StatusCreated || decoded["acceptanceKnown"] != true {
+		t.Fatalf("cancel status=%d body=%#v", response.StatusCode, decoded)
+	}
+	response, _ = requestJSON(t, server.Client(), http.MethodPost, cancelURL, cancellation)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("idempotent cancel status=%d", response.StatusCode)
+	}
+
+	response, decoded = requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/v1/orders/"+fixture.order.ID+"/match", fixture.match)
+	if response.StatusCode != http.StatusConflict || !strings.Contains(decoded["error"].(string), "cancelled") {
+		t.Fatalf("match after cancellation status=%d body=%#v", response.StatusCode, decoded)
+	}
+
+	makerPoll, err := trade.NewPoll("mainnet", 0, 20, fixture.makerPrivate, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, decoded = requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/v1/mailbox/poll", makerPoll)
+	items := decoded["items"].([]any)
+	if response.StatusCode != http.StatusOK || len(items) != 1 ||
+		items[0].(map[string]any)["kind"] != string(MailboxAcceptance) {
+		t.Fatalf("maker cancellation mailbox status=%d body=%#v", response.StatusCode, decoded)
+	}
+}

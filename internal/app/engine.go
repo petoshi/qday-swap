@@ -446,6 +446,9 @@ func (s *Service) driveSwaps(ctx context.Context) {
 		return
 	}
 	for _, record := range records {
+		if record.RelayMatchPending {
+			continue
+		}
 		s.recordEngineResult(journal, record, s.driveSwap(ctx, wallets, journal, record))
 	}
 }

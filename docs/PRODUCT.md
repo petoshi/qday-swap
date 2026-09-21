@@ -17,7 +17,9 @@ The normal path is:
    application.
 3. Review and sign an offer, or review and accept an existing one.
 4. The application may be closed. Signed acceptances queue at the relay and the
-   maker app selects the first valid one when it returns.
+   maker app selects the first valid one when it returns. Before selection, the
+   taker may cancel a pending acceptance and immediately reuse the locally
+   reserved funds after the relay acknowledges the signed cancellation.
 5. The taker's acceptance already contains its exact signed first-leg funding.
    The maker can relay it, wait for confirmations, fund the second leg and leave
    a signed claim template before going offline again.
@@ -141,6 +143,10 @@ applications.
   offer or withdrawal from promising the same funds twice. They are not
   described as on-chain locked before a match.
 - An offer can be cancelled only while the relay still reports it as open.
+- A pending acceptance can be cancelled until the relay atomically selects it
+  for a match. The client retries relay submission automatically after a
+  timeout, and a signed cancellation tombstone prevents delayed delivery from
+  reviving a cancelled acceptance.
 - An acceptance alone does not reserve the public order. Several takers may
   queue; the relay closes the indivisible order only when the maker signs one
   match. The selected amount then belongs to that swap until claims or refunds

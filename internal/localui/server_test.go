@@ -15,8 +15,9 @@ import (
 )
 
 type fakeApplication struct {
-	detailID         *string
-	notificationRead *string
+	detailID            *string
+	notificationRead    *string
+	cancelledAcceptance *string
 }
 
 func (fakeApplication) State(context.Context) app.State {
@@ -62,6 +63,12 @@ func (fakeApplication) CancelOffer(context.Context, string) (relay.Record, error
 func (fakeApplication) AcceptOffer(context.Context, string) (swapstate.Negotiation, error) {
 	return swapstate.Negotiation{}, nil
 }
+func (f fakeApplication) CancelAcceptance(_ context.Context, id string) (app.AcceptanceCancellationResult, error) {
+	if f.cancelledAcceptance != nil {
+		*f.cancelledAcceptance = id
+	}
+	return app.AcceptanceCancellationResult{Status: "cancelled", RelayAcknowledged: true}, nil
+}
 func (fakeApplication) MatchAcceptance(context.Context, string) (swapstate.Swap, error) {
 	return swapstate.Swap{}, nil
 }
@@ -86,8 +93,11 @@ func (f fakeApplication) AcknowledgeSwapNotification(id, milestone string) error
 
 func TestBootstrapSessionHostAndOriginProtection(t *testing.T) {
 	const host = "127.0.0.1:42424"
-	var detailID, notificationRead string
-	application := fakeApplication{detailID: &detailID, notificationRead: &notificationRead}
+	var detailID, notificationRead, cancelledAcceptance string
+	application := fakeApplication{
+		detailID: &detailID, notificationRead: &notificationRead,
+		cancelledAcceptance: &cancelledAcceptance,
+	}
 	shutdown := make(chan struct{}, 1)
 	server, err := New(application, host, func() { shutdown <- struct{}{} })
 	if err != nil {
@@ -186,6 +196,18 @@ func TestBootstrapSessionHostAndOriginProtection(t *testing.T) {
 	server.ServeHTTP(response, notificationRequest)
 	if response.Code != http.StatusOK || notificationRead != swapID+":both-funded" {
 		t.Fatalf("notification status=%d read=%q body=%q", response.Code, notificationRead, response.Body.String())
+	}
+
+	acceptanceID := strings.Repeat("b", 64)
+	cancelAcceptanceRequest := httptest.NewRequest(http.MethodPost, "http://"+host+"/api/v1/acceptances/"+acceptanceID+"/cancel", strings.NewReader(`{}`))
+	cancelAcceptanceRequest.Host = host
+	cancelAcceptanceRequest.Header.Set("Content-Type", "application/json")
+	cancelAcceptanceRequest.Header.Set("Origin", "http://"+host)
+	cancelAcceptanceRequest.AddCookie(cookie)
+	response = httptest.NewRecorder()
+	server.ServeHTTP(response, cancelAcceptanceRequest)
+	if response.Code != http.StatusOK || cancelledAcceptance != acceptanceID {
+		t.Fatalf("acceptance cancellation status=%d id=%q body=%q", response.Code, cancelledAcceptance, response.Body.String())
 	}
 
 	badOrigin := httptest.NewRequest(http.MethodPost, "http://"+host+"/api/v1/lock", strings.NewReader(`{}`))

@@ -94,14 +94,17 @@ type Swap struct {
 	// by an acceptance from one that has actually reached either chain. It is
 	// deliberately durable: after a crash the exact signed bytes are replayed
 	// before the local amount becomes available for another order.
-	TakerFundingSubmitted bool   `json:"takerFundingSubmitted,omitempty"`
-	MakerClaimTemplate    string `json:"makerClaimTemplate,omitempty"`
-	Approved              bool   `json:"approved"`
-	RevealedSecret        string `json:"revealedSecret,omitempty"`
-	MailboxCursor         uint64 `json:"mailboxCursor"`
-	LastError             string `json:"lastError,omitempty"`
-	CreatedAt             int64  `json:"createdAt"`
-	UpdatedAt             int64  `json:"updatedAt"`
+	TakerFundingSubmitted bool `json:"takerFundingSubmitted,omitempty"`
+	// RelayMatchPending prevents a provisional maker match from reaching either
+	// chain until the relay has atomically selected it over any cancellation.
+	RelayMatchPending  bool   `json:"relayMatchPending,omitempty"`
+	MakerClaimTemplate string `json:"makerClaimTemplate,omitempty"`
+	Approved           bool   `json:"approved"`
+	RevealedSecret     string `json:"revealedSecret,omitempty"`
+	MailboxCursor      uint64 `json:"mailboxCursor"`
+	LastError          string `json:"lastError,omitempty"`
+	CreatedAt          int64  `json:"createdAt"`
+	UpdatedAt          int64  `json:"updatedAt"`
 }
 
 type ActionStatus string
@@ -126,10 +129,16 @@ type Action struct {
 }
 
 type Negotiation struct {
-	Order      order.Signed           `json:"order"`
-	Acceptance trade.SignedAcceptance `json:"acceptance"`
-	CreatedAt  int64                  `json:"createdAt"`
-	UpdatedAt  int64                  `json:"updatedAt"`
+	Order               order.Signed                        `json:"order"`
+	Acceptance          trade.SignedAcceptance              `json:"acceptance"`
+	RelaySubmitted      bool                                `json:"relaySubmitted"`
+	RelayError          string                              `json:"relayError,omitempty"`
+	RelayRetryAt        int64                               `json:"relayRetryAt,omitempty"`
+	Cancellation        *trade.SignedAcceptanceCancellation `json:"cancellation,omitempty"`
+	CancellationError   string                              `json:"cancellationError,omitempty"`
+	CancellationRetryAt int64                               `json:"cancellationRetryAt,omitempty"`
+	CreatedAt           int64                               `json:"createdAt"`
+	UpdatedAt           int64                               `json:"updatedAt"`
 }
 
 type Journal struct{ db *bbolt.DB }
@@ -165,6 +174,134 @@ func (j *Journal) SaveIncomingAcceptance(signedOrder order.Signed, acceptance tr
 
 func (j *Journal) PendingAcceptances() ([]Negotiation, error) {
 	return j.acceptances(pendingAcceptancesBucket)
+}
+
+func (j *Journal) PendingAcceptance(id string) (Negotiation, error) {
+	var record Negotiation
+	err := j.db.View(func(tx *bbolt.Tx) error {
+		encoded := tx.Bucket(pendingAcceptancesBucket).Get([]byte(id))
+		if encoded == nil {
+			return ErrNotFound
+		}
+		return json.Unmarshal(encoded, &record)
+	})
+	return record, err
+}
+
+func (j *Journal) MarkPendingAcceptanceSubmitted(id string, now time.Time) (Negotiation, error) {
+	var record Negotiation
+	err := j.db.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(pendingAcceptancesBucket)
+		encoded := bucket.Get([]byte(id))
+		if encoded == nil {
+			return ErrNotFound
+		}
+		if err := json.Unmarshal(encoded, &record); err != nil {
+			return err
+		}
+		record.RelaySubmitted = true
+		record.RelayError = ""
+		record.RelayRetryAt = 0
+		record.UpdatedAt = now.Unix()
+		encoded, err := json.Marshal(record)
+		if err != nil {
+			return err
+		}
+		return bucket.Put([]byte(id), encoded)
+	})
+	return record, err
+}
+
+func (j *Journal) RecordPendingAcceptanceRelayFailure(id, message string, retryAt, now time.Time) (Negotiation, error) {
+	var record Negotiation
+	err := j.db.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(pendingAcceptancesBucket)
+		encoded := bucket.Get([]byte(id))
+		if encoded == nil {
+			return ErrNotFound
+		}
+		if err := json.Unmarshal(encoded, &record); err != nil {
+			return err
+		}
+		if record.RelaySubmitted {
+			return errors.New("acceptance is already acknowledged by the relay")
+		}
+		if record.RelayError != "" {
+			return nil
+		}
+		record.RelayError = message
+		record.RelayRetryAt = retryAt.Unix()
+		record.UpdatedAt = now.Unix()
+		encoded, err := json.Marshal(record)
+		if err != nil {
+			return err
+		}
+		return bucket.Put([]byte(id), encoded)
+	})
+	return record, err
+}
+
+func (j *Journal) SavePendingAcceptanceCancellation(id string, cancellation trade.SignedAcceptanceCancellation, now time.Time) (Negotiation, error) {
+	var record Negotiation
+	err := j.db.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(pendingAcceptancesBucket)
+		encoded := bucket.Get([]byte(id))
+		if encoded == nil {
+			return ErrNotFound
+		}
+		if err := json.Unmarshal(encoded, &record); err != nil {
+			return err
+		}
+		if err := cancellation.VerifyAcceptance(record.Acceptance, now); err != nil {
+			return err
+		}
+		if record.Cancellation != nil {
+			if *record.Cancellation != cancellation {
+				return errors.New("pending acceptance already has a different signed cancellation")
+			}
+			return nil
+		}
+		record.Cancellation = &cancellation
+		record.UpdatedAt = now.Unix()
+		encoded, err := json.Marshal(record)
+		if err != nil {
+			return err
+		}
+		return bucket.Put([]byte(id), encoded)
+	})
+	return record, err
+}
+
+func (j *Journal) RecordPendingAcceptanceCancellationFailure(id, message string, retryAt, now time.Time) (Negotiation, error) {
+	var record Negotiation
+	err := j.db.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(pendingAcceptancesBucket)
+		encoded := bucket.Get([]byte(id))
+		if encoded == nil {
+			return ErrNotFound
+		}
+		if err := json.Unmarshal(encoded, &record); err != nil {
+			return err
+		}
+		if record.Cancellation == nil {
+			return errors.New("pending acceptance has no cancellation request")
+		}
+		// Preserve the first failure and retry epoch. The UI derives a live
+		// five-second countdown from this stable point without rewriting the
+		// whole page after every background attempt.
+		if record.CancellationError != "" {
+			return nil
+		}
+		record.CancellationError = message
+		record.CancellationRetryAt = retryAt.Unix()
+		record.UpdatedAt = now.Unix()
+		encoded, err := json.Marshal(record)
+		if err != nil {
+			return err
+		}
+		return bucket.Put([]byte(id), encoded)
+	})
+	return record, err
 }
 
 func (j *Journal) IncomingAcceptances() ([]Negotiation, error) {
@@ -463,7 +600,8 @@ func (j *Journal) Create(role Role, signedOrder order.Signed, acceptance trade.S
 	record := Swap{
 		Version: acceptance.Acceptance.Version, ID: acceptance.Acceptance.TradeID, Role: role, Phase: PhaseMatched,
 		Order: signedOrder, Acceptance: acceptance, Match: match,
-		CreatedAt: now.Unix(), UpdatedAt: now.Unix(),
+		RelayMatchPending: role == RoleMaker,
+		CreatedAt:         now.Unix(), UpdatedAt: now.Unix(),
 	}
 	created := false
 	err := j.db.Update(func(tx *bbolt.Tx) error {
@@ -487,6 +625,46 @@ func (j *Journal) Create(role Role, signedOrder order.Signed, acceptance trade.S
 		return bucket.Put([]byte(record.ID), encoded)
 	})
 	return record, created, err
+}
+
+func (j *Journal) MarkRelayMatched(id string, now time.Time) (Swap, error) {
+	return j.updateSwap(id, func(record *Swap) error {
+		record.RelayMatchPending = false
+		record.UpdatedAt = now.Unix()
+		return nil
+	})
+}
+
+// RemoveRelayPendingSwap discards only a provisional maker selection that has
+// not been acknowledged by the relay and cannot have performed a chain action.
+func (j *Journal) RemoveRelayPendingSwap(id, acceptanceID string) error {
+	return j.db.Update(func(tx *bbolt.Tx) error {
+		trades := tx.Bucket(tradesBucket)
+		encoded := trades.Get([]byte(id))
+		if encoded == nil {
+			return nil
+		}
+		var record Swap
+		if err := json.Unmarshal(encoded, &record); err != nil {
+			return err
+		}
+		if !record.RelayMatchPending || record.Phase != PhaseMatched || record.Acceptance.ID != acceptanceID {
+			return errors.New("swap is no longer awaiting relay match")
+		}
+		if err := tx.Bucket(actionsBucket).ForEach(func(_, value []byte) error {
+			var action Action
+			if err := json.Unmarshal(value, &action); err != nil {
+				return err
+			}
+			if action.SwapID == id {
+				return errors.New("provisional swap already has a chain action")
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		return trades.Delete([]byte(id))
+	})
 }
 
 func (j *Journal) Swap(id string) (Swap, error) {

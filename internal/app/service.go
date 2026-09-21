@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -31,7 +32,10 @@ import (
 
 const mainQDAYReceiveReference = "qday-swap-main-receive-v1"
 
-var errInvalidAsyncFunding = errors.New("invalid asynchronous acceptance funding")
+var (
+	errInvalidAsyncFunding         = errors.New("invalid asynchronous acceptance funding")
+	errCancellationRetryNotDurable = errors.New("acceptance cancellation retry was not saved")
+)
 
 type Config struct {
 	DataDir         string
@@ -116,6 +120,7 @@ type relayAPI interface {
 	Publish(context.Context, order.Signed) (relay.Record, error)
 	Cancel(context.Context, string, order.SignedCancellation) (relay.Record, error)
 	Accept(context.Context, string, trade.SignedAcceptance) (relay.AcceptanceRecord, error)
+	CancelAcceptance(context.Context, string, string, trade.SignedAcceptanceCancellation) (relay.AcceptanceCancellationRecord, error)
 	Match(context.Context, string, trade.SignedMatch) (relay.Record, error)
 	Message(context.Context, trade.SignedMessage) (trade.SignedMessage, error)
 	Poll(context.Context, trade.SignedPoll) (relay.MailboxPage, error)
@@ -215,6 +220,11 @@ type Negotiations struct {
 	Incoming          []swapstate.Negotiation `json:"incoming"`
 	Swaps             []swapstate.Swap        `json:"swaps"`
 	NotificationReads map[string]string       `json:"notificationReads"`
+}
+
+type AcceptanceCancellationResult struct {
+	Status            string `json:"status"`
+	RelayAcknowledged bool   `json:"relayAcknowledged"`
 }
 
 // SwapTransaction is the read-only chain evidence shown by the local
@@ -876,7 +886,9 @@ func (s *Service) AcceptOffer(ctx context.Context, orderID string) (swapstate.Ne
 			continue
 		}
 		if pending.Acceptance.Acceptance.ExpiresAt <= now.Unix() {
-			s.releasePendingFunding(ctx, pending)
+			if err := s.releasePendingFunding(ctx, pending); err != nil {
+				return swapstate.Negotiation{}, err
+			}
 			if err := journal.RemovePendingAcceptance(pending.Acceptance.ID); err != nil {
 				return swapstate.Negotiation{}, err
 			}
@@ -888,9 +900,15 @@ func (s *Service) AcceptOffer(ctx context.Context, orderID string) (swapstate.Ne
 		// A timeout does not mean the relay rejected the acceptance. Resend the
 		// exact signed record so one click can be retried without opening a second trade.
 		if _, err := s.relay.Accept(ctx, orderID, pending.Acceptance); err != nil {
+			if isTransientRelayError(err) {
+				retryAt := time.Now().UTC()
+				return journal.RecordPendingAcceptanceRelayFailure(
+					pending.Acceptance.ID, err.Error(), retryAt.Add(engineInterval), retryAt,
+				)
+			}
 			return pending, err
 		}
-		return pending, nil
+		return journal.MarkPendingAcceptanceSubmitted(pending.Acceptance.ID, now)
 	}
 	if record.Signed.Order.Version != order.AsyncProtocolVersion {
 		return swapstate.Negotiation{}, errors.New("legacy online-only offers are no longer accepted")
@@ -1015,9 +1033,83 @@ func (s *Service) AcceptOffer(ctx context.Context, orderID string) (swapstate.Ne
 	}
 	committed = true
 	if _, err := s.relay.Accept(ctx, orderID, acceptance); err != nil {
+		if isTransientRelayError(err) {
+			retryAt := time.Now().UTC()
+			return journal.RecordPendingAcceptanceRelayFailure(
+				acceptance.ID, err.Error(), retryAt.Add(engineInterval), retryAt,
+			)
+		}
 		return pending, err
 	}
-	return pending, nil
+	return journal.MarkPendingAcceptanceSubmitted(acceptance.ID, now)
+}
+
+func (s *Service) CancelAcceptance(ctx context.Context, acceptanceID string) (AcceptanceCancellationResult, error) {
+	s.negotiationMu.Lock()
+	defer s.negotiationMu.Unlock()
+	s.fundsMu.Lock()
+	defer s.fundsMu.Unlock()
+	identity, _, cleanup, err := s.identities()
+	if err != nil {
+		return AcceptanceCancellationResult{}, err
+	}
+	defer cleanup()
+	s.mu.RLock()
+	journal := s.journal
+	s.mu.RUnlock()
+	if journal == nil {
+		return AcceptanceCancellationResult{}, errors.New("swap journal is unavailable")
+	}
+	negotiation, err := journal.PendingAcceptance(acceptanceID)
+	if err != nil {
+		return AcceptanceCancellationResult{}, err
+	}
+	now := time.Now().UTC()
+	if negotiation.Cancellation == nil {
+		cancellation, err := trade.NewAcceptanceCancellation(negotiation.Acceptance, identity, now)
+		if err != nil {
+			return AcceptanceCancellationResult{}, err
+		}
+		negotiation, err = journal.SavePendingAcceptanceCancellation(acceptanceID, cancellation, now)
+		if err != nil {
+			return AcceptanceCancellationResult{}, err
+		}
+	}
+	if _, err := s.submitAcceptanceCancellation(ctx, journal, negotiation); err != nil {
+		if isRelayHTTPError(err, http.StatusConflict, relay.ErrAcceptanceMatched.Error()) {
+			return AcceptanceCancellationResult{Status: "matched"}, nil
+		}
+		if isTransientRelayError(err) && !errors.Is(err, errCancellationRetryNotDurable) {
+			return AcceptanceCancellationResult{Status: "cancelling"}, nil
+		}
+		return AcceptanceCancellationResult{}, err
+	}
+	return AcceptanceCancellationResult{Status: "cancelled", RelayAcknowledged: true}, nil
+}
+
+func (s *Service) submitAcceptanceCancellation(ctx context.Context, journal *swapstate.Journal, negotiation swapstate.Negotiation) (relay.AcceptanceCancellationRecord, error) {
+	if negotiation.Cancellation == nil {
+		return relay.AcceptanceCancellationRecord{}, errors.New("acceptance has no signed cancellation request")
+	}
+	record, err := s.relay.CancelAcceptance(ctx, negotiation.Order.ID, negotiation.Acceptance.ID, *negotiation.Cancellation)
+	if err != nil {
+		if !isRelayHTTPError(err, http.StatusConflict, relay.ErrAcceptanceMatched.Error()) {
+			now := time.Now().UTC()
+			if _, journalErr := journal.RecordPendingAcceptanceCancellationFailure(
+				negotiation.Acceptance.ID, err.Error(), now.Add(engineInterval), now,
+			); journalErr != nil {
+				return relay.AcceptanceCancellationRecord{}, fmt.Errorf("%w: relay: %v; journal: %v", errCancellationRetryNotDurable, err, journalErr)
+			}
+		}
+		return relay.AcceptanceCancellationRecord{}, err
+	}
+	if err := s.releasePendingFunding(ctx, negotiation); err != nil {
+		return relay.AcceptanceCancellationRecord{}, err
+	}
+	if err := journal.RemovePendingAcceptance(negotiation.Acceptance.ID); err != nil {
+		return relay.AcceptanceCancellationRecord{}, err
+	}
+	return record, nil
 }
 
 func (s *Service) MatchAcceptance(ctx context.Context, acceptanceID string) (swapstate.Swap, error) {
@@ -1077,6 +1169,17 @@ func (s *Service) matchAcceptance(ctx context.Context, journal *swapstate.Journa
 	if err != nil {
 		return swapstate.Swap{}, err
 	}
+	// The exact signed match is persisted before contacting the relay. A retry
+	// after a timeout must resend those bytes instead of creating another match.
+	// No chain action is allowed until the relay atomically chooses this match
+	// over a possible taker cancellation.
+	if _, err := s.relay.Match(ctx, negotiation.Order.ID, record.Match); err != nil {
+		return record, err
+	}
+	record, err = journal.MarkRelayMatched(record.ID, time.Now().UTC())
+	if err != nil {
+		return record, err
+	}
 	if record.Version == trade.AsyncProtocolVersion && (record.AgreementJSON == "" || record.Phase == swapstate.PhaseMatched) {
 		wallets, _, walletErr := s.engineWalletSnapshot()
 		if walletErr != nil {
@@ -1087,11 +1190,6 @@ func (s *Service) matchAcceptance(ctx context.Context, journal *swapstate.Journa
 		if err != nil {
 			return record, fmt.Errorf("validate asynchronous acceptance funding: %w", err)
 		}
-	}
-	// The exact signed match is persisted before contacting the relay. A retry
-	// after a timeout must resend those bytes instead of creating another match.
-	if _, err := s.relay.Match(ctx, negotiation.Order.ID, record.Match); err != nil {
-		return record, err
 	}
 	if err := journal.RemoveIncomingAcceptance(acceptanceID); err != nil {
 		return record, err
@@ -1293,6 +1391,21 @@ func requireAvailable(wanted, available, asset string) error {
 	return nil
 }
 
+func isRelayHTTPError(err error, status int, message string) bool {
+	var relayError *relayclient.HTTPError
+	return errors.As(err, &relayError) && relayError.StatusCode == status && relayError.Message == message
+}
+
+func isTransientRelayError(err error) bool {
+	var relayError *relayclient.HTTPError
+	if !errors.As(err, &relayError) {
+		return true
+	}
+	return relayError.StatusCode == http.StatusRequestTimeout ||
+		relayError.StatusCode == http.StatusTooManyRequests ||
+		relayError.StatusCode >= http.StatusInternalServerError
+}
+
 func (s *Service) syncRelay(ctx context.Context) error {
 	s.mu.RLock()
 	unlocked := s.root != nil
@@ -1316,7 +1429,12 @@ func (s *Service) syncRelay(ctx context.Context) error {
 	defer cleanup()
 	identityPublic := hex.EncodeToString(identity.Public().(ed25519.PublicKey))
 	now := time.Now().UTC()
-	if err := s.reconcileNegotiations(ctx, journal, now); err != nil {
+	s.negotiationMu.Lock()
+	s.fundsMu.Lock()
+	err = s.reconcileNegotiations(ctx, journal, now)
+	s.fundsMu.Unlock()
+	s.negotiationMu.Unlock()
+	if err != nil {
 		return err
 	}
 	cursor, err := journal.RelayCursor()
@@ -1359,17 +1477,21 @@ func (s *Service) syncRelay(ctx context.Context) error {
 				}
 				if orderRecord.Status == relay.StatusMatched {
 					if orderRecord.Acceptance != nil && orderRecord.Match != nil && orderRecord.Acceptance.ID == acceptance.ID {
-						if _, _, err := journal.Create(swapstate.RoleMaker, orderRecord.Signed, *orderRecord.Acceptance, *orderRecord.Match, now); err != nil {
+						swap, _, err := journal.Create(swapstate.RoleMaker, orderRecord.Signed, *orderRecord.Acceptance, *orderRecord.Match, now)
+						if err != nil {
+							return err
+						}
+						if _, err := journal.MarkRelayMatched(swap.ID, now); err != nil {
 							return err
 						}
 					}
 					if err := journal.RemoveIncomingAcceptance(acceptance.ID); err != nil {
 						return err
 					}
-					continue
+					break
 				}
 				if orderRecord.Status != relay.StatusOpen || acceptance.Acceptance.ExpiresAt <= now.Unix() {
-					continue
+					break
 				}
 				if _, _, err := journal.SaveIncomingAcceptance(orderRecord.Signed, acceptance, now); err != nil {
 					return err
@@ -1382,6 +1504,13 @@ func (s *Service) syncRelay(ctx context.Context) error {
 				s.negotiationMu.Unlock()
 				if err != nil {
 					if errors.Is(err, errInvalidAsyncFunding) {
+						if removeErr := journal.RemoveIncomingAcceptance(acceptance.ID); removeErr != nil {
+							return removeErr
+						}
+					} else if isRelayHTTPError(err, http.StatusConflict, relay.ErrAcceptanceCancelled.Error()) {
+						if removeErr := journal.RemoveRelayPendingSwap(acceptance.Acceptance.TradeID, acceptance.ID); removeErr != nil {
+							return removeErr
+						}
 						if removeErr := journal.RemoveIncomingAcceptance(acceptance.ID); removeErr != nil {
 							return removeErr
 						}
@@ -1458,21 +1587,59 @@ func (s *Service) reconcileNegotiations(ctx context.Context, journal *swapstate.
 		return err
 	}
 	for _, negotiation := range pending {
-		remove := negotiation.Acceptance.Acceptance.ExpiresAt <= now.Unix()
-		if !remove {
-			record, err := orderRecord(negotiation.Order.ID)
-			if err != nil {
+		if negotiation.Cancellation != nil {
+			if _, err := s.submitAcceptanceCancellation(ctx, journal, negotiation); err == nil {
+				continue
+			} else if !isRelayHTTPError(err, http.StatusConflict, relay.ErrAcceptanceMatched.Error()) {
+				return fmt.Errorf("cancel pending acceptance: %w", err)
+			}
+			// A match that won the relay transaction cannot be cancelled. Keep
+			// the local reservation until its signed match arrives below.
+		}
+		record, err := orderRecord(negotiation.Order.ID)
+		if err != nil {
+			return err
+		}
+		selected := record.Status == relay.StatusMatched && record.Acceptance != nil && record.Acceptance.ID == negotiation.Acceptance.ID
+		// The acceptance deadline limits when the relay may choose a taker. A
+		// match committed before that deadline remains valid after it, so always
+		// check relay state before releasing prepared funding.
+		remove := !selected && (negotiation.Acceptance.Acceptance.ExpiresAt <= now.Unix() || record.Status != relay.StatusOpen)
+		if remove {
+			if err := s.releasePendingFunding(ctx, negotiation); err != nil {
 				return err
 			}
-			selected := record.Status == relay.StatusMatched && record.Acceptance != nil && record.Acceptance.ID == negotiation.Acceptance.ID
-			remove = record.Status != relay.StatusOpen && !selected
-		}
-		if remove {
-			s.releasePendingFunding(ctx, negotiation)
 			if err := journal.RemovePendingAcceptance(negotiation.Acceptance.ID); err != nil {
 				return err
 			}
-		} else if negotiation.Acceptance.Acceptance.Version == trade.AsyncProtocolVersion {
+		} else {
+			if record.Status == relay.StatusOpen && !negotiation.RelaySubmitted {
+				if _, err := s.relay.Accept(ctx, negotiation.Order.ID, negotiation.Acceptance); err != nil {
+					if isRelayHTTPError(err, http.StatusConflict, relay.ErrAcceptanceCancelled.Error()) {
+						if err := s.releasePendingFunding(ctx, negotiation); err != nil {
+							return err
+						}
+						if err := journal.RemovePendingAcceptance(negotiation.Acceptance.ID); err != nil {
+							return err
+						}
+						continue
+					}
+					if isTransientRelayError(err) {
+						if _, journalErr := journal.RecordPendingAcceptanceRelayFailure(
+							negotiation.Acceptance.ID, err.Error(), now.Add(engineInterval), now,
+						); journalErr != nil {
+							return errors.Join(err, fmt.Errorf("save acceptance retry: %w", journalErr))
+						}
+					}
+					return fmt.Errorf("submit pending acceptance: %w", err)
+				}
+				if _, err := journal.MarkPendingAcceptanceSubmitted(negotiation.Acceptance.ID, now); err != nil {
+					return err
+				}
+			}
+			if negotiation.Acceptance.Acceptance.Version != trade.AsyncProtocolVersion {
+				continue
+			}
 			funding := negotiation.Acceptance.Acceptance.Funding
 			if funding.Asset == "BTC" && len(funding.RawTransactions) == 1 {
 				s.mu.RLock()
@@ -1491,15 +1658,12 @@ func (s *Service) reconcileNegotiations(ctx context.Context, journal *swapstate.
 		return err
 	}
 	for _, negotiation := range incoming {
-		remove := negotiation.Acceptance.Acceptance.ExpiresAt <= now.Unix()
-		if !remove {
-			record, err := orderRecord(negotiation.Order.ID)
-			if err != nil {
-				return err
-			}
-			selected := record.Status == relay.StatusMatched && record.Acceptance != nil && record.Acceptance.ID == negotiation.Acceptance.ID
-			remove = record.Status != relay.StatusOpen && !selected
+		record, err := orderRecord(negotiation.Order.ID)
+		if err != nil {
+			return err
 		}
+		selected := record.Status == relay.StatusMatched && record.Acceptance != nil && record.Acceptance.ID == negotiation.Acceptance.ID
+		remove := !selected && (negotiation.Acceptance.Acceptance.ExpiresAt <= now.Unix() || record.Status != relay.StatusOpen)
 		if remove {
 			if err := journal.RemoveIncomingAcceptance(negotiation.Acceptance.ID); err != nil {
 				return err
@@ -1509,9 +1673,9 @@ func (s *Service) reconcileNegotiations(ctx context.Context, journal *swapstate.
 	return nil
 }
 
-func (s *Service) releasePendingFunding(ctx context.Context, negotiation swapstate.Negotiation) {
+func (s *Service) releasePendingFunding(ctx context.Context, negotiation swapstate.Negotiation) error {
 	if negotiation.Acceptance.Acceptance.Version != trade.AsyncProtocolVersion {
-		return
+		return nil
 	}
 	funding := negotiation.Acceptance.Acceptance.Funding
 	s.mu.RLock()
@@ -1519,13 +1683,14 @@ func (s *Service) releasePendingFunding(ctx context.Context, negotiation swapsta
 	s.mu.RUnlock()
 	if funding.Asset == "QDAY" {
 		if qday, ok := qdayClient.(qdayAsyncSwapClient); ok {
-			_ = qday.CancelPreparedSwapFunding(ctx, negotiation.Acceptance.Acceptance.TradeID)
+			return qday.CancelPreparedSwapFunding(ctx, negotiation.Acceptance.Acceptance.TradeID)
 		}
 	} else if funding.Asset == "BTC" && len(funding.RawTransactions) == 1 {
 		if bitcoinClient, ok := bitcoinClient.(bitcoinAsyncSwapClient); ok {
-			_ = bitcoinClient.ReleaseFunding(funding.RawTransactions[0])
+			return bitcoinClient.ReleaseFunding(funding.RawTransactions[0])
 		}
 	}
+	return nil
 }
 
 func (s *Service) State(ctx context.Context) State {

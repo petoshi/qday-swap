@@ -51,6 +51,7 @@ type Application interface {
 	CreateOffer(context.Context, app.CreateOfferRequest) (relay.Record, error)
 	CancelOffer(context.Context, string) (relay.Record, error)
 	AcceptOffer(context.Context, string) (swapstate.Negotiation, error)
+	CancelAcceptance(context.Context, string) (app.AcceptanceCancellationResult, error)
 	MatchAcceptance(context.Context, string) (swapstate.Swap, error)
 	ApproveSwap(string) (swapstate.Swap, error)
 	Negotiations() (app.Negotiations, error)
@@ -403,6 +404,17 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, swap)
+	case r.Method == http.MethodPost && routeID(r.URL.Path, "/api/v1/acceptances/", "/cancel") != "":
+		var request struct{}
+		if !decode(w, r, &request) {
+			return
+		}
+		record, err := s.application.CancelAcceptance(r.Context(), routeID(r.URL.Path, "/api/v1/acceptances/", "/cancel"))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, record)
 	case r.Method == http.MethodPost && routeID(r.URL.Path, "/api/v1/swaps/", "/approve") != "":
 		var request struct{}
 		if !decode(w, r, &request) {

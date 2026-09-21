@@ -38,12 +38,13 @@ const (
 )
 
 var (
-	acceptanceDomain      = []byte("QDAY_SWAP_ACCEPTANCE_V1")
-	asyncAcceptanceDomain = []byte("QDAY_SWAP_ACCEPTANCE_V2")
-	matchDomain           = []byte("QDAY_SWAP_MATCH_V1")
-	asyncMatchDomain      = []byte("QDAY_SWAP_MATCH_V2")
-	messageDomain         = []byte("QDAY_SWAP_MESSAGE_V1")
-	pollDomain            = []byte("QDAY_SWAP_MAILBOX_POLL_V1")
+	acceptanceDomain       = []byte("QDAY_SWAP_ACCEPTANCE_V1")
+	asyncAcceptanceDomain  = []byte("QDAY_SWAP_ACCEPTANCE_V2")
+	acceptanceCancelDomain = []byte("QDAY_SWAP_ACCEPTANCE_CANCEL_V1")
+	matchDomain            = []byte("QDAY_SWAP_MATCH_V1")
+	asyncMatchDomain       = []byte("QDAY_SWAP_MATCH_V2")
+	messageDomain          = []byte("QDAY_SWAP_MESSAGE_V1")
+	pollDomain             = []byte("QDAY_SWAP_MAILBOX_POLL_V1")
 )
 
 type FundingPackage struct {
@@ -77,6 +78,118 @@ type SignedAcceptance struct {
 	Acceptance AcceptancePayload `json:"acceptance"`
 	ID         string            `json:"id"`
 	Signature  string            `json:"signature"`
+}
+
+// AcceptanceCancellationPayload revokes one exact acceptance before the
+// relay commits it to a match. The taker signs the acceptance identity rather
+// than merely deleting local state, so a delayed acceptance request cannot
+// revive a cancelled trade.
+type AcceptanceCancellationPayload struct {
+	Version        uint16 `json:"version"`
+	Network        string `json:"network"`
+	OrderID        string `json:"orderID"`
+	TradeID        string `json:"tradeID"`
+	AcceptanceID   string `json:"acceptanceID"`
+	TakerPublicKey string `json:"takerPublicKey"`
+	CreatedAt      int64  `json:"createdAt"`
+}
+
+type SignedAcceptanceCancellation struct {
+	Cancellation AcceptanceCancellationPayload `json:"cancellation"`
+	Signature    string                        `json:"signature"`
+}
+
+func NewAcceptanceCancellation(acceptance SignedAcceptance, privateKey ed25519.PrivateKey, now time.Time) (SignedAcceptanceCancellation, error) {
+	if len(privateKey) != ed25519.PrivateKeySize {
+		return SignedAcceptanceCancellation{}, errors.New("invalid Ed25519 private key")
+	}
+	payload := AcceptanceCancellationPayload{
+		Version: acceptance.Acceptance.Version, Network: acceptance.Acceptance.Network,
+		OrderID: acceptance.Acceptance.OrderID, TradeID: acceptance.Acceptance.TradeID,
+		AcceptanceID: acceptance.ID, TakerPublicKey: acceptance.Acceptance.TakerPublicKey,
+		CreatedAt: now.Unix(),
+	}
+	if hex.EncodeToString(privateKey.Public().(ed25519.PublicKey)) != payload.TakerPublicKey {
+		return SignedAcceptanceCancellation{}, errors.New("private key does not match acceptance taker")
+	}
+	if err := payload.validate(now); err != nil {
+		return SignedAcceptanceCancellation{}, err
+	}
+	digest := sha256.Sum256(payload.signingBytes())
+	return SignedAcceptanceCancellation{
+		Cancellation: payload,
+		Signature:    hex.EncodeToString(ed25519.Sign(privateKey, digest[:])),
+	}, nil
+}
+
+func (c SignedAcceptanceCancellation) Verify(now time.Time) error {
+	if err := c.Cancellation.validate(now); err != nil {
+		return err
+	}
+	publicKey, err := decodeSigningKey(c.Cancellation.TakerPublicKey, "taker public key")
+	if err != nil {
+		return err
+	}
+	signature, err := decodeSignature(c.Signature)
+	if err != nil {
+		return err
+	}
+	digest := sha256.Sum256(c.Cancellation.signingBytes())
+	if !ed25519.Verify(publicKey, digest[:], signature) {
+		return errors.New("invalid acceptance cancellation signature")
+	}
+	return nil
+}
+
+func (c SignedAcceptanceCancellation) VerifyAcceptance(acceptance SignedAcceptance, now time.Time) error {
+	if err := c.Verify(now); err != nil {
+		return err
+	}
+	payload := c.Cancellation
+	accepted := acceptance.Acceptance
+	if payload.Version != accepted.Version || payload.Network != accepted.Network ||
+		payload.OrderID != accepted.OrderID || payload.TradeID != accepted.TradeID ||
+		payload.AcceptanceID != acceptance.ID || payload.TakerPublicKey != accepted.TakerPublicKey {
+		return errors.New("cancellation does not bind the selected acceptance")
+	}
+	if payload.CreatedAt < accepted.CreatedAt {
+		return errors.New("acceptance cancellation predates the acceptance")
+	}
+	return nil
+}
+
+func (p AcceptanceCancellationPayload) validate(now time.Time) error {
+	if p.Version != ProtocolVersion && p.Version != AsyncProtocolVersion {
+		return fmt.Errorf("unsupported acceptance cancellation version %d", p.Version)
+	}
+	if p.Network != "mainnet" && p.Network != "testnet" && p.Network != "regtest" {
+		return errors.New("acceptance cancellation network is invalid")
+	}
+	if _, err := decodeDigest(p.OrderID, "order ID"); err != nil {
+		return err
+	} else if _, err := decodeDigest(p.TradeID, "trade ID"); err != nil {
+		return err
+	} else if _, err := decodeDigest(p.AcceptanceID, "acceptance ID"); err != nil {
+		return err
+	} else if _, err := decodeSigningKey(p.TakerPublicKey, "taker public key"); err != nil {
+		return err
+	}
+	if time.Unix(p.CreatedAt, 0).After(now.Add(maximumClockSkew)) {
+		return errors.New("acceptance cancellation time is too far in the future")
+	}
+	return nil
+}
+
+func (p AcceptanceCancellationPayload) signingBytes() []byte {
+	encoder := canonicalEncoder{bytes: append([]byte(nil), acceptanceCancelDomain...)}
+	encoder.uint16(p.Version)
+	encoder.text(p.Network)
+	encoder.text(p.OrderID)
+	encoder.text(p.TradeID)
+	encoder.text(p.AcceptanceID)
+	encoder.text(p.TakerPublicKey)
+	encoder.int64(p.CreatedAt)
+	return encoder.bytes
 }
 
 func NewAcceptance(signedOrder order.Signed, lifetime time.Duration, privateKey ed25519.PrivateKey, messageKey [32]byte, now time.Time) (SignedAcceptance, error) {

@@ -156,6 +156,26 @@ func TestAcceptanceAndMatchBindEveryParticipant(t *testing.T) {
 	}
 }
 
+func TestAcceptanceCancellationBindsExactAcceptance(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	fixture := newProtocolFixture(t, now)
+	cancellation, err := NewAcceptanceCancellation(fixture.acceptance, fixture.takerPrivate, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cancellation.VerifyAcceptance(fixture.acceptance, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	tampered := fixture.acceptance
+	tampered.ID = strings.Repeat("1", 64)
+	if err := cancellation.VerifyAcceptance(tampered, now.Add(time.Second)); err == nil {
+		t.Fatal("cancellation verified for a different acceptance")
+	}
+	if _, err := NewAcceptanceCancellation(fixture.acceptance, fixture.makerPrivate, now.Add(time.Second)); err == nil {
+		t.Fatal("maker signed a taker cancellation")
+	}
+}
+
 func TestEncryptedMessageRoundTripAndTampering(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 	fixture := newProtocolFixture(t, now)

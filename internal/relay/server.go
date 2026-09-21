@@ -111,6 +111,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/orders/{id}", s.handleOrder)
 	mux.HandleFunc("POST /api/v1/orders/{id}/cancel", s.handleCancel)
 	mux.HandleFunc("POST /api/v1/orders/{id}/accept", s.handleAccept)
+	mux.HandleFunc("POST /api/v1/orders/{id}/acceptances/{acceptanceID}/cancel", s.handleCancelAcceptance)
 	mux.HandleFunc("POST /api/v1/orders/{id}/match", s.handleMatch)
 	mux.HandleFunc("POST /api/v1/messages", s.handleMessage)
 	mux.HandleFunc("POST /api/v1/mailbox/poll", s.handleMailboxPoll)
@@ -294,9 +295,44 @@ func (s *Server) handleAccept(response http.ResponseWriter, request *http.Reques
 	switch {
 	case errors.Is(err, ErrNotFound):
 		writeError(response, http.StatusNotFound, ErrNotFound.Error())
-	case errors.Is(err, ErrNotOpen), errors.Is(err, ErrAlreadyAccepted):
+	case errors.Is(err, ErrNotOpen), errors.Is(err, ErrAlreadyAccepted), errors.Is(err, ErrAcceptanceCancelled):
 		writeError(response, http.StatusConflict, err.Error())
 	case errors.Is(err, ErrAcceptanceLimit):
+		writeError(response, http.StatusTooManyRequests, err.Error())
+	case err != nil:
+		writeError(response, http.StatusBadRequest, err.Error())
+	default:
+		status := http.StatusOK
+		if created {
+			status = http.StatusCreated
+		}
+		writeJSON(response, status, record)
+	}
+}
+
+func (s *Server) handleCancelAcceptance(response http.ResponseWriter, request *http.Request) {
+	var cancellation trade.SignedAcceptanceCancellation
+	if err := decodeJSON(response, request, &cancellation); err != nil {
+		writeError(response, http.StatusBadRequest, err.Error())
+		return
+	}
+	orderID, acceptanceID := request.PathValue("id"), request.PathValue("acceptanceID")
+	payload := cancellation.Cancellation
+	if payload.OrderID != orderID || payload.AcceptanceID != acceptanceID {
+		writeError(response, http.StatusBadRequest, "path IDs do not match acceptance cancellation")
+		return
+	}
+	if payload.Network != s.network {
+		writeError(response, http.StatusBadRequest, fmt.Sprintf("relay accepts only %s trades", s.network))
+		return
+	}
+	record, created, err := s.store.CancelAcceptance(orderID, acceptanceID, cancellation, s.now())
+	switch {
+	case errors.Is(err, ErrNotFound):
+		writeError(response, http.StatusNotFound, ErrNotFound.Error())
+	case errors.Is(err, ErrAcceptanceMatched), errors.Is(err, ErrNotOpen):
+		writeError(response, http.StatusConflict, err.Error())
+	case errors.Is(err, ErrAcceptanceCancellationLimit):
 		writeError(response, http.StatusTooManyRequests, err.Error())
 	case err != nil:
 		writeError(response, http.StatusBadRequest, err.Error())
@@ -327,8 +363,8 @@ func (s *Server) handleMatch(response http.ResponseWriter, request *http.Request
 	switch {
 	case errors.Is(err, ErrNotFound):
 		writeError(response, http.StatusNotFound, ErrNotFound.Error())
-	case errors.Is(err, ErrNotOpen):
-		writeError(response, http.StatusConflict, ErrNotOpen.Error())
+	case errors.Is(err, ErrNotOpen), errors.Is(err, ErrAcceptanceCancelled):
+		writeError(response, http.StatusConflict, err.Error())
 	case err != nil:
 		writeError(response, http.StatusBadRequest, err.Error())
 	default:

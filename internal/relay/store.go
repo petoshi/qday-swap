@@ -13,21 +13,28 @@ import (
 	"go.etcd.io/bbolt"
 )
 
-const MaxOpenOrdersPerMaker = 100
+const (
+	MaxOpenOrdersPerMaker              = 100
+	MaxAcceptanceCancellationsPerOrder = 1000
+)
 
 var (
-	ordersBucket          = []byte("orders")
-	acceptancesBucket     = []byte("acceptances")
-	messagesBucket        = []byte("messages")
-	messageSequenceBucket = []byte("message-sequences")
-	messageHeadBucket     = []byte("message-heads")
-	mailboxesBucket       = []byte("mailboxes")
-	ErrNotFound           = errors.New("order not found")
-	ErrNotOpen            = errors.New("order is not open")
-	ErrMakerLimit         = errors.New("maker has too many open orders")
-	ErrAcceptanceLimit    = errors.New("order has too many pending acceptances")
-	ErrAlreadyAccepted    = errors.New("taker already accepted this order")
-	ErrMessageSequence    = errors.New("message sequence is not the next expected value")
+	ordersBucket                   = []byte("orders")
+	acceptancesBucket              = []byte("acceptances")
+	acceptanceCancellationsBucket  = []byte("acceptance-cancellations")
+	messagesBucket                 = []byte("messages")
+	messageSequenceBucket          = []byte("message-sequences")
+	messageHeadBucket              = []byte("message-heads")
+	mailboxesBucket                = []byte("mailboxes")
+	ErrNotFound                    = errors.New("order not found")
+	ErrNotOpen                     = errors.New("order is not open")
+	ErrMakerLimit                  = errors.New("maker has too many open orders")
+	ErrAcceptanceLimit             = errors.New("order has too many pending acceptances")
+	ErrAlreadyAccepted             = errors.New("taker already accepted this order")
+	ErrAcceptanceCancelled         = errors.New("acceptance is cancelled")
+	ErrAcceptanceMatched           = errors.New("acceptance is already matched")
+	ErrAcceptanceCancellationLimit = errors.New("order has too many acceptance cancellations")
+	ErrMessageSequence             = errors.New("message sequence is not the next expected value")
 )
 
 type Status string
@@ -121,7 +128,7 @@ func OpenStore(path string) (*Store, error) {
 		return nil, fmt.Errorf("open relay store: %w", err)
 	}
 	if err := db.Update(func(tx *bbolt.Tx) error {
-		for _, name := range [][]byte{ordersBucket, acceptancesBucket, messagesBucket, messageSequenceBucket, messageHeadBucket, mailboxesBucket} {
+		for _, name := range [][]byte{ordersBucket, acceptancesBucket, acceptanceCancellationsBucket, messagesBucket, messageSequenceBucket, messageHeadBucket, mailboxesBucket} {
 			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
 				return err
 			}
