@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/petoshi/qday-swap/internal/walletroot"
@@ -19,7 +20,7 @@ func TestCreateOpenAndWrongPassword(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0600 {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0600 {
 		t.Fatalf("keystore mode = %o", info.Mode().Perm())
 	}
 	opened, err := Open(path, "correct horse battery staple")
